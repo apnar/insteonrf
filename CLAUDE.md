@@ -43,6 +43,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/manchester.py` | Manchester encode/decode, `invert_bits` |
 | `insteonrf/cmds.py` | `Command` enum, cmd1/cmd2 → name tables, `lookup()` |
 | `insteonrf/dsp.py` | numpy `modulate_fsk2()`; receive chain `find_sync()` → `estimate_cfo()` → `_ml_soft()` exposed as `demodulate_bursts()` (returns `Burst`: bits + per-symbol soft + sps + cfo + snr + header_index); `demodulate_fsk2()` is the string-contract wrapper; `iq_bursts()` splits bursts |
+| `insteonrf/allon.py` | phantom all-on hunting: group-0/unknown-group/storm triggers, rolling context capture, hop-count+RSSI attribution, per-sender suspicion score (`insteon-rf allon`) |
 | `insteonrf/context.py` | `CommandTracker`: correlates replies with their queries so an ACK's `cmd1` is read in the right table |
 | `insteonrf/recover.py` | soft-decision framing: Manchester pairs combined by difference, known frame-index counters as a checksum, bounded CRC-guided bit repair (`recover_packets`, `recover_from_burst`) |
 | `insteonrf/radio/` | `rfcat.py` (`RfcatRadio`, aliased `Radio`: 2FSK, 914.95 MHz, 9124 baud, 200 kHz BW, 75 kHz dev; `configure_rx()` syncs on the inverted start header `0x3155`, `sync_header=False` = carrier detect; `configure_tx()` sync word `0x6666`), `sdr.py` (`SdrReceiver`/`SdrTransmitter`), `file.py` (`FileRadio`), `__init__.py` (`RadioBackend` protocol, `open_backend()`) |
@@ -143,6 +144,18 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   named command from the same device, `hl:0` copies are over-represented, and they cluster into
   89 hours of ~3,600. Do not "fix" it by adding names. RF packets carry a CRC, so they never
   reach the decoder; use `monitor --unknown-commands` if something genuinely new appears.
+- **Phantom all-on events (this house).** Legacy i1/i2 devices still obey an ALL-Link
+  broadcast to group 0 = every device. A PLM only passes up group broadcasts it has an ALDB
+  link for, so an unlinked group-0 broadcast never reaches the host — which is why HA (and
+  the ISY before it) shows the lights as off while they are physically on, and why
+  `/k8s/insteon-config/log/insteon_mqtt.log` contains **no trigger** for any event. Locate
+  past events by the owner's recovery action instead: `grep '"group": "115"'` (the Everything
+  scene off) found three in five months — 2026-05-29 14:47, **2026-07-08 03:30** (plus a
+  Main Level Lights off at 01:43 the same night), 2026-07-21 22:05 — each preceded only by
+  routine status polling. Power data cannot date them: events last seconds. Use
+  `insteon-rf allon --known-groups <groups.txt>`; build the group list with
+  `grep -oE '^  - modem: [0-9]+' /k8s/insteon-config/scenes.yaml | awk '{print $3}' | sort -nu`
+  (114 legitimate groups, 0 not among them).
 - Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
   Assistant `mqtt.publish` service (no `mosquitto_pub` on the host or in the pod), e.g.
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.

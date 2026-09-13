@@ -4,6 +4,36 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.4.0 — 2026-09-13
+
+### Added
+
+- **`insteon-rf allon` and `insteonrf/allon.py`** — hunting phantom "all on"
+  events, where a malformed ALL-Link broadcast to group 0 turns a whole house
+  on because legacy (pre-2012) devices still honour that command.
+
+  The motivating insight is that a hub cannot see this: a PLM only passes up
+  group broadcasts it holds an ALDB link for, so an unlinked group-0 broadcast
+  never reaches the host — which is also why Home Assistant keeps showing the
+  lights as *off* while they are on. Verified against a real installation:
+  three events, located by finding the owner's "Everything"-scene-off recovery
+  in five months of PLM logs (one at 03:30), and in every case the log held
+  **no trigger** beforehand, only the recovery. An RF receiver has no such
+  filter.
+
+  `AllOnWatcher` keeps a rolling buffer of every burst and, on a trigger,
+  writes the whole window plus an attribution report. It leans on two things RF
+  gives you: a **CRC**, which separates "a device really transmitted this" from
+  "the air mangled it", and **hop counts**, since a transmission leaves its
+  sender with `hops_left == max_hops` so the hop-intact copy is closest to the
+  source — with its RSSI as a distance hint, and several receivers as a
+  triangulation method. Triggers: group-0 broadcast, On to a group the network
+  does not use (`--known-groups`), and broadcast storms. Senders accumulate a
+  suspicion score from malformed all-link traffic, CRC failures and repaired
+  bits, so a repeat offender surfaces even between events.
+- `monitor` gained `--watch-all-on`, `--dump-dir`, `--known-groups` and
+  `--context-s`; with `--mqtt`, triggers publish as alerts.
+
 ## 2.3.0 — 2026-09-13
 
 Command-name coverage, measured against a real network rather than assumed:

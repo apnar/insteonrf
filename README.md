@@ -218,6 +218,7 @@ and flips the least-confident bits looking for a CRC match.
     insteonrf/dsp.py        numpy modulator, sync correlation, CFO, ML detector, Burst
     insteonrf/recover.py    soft-decision framing and CRC-guided repair
     insteonrf/context.py    remembers queries so replies name from the right table
+    insteonrf/allon.py      phantom all-on triggers, context capture, attribution
     insteonrf/radio/        rfcat, SDR and file backends behind one protocol
     insteonrf/monitor.py    JSON-lines logging, mesh-repeat dedupe, MQTT
     insteonrf/debug.py      frame-by-frame dump for demodulator debugging
@@ -245,6 +246,7 @@ for the start header, so leading garbage and either bit polarity are fine.
 | `insteon-rf print` | `print_pkt.py` | Decode bit strings into packets (`-v` for addresses/command names, `-j` JSON, `-l FILE` to log) |
 | `insteon-rf pkt` | `send_comm.py` | Build a packet as a bit string (`-n` to just describe it, `-j` for JSON) |
 | `insteon-rf send` | `rf_send.py` | Transmit bit strings (`-L MS` listens for replies, `-n` dry run) |
+| `insteon-rf allon` | | Hunt phantom "all on" events; see [below](#hunting-phantom-all-on-events) |
 | `insteon-rf monitor` | | Long-running logger: JSON lines to a rotating file and/or MQTT, mesh repeats deduped |
 | `insteon-rf modulate` | `mod_pkt.py` | Bit strings → raw I/Q for an SDR transmitter |
 | `insteon-rf demod` | | Raw I/Q → bit strings, or packets with `-D` (`--demod numpy|c`, `--method ml|discriminator`) |
@@ -257,6 +259,67 @@ for the start header, so leading garbage and either bit polarity are fine.
 
 Backends: `--backend rfcat` (default, TX and RX), `rtlsdr` (RX), `hackrf`
 (RX, and TX via the numpy modulator), `file` (replays bit-string files).
+
+## Hunting phantom "all on" events
+
+Early Insteon devices (i1/i2, roughly pre-2012) act on an ALL-Link broadcast
+addressed to **group 0** — "every device". The command was dropped from later
+firmware, but legacy devices still obey it, so one malformed group-0 message
+turns a whole house on at once, often at 3am.
+
+**Your hub cannot catch this, structurally.** A PLM only passes up group
+broadcasts it holds an ALDB link for, so an unlinked group-0 broadcast is
+filtered out before the host sees it. That is also why the lights show as *off*
+in Home Assistant while they are physically on: responders to an all-link
+command do not announce their new state, and the controller never saw the
+command. Checked against a real installation — three such events, identified by
+the owner firing the "Everything" scene off to recover — the PLM log contained
+**no trigger at all** in the minutes beforehand, only the recovery.
+
+An RF receiver has no ALDB filter, so it sees everything. Two properties make
+it diagnostic:
+
+- **RF packets carry a CRC.** A group-0 On arriving with a *valid* CRC was
+  genuinely transmitted that way, so the corruption happened inside the sending
+  device. A *failed* CRC means it was mangled in flight — a different problem.
+- **Hop counts locate the origin.** A transmission leaves its sender with
+  `hops_left == max_hops`, and each repeat decrements it. The copy with the hop
+  counter intact is closest to the source, and its RSSI says how near.
+
+```
+# generate the list of groups your network legitimately uses
+grep -oE '^  - modem: [0-9]+' /path/to/scenes.yaml | awk '{print $3}' | sort -nu > groups.txt
+
+insteon-rf allon --known-groups groups.txt -v
+```
+
+Leave it running. It keeps a rolling 30-second buffer of *every* burst, and on
+a trigger writes the whole window — the trigger, its repeats, and whatever the
+mesh did next — plus an attribution report:
+
+```
+=== all-link-group-0 at 2026-07-08 03:29:58
+    group 0 (ON) from 29.41.B5, hops 3/3, CRC valid — some device transmitted this
+    CF : B5 41 29 : 00 00 00 : 11 00 23 00 00 AA     crc 23
+    3 copies of this message in the 30s window:
+      03:29:58 hops 3/3  -55.0 dBm  crc_ok=True <-- hop counter intact: closest to the source
+      03:29:58 hops 2/3  -61.0 dBm  crc_ok=True
+      03:29:58 hops 1/3  -67.0 dBm  crc_ok=True
+    most suspicious senders so far:
+      29.41.B5  score 100  group0=1 unknown_group=0 crc_fail=0 of 412 packets
+```
+
+Triggers are: a **group-0** broadcast (any command), an **On to a group your
+network does not use** (needs `--known-groups`, since a novel group number is
+only suspicious if you know which are real), and a **storm** of group
+broadcasts. Every sender also accumulates a suspicion score from malformed
+all-link traffic, CRC failures and repaired bits, so a repeat offender rises to
+the top of the exit summary even between events.
+
+With `--mqtt`, triggers publish as alerts so an automation can notify you. And
+because attribution leans on RSSI, **several receivers are much better than
+one**: compare the RSSI of the hop-intact copy across nodes in different parts
+of the house and the origin localises.
 
 ## Command coverage
 

@@ -668,6 +668,16 @@ def monitor_main(argv: list[str] | None = None) -> int:
                         "instead of hiding in the log as 'Std Command 0x??'")
     p.add_argument("--window", type=float, default=DEDUPE_WINDOW_S,
                    help="dedupe window in seconds (default %(default)s)")
+    p.add_argument("-W", "--watch-all-on", action="store_true",
+                   help="watch for phantom 'all on' triggers: a group-0 all-link broadcast, an "
+                        "On to an unknown group, or a broadcast storm")
+    p.add_argument("--dump-dir", metavar="DIR",
+                   help="with -W: write the trigger plus the surrounding raw bursts here")
+    p.add_argument("--known-groups", metavar="FILE",
+                   help="with -W: groups the network legitimately uses, so a novel group number "
+                        "counts as suspicious (one per line, or a JSON array)")
+    p.add_argument("--context-s", type=float, default=30.0,
+                   help="with -W: seconds of raw bursts to keep around a trigger")
     p.add_argument("-a", "--all", action="store_true", help="also log fragments with no CRC")
     p.add_argument("--quiet", action="store_true", help="do not echo records to stdout")
     p.add_argument("--carrier", action="store_true", help="capture on carrier detect alone")
@@ -689,6 +699,15 @@ def monitor_main(argv: list[str] | None = None) -> int:
                              username=a.mqtt_user, password=a.mqtt_pass)
     dd = None if a.no_dedupe else Deduper(a.window)
     tracker = CommandTracker()
+    watcher = None
+    if a.watch_all_on:
+        from .allon import AllOnWatcher, load_known_groups
+
+        watcher = AllOnWatcher(
+            known_groups=load_known_groups(a.known_groups) if a.known_groups else None,
+            window_s=a.context_s, dump_dir=a.dump_dir)
+        log.info("watching for phantom all-on triggers%s",
+                 f", dumping context to {a.dump_dir}" if a.dump_dir else "")
     seen = 0
     unknown: Counter[tuple[str, int]] = Counter()
 
@@ -732,6 +751,15 @@ def monitor_main(argv: list[str] | None = None) -> int:
                         pkt.rssi_dbm = rssi
                         if a.unknown_commands:
                             note_unknown(pkt)
+                        if watcher is not None:
+                            for trig in watcher.observe(pkt, bits=bits, rssi_dbm=rssi,
+                                                        snr_db=pkt.snr_db):
+                                log.warning("%s", watcher.report(trig))
+                                if mqtt is not None:
+                                    mqtt.publish({"alert": trig.kind, "at": trig.at,
+                                                  "detail": trig.detail,
+                                                  "packet": trig.packet.to_dict()
+                                                  if trig.packet else None})
                         if dd is None:
                             emit([pkt.to_dict()])
                         else:
@@ -751,12 +779,31 @@ def monitor_main(argv: list[str] | None = None) -> int:
             writer.close()
         if mqtt is not None:
             mqtt.close()
+        if watcher is not None:
+            log.warning("all-on watch: %s", watcher.summary())
         if unknown:
             log.warning("%d unnamed command(s) seen:", len(unknown))
             for (kind, cmd1), n in unknown.most_common():
                 log.warning("    %-10s cmd1=0x%02X  %d time(s)", kind, cmd1, n)
     log.info("logged %d packet(s)", seen)
     return 0
+
+
+# --------------------------------------------------------------------------- allon
+
+
+def allon_main(argv: list[str] | None = None) -> int:
+    """`monitor` preset for hunting phantom all-on events."""
+    argv = list(argv or [])
+    if not any(x.startswith("--dump-dir") for x in argv):
+        argv += ["--dump-dir", "allon-dumps"]
+    if not any(x in ("-o", "--out") for x in argv):
+        argv += ["-o", "allon.jsonl"]
+    print("watching for phantom 'all on' triggers — a group-0 all-link broadcast is the\n"
+          "classic culprit. Leave this running; Ctrl-C for a summary.\n"
+          "Context and attribution go to the dump directory on each trigger.\n",
+          file=sys.stderr)
+    return monitor_main(["--watch-all-on", "--unknown-commands", *argv])
 
 
 # --------------------------------------------------------------------------- reset
@@ -792,6 +839,7 @@ COMMANDS = {
     "modulate": (modulate_main, "bit strings -> raw I/Q for an SDR transmitter"),
     "demod": (demod_main, "raw I/Q -> bit strings"),
     "clip": (clip_main, "split raw I/Q into one file per burst"),
+    "allon": (allon_main, "hunt phantom 'all on' events and pin them on a device"),
     "reset": (reset_main, "USB-reset a wedged rfcat dongle"),
 }
 
