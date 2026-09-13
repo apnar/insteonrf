@@ -663,6 +663,13 @@ def monitor_main(argv: list[str] | None = None) -> int:
                                                           "%(default)s)")
     p.add_argument("--mqtt", metavar="HOST[:PORT]", help="publish each packet to this MQTT broker")
     p.add_argument("--topic", default="insteon-rf", help="MQTT topic prefix (default %(default)s)")
+    p.add_argument("--mqtt-alerts-only", action="store_true",
+                   help="publish only all-on triggers to <topic>/alert, not every packet — the "
+                        "JSON-lines file is the record, and a per-packet stream nobody subscribes "
+                        "to only costs broker log volume")
+    p.add_argument("--mqtt-retain-alerts", action="store_true",
+                   help="retain the last alert so a consumer connecting later still sees it "
+                        "(it will re-fire on every reconnect)")
     p.add_argument("--mqtt-user", default=os.environ.get("INSTEONRF_MQTT_USER"),
                    help="MQTT username (default: $INSTEONRF_MQTT_USER)")
     p.add_argument("--mqtt-pass", default=os.environ.get("INSTEONRF_MQTT_PASS"),
@@ -703,7 +710,9 @@ def monitor_main(argv: list[str] | None = None) -> int:
     if a.mqtt:
         host, _, port = a.mqtt.partition(":")
         mqtt = MqttPublisher(host, int(port or 1883), a.topic,
-                             username=a.mqtt_user, password=a.mqtt_pass)
+                             username=a.mqtt_user, password=a.mqtt_pass,
+                             alerts_only=a.mqtt_alerts_only,
+                             alert_retain=a.mqtt_retain_alerts)
     dd = None if a.no_dedupe else Deduper(a.window)
     tracker = CommandTracker()
     watcher = None
@@ -763,10 +772,12 @@ def monitor_main(argv: list[str] | None = None) -> int:
                                                         snr_db=pkt.snr_db):
                                 log.warning("%s", watcher.report(trig))
                                 if mqtt is not None:
-                                    mqtt.publish({"alert": trig.kind, "at": trig.at,
-                                                  "detail": trig.detail,
-                                                  "packet": trig.packet.to_dict()
-                                                  if trig.packet else None})
+                                    mqtt.publish_alert({
+                                        "alert": trig.kind, "at": trig.at,
+                                        "detail": trig.detail,
+                                        "report": watcher.report(trig),
+                                        "packet": trig.packet.to_dict()
+                                        if trig.packet else None})
                         if dd is None:
                             emit([pkt.to_dict()])
                         else:
@@ -785,6 +796,7 @@ def monitor_main(argv: list[str] | None = None) -> int:
         if writer is not None:
             writer.close()
         if mqtt is not None:
+            log.info("mqtt: %d packet(s), %d alert(s) published", mqtt.published, mqtt.alerts)
             mqtt.close()
         if watcher is not None:
             log.warning("all-on watch: %s", watcher.summary())

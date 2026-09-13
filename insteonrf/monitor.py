@@ -118,11 +118,21 @@ class JsonlWriter:
 
 
 class MqttPublisher:
-    """Publish each record as JSON to ``<topic>`` (and ``<topic>/<address>``)."""
+    """Publish JSON to ``<topic>`` (and ``<topic>/<address>``).
+
+    Nothing accumulates on the broker when no one is subscribed: these go out
+    at QoS 0, unretained, so the broker drops them. What *does* cost something
+    is the broker's own log — a mosquitto running ``log_type debug`` writes a
+    line per publish — so publishing a per-packet stream that nobody reads is
+    pure overhead. Use :meth:`publish_alert` and ``alerts_only`` when the file
+    is the record and MQTT is only there to wake something up.
+    """
 
     def __init__(self, host: str, port: int = 1883, topic: str = "insteon-rf",
                  *, username: str | None = None, password: str | None = None,
-                 client_id: str = "insteon-rf", per_device: bool = True, qos: int = 0):
+                 client_id: str = "insteon-rf", per_device: bool = True, qos: int = 0,
+                 alerts_only: bool = False, alert_qos: int = 1,
+                 alert_retain: bool = False):
         try:
             import paho.mqtt.client as mqtt
         except ImportError as err:  # pragma: no cover - optional dependency
@@ -130,6 +140,14 @@ class MqttPublisher:
         self.topic = topic.rstrip("/")
         self.per_device = per_device
         self.qos = qos
+        #: Publish only triggers, not every packet.
+        self.alerts_only = alerts_only
+        self.alert_qos = alert_qos
+        #: Retaining an alert means a consumer that connects later still sees
+        #: the last one — at the cost of re-firing on every reconnect.
+        self.alert_retain = alert_retain
+        self.published = 0
+        self.alerts = 0
         # paho 2.x deprecates the v1 callback API; ask for v2 where it exists.
         api = getattr(mqtt, "CallbackAPIVersion", None)
         self.client = (mqtt.Client(api.VERSION2, client_id=client_id) if api is not None
@@ -141,12 +159,22 @@ class MqttPublisher:
         log.info("publishing to mqtt://%s:%d/%s", host, port, self.topic)
 
     def publish(self, record: dict[str, Any]) -> None:
+        """Publish one packet record, unless configured for alerts only."""
+        if self.alerts_only:
+            return
         payload = json.dumps(record, separators=(",", ":"))
         self.client.publish(self.topic, payload, qos=self.qos)
+        self.published += 1
         if self.per_device:
             who = record.get("from") or record.get("to")
             if who:
                 self.client.publish(f"{self.topic}/{who}", payload, qos=self.qos)
+
+    def publish_alert(self, alert: dict[str, Any]) -> None:
+        """Publish a trigger to ``<topic>/alert``, at a higher QoS than packets."""
+        self.client.publish(f"{self.topic}/alert", json.dumps(alert, separators=(",", ":")),
+                            qos=self.alert_qos, retain=self.alert_retain)
+        self.alerts += 1
 
     def close(self) -> None:
         self.client.loop_stop()

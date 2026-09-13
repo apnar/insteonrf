@@ -172,3 +172,69 @@ def test_dedupe_tolerates_truncated_pads():
     short = Packet(full.data[:11], timestamp=full.timestamp, complete=False)
     recs = list(records([full, short]))
     assert len(recs) == 1 and recs[0]["repeats"] == 2
+
+
+def fake_mqtt(monkeypatch, sent):
+    """Install a stub paho client that records what was published."""
+    import sys
+    import types
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def username_pw_set(self, u, p):
+            pass
+
+        def connect_async(self, host, port):
+            pass
+
+        def loop_start(self):
+            pass
+
+        def loop_stop(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def publish(self, topic, payload, qos=0, retain=False):
+            sent.append((topic, qos, retain))
+
+    fake = types.ModuleType("paho.mqtt.client")
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "paho", types.ModuleType("paho"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt", types.ModuleType("paho.mqtt"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt.client", fake)
+
+
+def test_alerts_only_skips_the_per_packet_stream(monkeypatch):
+    """Nothing subscribes to per-packet topics here, and a debug-logging broker
+    writes a line per publish, so the file is the record and MQTT is for alerts."""
+    sent = []
+    fake_mqtt(monkeypatch, sent)
+    pub = MqttPublisher("broker", alerts_only=True)
+    pub.publish(on().to_dict())
+    assert sent == [] and pub.published == 0
+    pub.publish_alert({"alert": "all-link-group-0"})
+    assert [t for t, _q, _r in sent] == ["insteon-rf/alert"]
+    assert pub.alerts == 1
+
+
+def test_alerts_go_out_at_a_higher_qos_than_packets(monkeypatch):
+    sent = []
+    fake_mqtt(monkeypatch, sent)
+    pub = MqttPublisher("broker")
+    pub.publish(on().to_dict())
+    pub.publish_alert({"alert": "storm"})
+    packet_qos = [q for t, q, _r in sent if t == "insteon-rf"]
+    alert = [(q, r) for t, q, r in sent if t.endswith("/alert")]
+    assert packet_qos == [0] and alert == [(1, False)]
+
+
+def test_alerts_can_be_retained(monkeypatch):
+    sent = []
+    fake_mqtt(monkeypatch, sent)
+    pub = MqttPublisher("broker", alerts_only=True, alert_retain=True)
+    pub.publish_alert({"alert": "x"})
+    assert sent[0][2] is True

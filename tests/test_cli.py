@@ -253,11 +253,17 @@ def test_mqtt_credentials_come_from_the_environment(monkeypatch, tmp_path):
     seen = {}
 
     class FakePublisher:
+        published = 0
+        alerts = 0
+
         def __init__(self, host, port=1883, topic="insteon-rf", *, username=None,
                      password=None, **kw):
             seen.update(host=host, port=port, user=username, password=password)
 
         def publish(self, rec):
+            pass
+
+        def publish_alert(self, alert):
             pass
 
         def close(self):

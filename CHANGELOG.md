@@ -4,6 +4,19 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.4.2 — 2026-09-13
+
+- **`monitor --mqtt-alerts-only`** publishes only all-on triggers, to
+  `<topic>/alert` at QoS 1, instead of every packet. Unsubscribed messages do
+  not accumulate on a broker — unretained QoS 0 publishes are dropped, and the
+  persistence file only holds retained and queued QoS 1+ messages — but a
+  broker configured with `log_type debug` writes a line per publish, so a
+  per-packet stream with no subscriber costs log volume and nothing else. The
+  rotating JSON-lines file was always the durable record; MQTT now only carries
+  what needs a live consumer. `--mqtt-retain-alerts` keeps the last alert for a
+  consumer that connects later, at the cost of re-firing on reconnect.
+- The pod manifest uses it, and reports published/alert counts at exit.
+
 ## 2.4.1 — 2026-09-13
 
 Deployed the all-on watch as a pod and fixed what running it for real exposed.

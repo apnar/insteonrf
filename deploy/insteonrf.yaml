@@ -9,7 +9,9 @@
 #
 # On a trigger it writes the surrounding raw bursts plus an attribution report
 # (hop counts identify the copy closest to the source, RSSI hints at distance)
-# to /nvme/k8s/insteonrf-config/dumps, and publishes an alert to MQTT.
+# to /nvme/k8s/insteonrf-config/dumps, and publishes an alert to
+# insteon-rf/alert for an automation to notify on. Per-packet MQTT is off: the
+# rotating JSON-lines file at /nvme/k8s/insteonrf-config/log is the record.
 #
 # NEVER add a transmit command here: the PLM owns the air. Topic prefix is
 # insteon-rf/ so it cannot collide with insteon-mqtt's insteon/ prefix.
@@ -67,6 +69,10 @@ spec:
         - monitor
         - --mqtt=192.168.88.5:1883
         - --topic=insteon-rf
+        # The JSON-lines file is the record. Nothing subscribes to a per-packet
+        # stream, and this broker runs log_type debug (a line per publish), so
+        # MQTT carries only all-on triggers, on insteon-rf/alert.
+        - --mqtt-alerts-only
         - --out=/config/log/insteon-rf.jsonl
         - --watch-all-on
         - --known-groups=/config/groups.txt

@@ -328,7 +328,13 @@ which `rflib` cannot see the dongle). The pod exits with a one-line error if
 the dongle is busy and lets the supervisor retry, which is what happens for a
 moment when a previous process still holds the USB interface.
 
-With `--mqtt`, triggers publish as alerts so an automation can notify you. And
+With `--mqtt --mqtt-alerts-only`, triggers publish to `<topic>/alert` (QoS 1)
+and nothing else does — which is the right split for a long watch. Unsubscribed
+MQTT messages do not pile up on a broker (they go out unretained at QoS 0 and
+are simply dropped), but a broker running `log_type debug` writes a line per
+publish, so a per-packet stream nobody reads costs log volume for nothing. The
+rotating JSON-lines file is the record; MQTT is only there to wake something
+up. And
 because attribution leans on RSSI, **several receivers are much better than
 one**: compare the RSSI of the hop-intact copy across nodes in different parts
 of the house and the origin localises.
