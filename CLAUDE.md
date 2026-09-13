@@ -43,6 +43,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/manchester.py` | Manchester encode/decode, `invert_bits` |
 | `insteonrf/cmds.py` | `Command` enum, cmd1/cmd2 → name tables, `lookup()` |
 | `insteonrf/dsp.py` | numpy `modulate_fsk2()`; receive chain `find_sync()` → `estimate_cfo()` → `_ml_soft()` exposed as `demodulate_bursts()` (returns `Burst`: bits + per-symbol soft + sps + cfo + snr + header_index); `demodulate_fsk2()` is the string-contract wrapper; `iq_bursts()` splits bursts |
+| `insteonrf/context.py` | `CommandTracker`: correlates replies with their queries so an ACK's `cmd1` is read in the right table |
 | `insteonrf/recover.py` | soft-decision framing: Manchester pairs combined by difference, known frame-index counters as a checksum, bounded CRC-guided bit repair (`recover_packets`, `recover_from_burst`) |
 | `insteonrf/radio/` | `rfcat.py` (`RfcatRadio`, aliased `Radio`: 2FSK, 914.95 MHz, 9124 baud, 200 kHz BW, 75 kHz dev; `configure_rx()` syncs on the inverted start header `0x3155`, `sync_header=False` = carrier detect; `configure_tx()` sync word `0x6666`), `sdr.py` (`SdrReceiver`/`SdrTransmitter`), `file.py` (`FileRadio`), `__init__.py` (`RadioBackend` protocol, `open_backend()`) |
 | `insteonrf/monitor.py` | JSON-lines writer with rotation, mesh-repeat `Deduper`, `MqttPublisher` |
@@ -115,6 +116,33 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   radio is still in RX — a channel snapshot, not a latched per-packet measurement. Idle
   floor here is about -105 dBm; the loft KPL `2B.A0.AB` answers at about -102 dBm, i.e. it is
   a marginal link. `read_lqi()` is only meaningful right after a sync.
+- **Command-name coverage is measured, not assumed.** `/k8s/insteon-config/log/insteon_mqtt.log`
+  (~700 MB, 5 months) is the corpus: parse `Read 0x50: Std: <src>-><dst> N mh:X hl:Y cmd: c1 c2`
+  for direct, the `grp:` variant for broadcast, and `Read 0x51: Ext:` for extended, then check
+  `cmds.is_known()`. 99.5% of 257k messages are named; `tests/test_cmds.py` pins the observed
+  distribution so a table edit cannot regress it.
+- Broadcast `0x06` is the **ALL-Link Cleanup Status Report** and `cmd2` is the count of
+  responders that did not answer — verified by correlating all 11,184 of them against
+  insteon-mqtt's own "success"/"had N fails" log lines (it matched every time). It is the third
+  most common message on this network after On and Off.
+- The broadcast tables are the first step of a fallback chain (broadcast → standard → the
+  unnamed label), not standalone lists; `BCAST_EXT_CMDS` is empty on purpose and falls through.
+- **An ACK is a standard message even when it answers an extended command**, and it echoes the
+  query's `cmd1` — so `0x03`, `0x2E`, `0x2F`, `0x30` (`cmds.ambiguous()`) cannot be named from
+  one packet. Measured: 3,712 of 3,722 standard `0x2F` messages in the log arrived while an
+  extended `0x2F` to that device was outstanding, i.e. ACKs of ALDB reads all named "Light Off
+  at Rate" — 18% of direct traffic, confidently wrong. `context.CommandTracker` remembers
+  queries (5 s window) and sets `Packet.ack_of_extended`; `cmd_name` then reads the right
+  table, or reports both labels when no query was seen. Wired into recv/print/monitor/demod.
+  Found live by firing a scene: an extended `0x30` ACK read "Beep".
+- **In an ACK or NAK, `cmd2` is a reply, not a sub-command** (on-level, engine version, peeked
+  byte), so `lookup(..., ack=True)` suppresses sub-table lookup. Without that, the ACK of Get
+  Operating Flags read as "Set Operating Flags: LED On".
+- The residual ~0.5% of unnamed traffic is **corrupted powerline reception**, not missing
+  entries: standard powerline messages have no CRC, 53% of the unnamed arrive within 1.5 s of a
+  named command from the same device, `hl:0` copies are over-represented, and they cluster into
+  89 hours of ~3,600. Do not "fix" it by adding names. RF packets carry a CRC, so they never
+  reach the decoder; use `monitor --unknown-commands` if something genuinely new appears.
 - Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
   Assistant `mqtt.publish` service (no `mosquitto_pub` on the host or in the pod), e.g.
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.

@@ -132,7 +132,19 @@ BCAST_STD_CMDS: dict[int, dict[str, Any]] = {
     0x01: {"label": "Set Button Pressed (Responder)"},
     0x02: {"label": "Set Button Pressed (Controller)"},
     0x03: {"label": "Test Powerline Phase", "sub": {0x00: "Phase A", 0x01: "Phase B"}},
+    # [UNVERIFIED] inherited from upstream. In 5 months of PLM logs 0x04 appears
+    # only as a *direct* message, never as a broadcast, and battery devices send
+    # their heartbeat as 0x11/0x13 on group 4 instead. Kept in case some device
+    # does use it, but do not trust the name.
     0x04: {"label": "Heartbeat"},
+    # Broadcast by a controller when an ALL-Link command finishes. cmd2 is the
+    # number of responders that did not answer the cleanup — verified against
+    # 11,184 of these in a real PLM log, where it matched insteon-mqtt's own
+    # success/"had N fails" verdict in every case. This is the third most
+    # common message on a busy network, after On and Off.
+    0x06: {"label": "ALL-Link Cleanup Status Report",
+           "cmd2": lambda c2: "all responders answered" if c2 == 0
+                   else f"{c2} responder{'s' if c2 != 1 else ''} did not answer"},
     0x11: {"label": "On"},
     0x12: {"label": "Fast On"},
     0x13: {"label": "Off"},
@@ -147,21 +159,76 @@ BCAST_STD_CMDS: dict[int, dict[str, Any]] = {
 
 BCAST_EXT_CMDS: dict[int, dict[str, Any]] = {}
 
-_TABLE_NAMES = {
-    (False, False): ("Std", STD_CMDS),
-    (True, False): ("Ext", EXT_CMDS),
-    (False, True): ("Bcast", BCAST_STD_CMDS),
-    (True, True): ("Bcast Ext", BCAST_EXT_CMDS),
+#: Which table to consult first for each ``(extended, broadcast)`` combination,
+#: and what to fall back to. The broadcast tables only need entries where a
+#: command *means something different* when broadcast; everything else shares
+#: the standard meaning, so falling through beats duplicating the tables (and
+#: beats reporting "Bcast Command 0x09" for a plain Enter Link Mode).
+_TABLES: dict[tuple[bool, bool], tuple[str, tuple[dict[int, dict[str, Any]], ...]]] = {
+    (False, False): ("Std", (STD_CMDS,)),
+    (True, False): ("Ext", (EXT_CMDS,)),
+    (False, True): ("Bcast", (BCAST_STD_CMDS, STD_CMDS)),
+    (True, True): ("Bcast Ext", (BCAST_EXT_CMDS, EXT_CMDS, STD_CMDS)),
 }
 
 
-def lookup(cmd1: int, cmd2: int | None = None, *, extended: bool = False, bcast: bool = False) -> str:
-    """Return a human-readable name for ``cmd1`` (and ``cmd2`` where it selects a sub-command)."""
-    kind, table = _TABLE_NAMES[(bool(extended), bool(bcast))]
-    entry = table.get(cmd1)
+def find(cmd1: int, *, extended: bool = False, bcast: bool = False) -> dict[str, Any] | None:
+    """The table entry for ``cmd1``, following the fallback chain, or None."""
+    _kind, tables = _TABLES[(bool(extended), bool(bcast))]
+    for table in tables:
+        entry = table.get(cmd1)
+        if entry is not None:
+            return entry
+    return None
+
+
+def is_known(cmd1: int, *, extended: bool = False, bcast: bool = False) -> bool:
+    """Whether this command has a name, i.e. :func:`lookup` will not fall back.
+
+    ``insteon-rf monitor --unknown-commands`` uses this to surface commands the
+    tables do not cover instead of letting them hide in the log as
+    ``Std Command 0x??``.
+    """
+    return find(cmd1, extended=extended, bcast=bcast) is not None
+
+
+def ambiguous(cmd1: int) -> bool:
+    """True when ``cmd1`` means different things standard vs extended.
+
+    An ACK is always a standard message but echoes the query's ``cmd1``, so for
+    these numbers a reply cannot be named from one packet alone — see
+    :mod:`insteonrf.context`.
+    """
+    std, ext = STD_CMDS.get(cmd1), EXT_CMDS.get(cmd1)
+    return bool(std and ext and std["label"] != ext["label"])
+
+
+def both_labels(cmd1: int) -> str:
+    """``"standard / extended"`` for an ambiguous command, for honest output."""
+    return f"{STD_CMDS[cmd1]['label']} / {EXT_CMDS[cmd1]['label']}"
+
+
+def lookup(cmd1: int, cmd2: int | None = None, *, extended: bool = False,
+           bcast: bool = False, ack: bool = False) -> str:
+    """Return a human-readable name for ``cmd1``.
+
+    ``cmd2`` refines the answer where it selects a sub-command — but only when
+    ``ack`` is false. In an ACK or NAK, ``cmd2`` is the device's *reply*: an
+    on-level, an engine version, a peeked byte. Reading it as a sub-command
+    there produces confident nonsense, such as reporting the ACK of Get
+    Operating Flags as "Set Operating Flags: LED On".
+    """
+    kind, _tables = _TABLES[(bool(extended), bool(bcast))]
+    entry = find(cmd1, extended=extended, bcast=bcast)
     if entry is None:
         return f"{kind} Command 0x{cmd1:02X}"
+    label = str(entry["label"])
+    if cmd2 is None or ack:
+        return label
     sub = entry.get("sub")
-    if sub and cmd2 is not None and cmd2 in sub:
-        return f"{entry['label']}: {sub[cmd2]}"
-    return str(entry["label"])
+    if sub and cmd2 in sub:
+        return f"{label}: {sub[cmd2]}"
+    fmt = entry.get("cmd2")
+    if fmt is not None:
+        return f"{label}: {fmt(cmd2)}"
+    return label

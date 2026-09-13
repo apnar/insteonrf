@@ -264,6 +264,10 @@ class Packet:
     snr_db: float | None = field(default=None, repr=False, compare=False)
     #: Receiver signal strength in dBm, when the radio reports it.
     rssi_dbm: float | None = field(default=None, repr=False, compare=False)
+    #: For an ACK/NAK: whether the query it answers was extended, when
+    #: :class:`insteonrf.context.CommandTracker` could work it out. ``None``
+    #: means unknown, and an ambiguous command is then reported as both.
+    ack_of_extended: bool | None = field(default=None, repr=False, compare=False)
     #: Whether the frame-index counters ran as the protocol requires. ``False``
     #: means these bytes are not a packet however well the CRC happened to
     #: match — an 8-bit CRC matches one random candidate in 256.
@@ -444,9 +448,25 @@ class Packet:
 
     @property
     def cmd_name(self) -> str | None:
+        """The command's name, read from the right table.
+
+        An ACK is a standard message even when it answers an extended command,
+        and it echoes the query's ``cmd1`` — so for the handful of numbers that
+        mean different things in the two tables, one packet is not enough.
+        With ``ack_of_extended`` set (see :mod:`insteonrf.context`) the reply is
+        read in the query's table; without it, both meanings are reported
+        rather than guessing one.
+        """
         if self.cmd1 is None:
             return None
-        return cmds.lookup(self.cmd1, self.cmd2, extended=self.extended, bcast=self.bcast)
+        extended = self.extended
+        if self.ack:
+            if self.ack_of_extended is not None:
+                extended = self.ack_of_extended
+            elif cmds.ambiguous(self.cmd1):
+                return cmds.both_labels(self.cmd1)
+        return cmds.lookup(self.cmd1, self.cmd2, extended=extended, bcast=self.bcast,
+                           ack=self.ack)
 
     @property
     def ext_data(self) -> list[int] | None:
@@ -507,6 +527,8 @@ class Packet:
             "cmd1": self.cmd1,
             "cmd2": self.cmd2,
             "command": self.cmd_name,
+            "command_known": (None if self.cmd1 is None else
+                              cmds.is_known(self.cmd1, extended=self.extended, bcast=self.bcast)),
             "ext_data": self.ext_data,
             "crc": self.crc,
             "crc_ok": self.crc_ok,

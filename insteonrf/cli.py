@@ -20,9 +20,11 @@ import signal
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from typing import IO, Any, TextIO
 
+from .context import CommandTracker
 from .debug import dump_frames
 from .packet import Packet, iter_bit_lines, parse_bits
 from .radio import BACKENDS, DEFAULT_DRATE, DEFAULT_FREQ, DEFAULT_SAMPLE_RATE, open_backend
@@ -182,7 +184,8 @@ def _receive(radio: Any, timeout_ms: int) -> tuple[float, str, Any, int | None] 
 
 
 def _decode(bits: str, ts: float | None, *, repair: bool = True, show_all: bool = False,
-            soft: Any = None, header_index: int | None = None) -> list[Packet]:
+            soft: Any = None, header_index: int | None = None,
+            tracker: Any = None) -> list[Packet]:
     """Decode a burst, recovering marginal packets when ``repair`` is set.
 
     :func:`~insteonrf.packet.parse_bits` is the fast path. With ``repair`` on,
@@ -215,6 +218,11 @@ def _decode(bits: str, ts: float | None, *, repair: bool = True, show_all: bool 
         if key(pkt) not in seen:
             out.append(pkt)
             seen.add(key(pkt))
+    if tracker is not None:
+        # An ACK echoes its query's cmd1 but is always a standard message, so
+        # the reply is only nameable in the light of what was asked.
+        for pkt in out:
+            tracker.observe(pkt)
     return out
 
 
@@ -249,6 +257,7 @@ def recv_main(argv: list[str] | None = None) -> int:
     _setup_logging(a.verbose)
     _install_signal_handlers()
 
+    tracker = CommandTracker()
     with _open_radio(a) as radio:
         radio.configure_rx(sync_header=not a.carrier)
         if a.verbose and not a.decode and hasattr(radio, "print_config"):
@@ -263,7 +272,7 @@ def recv_main(argv: list[str] | None = None) -> int:
                 ts, bits, soft, header_index = got
                 if a.decode:
                     pkts = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
-                                   soft=soft, header_index=header_index)
+                                   soft=soft, header_index=header_index, tracker=tracker)
                     _print_packets(pkts, sys.stdout, verbose=a.verbose > 0,
                                    show_time=a.time, as_json=a.json)
                 else:
@@ -340,6 +349,7 @@ def print_main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
 
     log_fh = open(a.log, "a") if a.log else None
+    tracker = CommandTracker()
     try:
         for kind, line in iter_bit_lines(_open_lines(a.files)):
             if kind == "meta":
@@ -349,7 +359,8 @@ def print_main(argv: list[str] | None = None) -> int:
             if kind == "junk":
                 print(f"skipping non-bit line: {line[:40]!r}", file=sys.stderr)
                 continue
-            _print_packets(_decode(line, None, repair=not a.no_repair, show_all=a.all),
+            _print_packets(_decode(line, None, repair=not a.no_repair, show_all=a.all,
+                                   tracker=tracker),
                            sys.stdout, verbose=a.verbose > 0, show_time=a.time,
                            log_fh=log_fh, as_json=a.json)
     except KeyboardInterrupt:
@@ -562,6 +573,7 @@ def demod_main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     _setup_logging(a.verbose)
 
+    tracker = CommandTracker()
     if a.demod in ("c", "auto"):
         path = find_demod()
         if path is None and a.demod == "c":
@@ -587,6 +599,7 @@ def demod_main(argv: list[str] | None = None) -> int:
                 from .recover import recover_from_burst
 
                 for rec in recover_from_burst(burst, repair=not a.no_repair):
+                    tracker.observe(rec.packet)
                     if a.verbose:
                         log.info("burst: %d bits, snr %.1f dB, cfo %+.0f Hz, %d bit(s) repaired",
                                  len(burst.bits), burst.snr_db, burst.cfo_hz, rec.corrected)
@@ -649,6 +662,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
                    help="MQTT password (default: $INSTEONRF_MQTT_PASS — prefer this to a "
                         "command line, which is visible in ps)")
     p.add_argument("--no-dedupe", action="store_true", help="log every mesh repeat separately")
+    p.add_argument("-U", "--unknown-commands", action="store_true",
+                   help="report commands the tables do not name — the first time each is seen "
+                        "and as a summary at exit — so a device speaking something new surfaces "
+                        "instead of hiding in the log as 'Std Command 0x??'")
     p.add_argument("--window", type=float, default=DEDUPE_WINDOW_S,
                    help="dedupe window in seconds (default %(default)s)")
     p.add_argument("-a", "--all", action="store_true", help="also log fragments with no CRC")
@@ -671,7 +688,22 @@ def monitor_main(argv: list[str] | None = None) -> int:
         mqtt = MqttPublisher(host, int(port or 1883), a.topic,
                              username=a.mqtt_user, password=a.mqtt_pass)
     dd = None if a.no_dedupe else Deduper(a.window)
+    tracker = CommandTracker()
     seen = 0
+    unknown: Counter[tuple[str, int]] = Counter()
+
+    def note_unknown(pkt: Packet) -> None:
+        """Flag a command the tables cannot name, once per distinct command."""
+        from . import cmds
+
+        if pkt.cmd1 is None or cmds.is_known(pkt.cmd1, extended=pkt.extended, bcast=pkt.bcast):
+            return
+        kind = ("bcast " if pkt.bcast else "") + ("ext" if pkt.extended else "std")
+        key = (kind, pkt.cmd1)
+        unknown[key] += 1
+        if unknown[key] == 1:
+            log.warning("unnamed command: %s cmd1=0x%02X from %s (%s)",
+                        kind, pkt.cmd1, pkt.from_addr or pkt.to_addr, pkt.summary())
 
     def emit(recs: list[dict[str, Any]]) -> None:
         nonlocal seen
@@ -696,8 +728,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
                     if not a.no_rssi and hasattr(radio, "read_rssi"):
                         rssi = radio.read_rssi()
                     for pkt in _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
-                                       soft=soft, header_index=header_index):
+                                       soft=soft, header_index=header_index, tracker=tracker):
                         pkt.rssi_dbm = rssi
+                        if a.unknown_commands:
+                            note_unknown(pkt)
                         if dd is None:
                             emit([pkt.to_dict()])
                         else:
@@ -717,6 +751,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
             writer.close()
         if mqtt is not None:
             mqtt.close()
+        if unknown:
+            log.warning("%d unnamed command(s) seen:", len(unknown))
+            for (kind, cmd1), n in unknown.most_common():
+                log.warning("    %-10s cmd1=0x%02X  %d time(s)", kind, cmd1, n)
     log.info("logged %d packet(s)", seen)
     return 0
 

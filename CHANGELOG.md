@@ -4,6 +4,72 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.3.0 — 2026-09-13
+
+Command-name coverage, measured against a real network rather than assumed:
+257,000 received messages in five months of PLM logs from a 136-device
+installation (68 dimmers, 18 relay switches, 13 KeypadLincs, 11 FanLincs,
+21 leak sensors, 3 remotes, 2 door sensors). Named coverage went from 95.3% of
+broadcast and 94.2% of direct traffic to **99.5% overall**.
+
+### Added
+
+- **`0x06` ALL-Link Cleanup Status Report** in the broadcast table — 11,185
+  messages in that log, the third most common thing on the air after On and
+  Off, previously reported as "Bcast Command 0x06". Its `cmd2` is the number of
+  responders that did not answer the cleanup, verified against all 11,184
+  instances where insteon-mqtt's own success/"had N fails" verdict was logged
+  alongside: `cmd2` matched the fail count every time.
+- **`cmds.find()` and `cmds.is_known()`**, and a `command_known` field in the
+  JSON, so unnamed commands can be found by query rather than by eye.
+- **`insteon-rf monitor --unknown-commands`** warns the first time each unnamed
+  command is seen (with sender and packet) and prints a summary at exit, so a
+  device speaking something new surfaces instead of hiding in a log.
+
+### Fixed
+
+- **An ACK is no longer named from the wrong table.** An ACK or NAK is always a
+  *standard* message even when it answers an extended command, and it echoes
+  the query's `cmd1` — and `0x03`, `0x2E`, `0x2F` and `0x30` mean different
+  things in the two tables. So every reply to an extended command was named as
+  the standard command of the same number. This was not marginal: of the 3,722
+  standard `0x2F` messages in that log, **3,712 arrived while an extended
+  `0x2F` to that same device was outstanding** — ACKs of ALDB reads, all
+  reported as "Light Off at Rate". That is 18% of direct traffic confidently
+  mislabelled, which is worse than being unnamed.
+
+  `insteonrf/context.py` fixes it the only way a receiver can, by remembering
+  what was asked: feed `CommandTracker` the packets in arrival order and it
+  marks each reply with whether its query was extended. `recv`, `print`,
+  `monitor` and `demod -D` all do this now. With no context available, an
+  ambiguous reply reports *both* meanings ("Beep / Trigger ALL-Link Command")
+  rather than picking one.
+
+  Found by firing a real scene and watching the air: an extended `0x30`
+  Trigger ALL-Link Command came back as an ACK named "Beep".
+- **The broadcast tables no longer dead-end.** They were thin standalone lists
+  — 14 entries for standard, *empty* for extended — so a command with the same
+  meaning in both contexts came out as "Bcast Command 0x09" despite being in
+  the standard table. They are now the first step of a fallback chain
+  (broadcast → standard), which is also why extended broadcasts decode at all.
+- **`cmd2` is no longer read as a sub-command in an ACK or NAK.** There, `cmd2`
+  is the device's reply — an on-level, an engine version, a peeked byte — so
+  the old behaviour reported the ACK of Get Operating Flags as "Set Operating
+  Flags: LED On". `lookup()` takes `ack=` and `Packet.cmd_name` passes it.
+- Marked the inherited broadcast `0x04 → "Heartbeat"` entry as unverified: in
+  five months that log has no broadcast `0x04` at all, and battery devices send
+  their heartbeat as `0x11`/`0x13` on group 4.
+
+### Not changed, deliberately
+
+0.47% of that traffic is still unnamed, and the evidence says it is corrupted
+reception rather than missing table entries: standard Insteon *powerline*
+messages carry no CRC (they rely on triple repetition), 53% of the unnamed ones
+arrive within 1.5 s of a named command from the same device, `hops_left=0` — the
+most-repeated copy — is over-represented, and they cluster into 89 hours out of
+some 3,600. Naming them would be inventing protocol. RF packets *do* carry a
+CRC, so they cannot reach this decoder in the first place.
+
 ## 2.2.0 — 2026-09-13
 
 Receiver rework: the detector now runs near the theoretical limit for uncoded

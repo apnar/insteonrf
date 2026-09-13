@@ -217,6 +217,7 @@ and flips the least-confident bits looking for a CRC match.
     insteonrf/manchester.py Manchester coding helpers
     insteonrf/dsp.py        numpy modulator, sync correlation, CFO, ML detector, Burst
     insteonrf/recover.py    soft-decision framing and CRC-guided repair
+    insteonrf/context.py    remembers queries so replies name from the right table
     insteonrf/radio/        rfcat, SDR and file backends behind one protocol
     insteonrf/monitor.py    JSON-lines logging, mesh-repeat dedupe, MQTT
     insteonrf/debug.py      frame-by-frame dump for demodulator debugging
@@ -256,6 +257,74 @@ for the start header, so leading garbage and either bit polarity are fine.
 
 Backends: `--backend rfcat` (default, TX and RX), `rtlsdr` (RX), `hackrf`
 (RX, and TX via the numpy modulator), `file` (replays bit-string files).
+
+## Command coverage
+
+The command tables are checked against real traffic, not guesswork: 257,000
+received messages from five months of PLM logs on a 136-device network (68
+dimmers, 18 relay switches, 13 KeypadLincs, 11 FanLincs, 21 leak sensors, 3
+remotes, 2 door sensors). **99.5% of those messages get a name.**
+
+| Message class | Messages | Named |
+|---|---|---|
+| Group broadcast, standard | 236,962 | 100% |
+| Direct, standard | 20,104 | 94.2% |
+| Extended | 8,155 | 99.7% |
+
+`tests/test_cmds.py` pins that result: every command the traffic contained is
+asserted to have a name, so a table edit cannot silently regress it.
+
+Device classes matter less than you'd think here. Leak sensors, door sensors
+and remotes signal through **group numbers** rather than special commands — a
+leak sensor sends plain `0x11`/`0x13` on group 1 (dry), 2 (wet) and 4
+(heartbeat) — and KeypadLinc buttons and FanLinc speeds are likewise ordinary
+commands distinguished by group and extended data. So there is no device class
+whose vocabulary sits outside these tables.
+
+### Replies are read in the query's table
+
+An ACK is always a *standard* message even when it answers an extended command,
+and it echoes the query's `cmd1`. Four numbers mean different things in the two
+tables — `0x03`, `0x2E`, `0x2F`, `0x30` — so a reply cannot be named from one
+packet alone. Measured on that same log, 3,712 of 3,722 standard `0x2F`
+messages were ACKs of extended ALDB reads; naming them from the standard table
+called every one of them "Light Off at Rate".
+
+`insteonrf.context.CommandTracker` remembers recent queries, so `recv`,
+`print`, `monitor` and `demod -D` name the reply from the query's table. Where
+no query was seen, both meanings are reported ("Beep / Trigger ALL-Link
+Command") rather than guessing:
+
+```python
+from insteonrf.context import CommandTracker
+tracker = CommandTracker()
+for pkt in stream:            # in arrival order
+    tracker.observe(pkt)
+    print(pkt.cmd_name)
+```
+
+### The remaining 0.47%
+
+Unnamed messages are all low-numbered *direct* commands (`0x00`, `0x04`–`0x0E`),
+and the evidence says they are corrupted reception rather than gaps:
+
+- standard Insteon **powerline** messages carry no CRC at all — they rely on
+  triple repetition, so mangled bytes reach the PLM and get logged;
+- 53% of them arrive within 1.5 s of a *named* command from the same device;
+- `hops_left=0`, the most-repeated copy, is over-represented (345 of 757);
+- they cluster into 89 hours out of roughly 3,600.
+
+Naming them would mean inventing protocol. **RF packets do carry a CRC**, so
+they cannot reach this decoder at all — which is why insteonrf's view of your
+network is cleaner than your PLM's.
+
+If something genuinely new does turn up on the air, surface it rather than let
+it hide in a log:
+
+```
+insteon-rf monitor --unknown-commands     # warns on each new one, summary at exit
+grep '"command_known":false' insteon-rf.jsonl | jq -r .command | sort | uniq -c
+```
 
 ## Sensitivity
 
@@ -389,6 +458,7 @@ for q in parse_bits(bits):
 | `to`, `from` | addresses as `16.3F.E5` (`from` is `null` on group broadcasts) |
 | `group` | all-link group number on group broadcasts, else `null` |
 | `cmd1`, `cmd2`, `command` | command bytes and the looked-up name |
+| `command_known` | false when the tables have no name for this command — see [Command coverage](#command-coverage) |
 | `ext_data` | the 13 extended-data bytes, or `null` |
 | `crc`, `crc_ok`, `ext_crc_ok` | received CRC and whether it verified |
 | `corrected` | how many bits the repair search had to flip (0 for a clean decode) |
