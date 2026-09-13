@@ -1,106 +1,65 @@
+# insteonrf — C helpers for the SDR receive path.
+#
+#   make           build fsk2_demod and rf_clip
+#   make test      build, then run the Python test suite
+#   make lint      ruff + mypy (needs the dev extra installed)
+#   make clean     remove objects; make realclean also removes the binaries
+#
+# The Python side needs no build step: 'pip install -e .' installs insteon-rf.
+# There is no fsk2_mod target any more — 'insteon-rf modulate' (numpy) replaced
+# the never-committed liquid-dsp modulator.
 
-UNAME = `uname`
-
-CC=gcc
-
-# ifeq ($(UNAME),Linux)
-# CC=gcc-4.7
-# endif
-
-# .if ${UNAME}=="FreeBSD"
-# CC=gcc47
-# .endif
-
-# ifeq ($(UNAME),FreeBSD)
-# CC=gcc47
-# endif
+UNAME = $(shell uname)
+CC ?= gcc
 
 MKDIR_P = mkdir -p
 
-OBJECTS_DIR=Obj
-SOURCE_DIR=Src
-CFLAGS+=-ggdb -O2 -Wall
-LDFLAGS+=-ggdb
-LINTFLAGS=-g -n -u -z
-TESTWAV=Dat/41802513110D2711018C00.dat
+OBJECTS_DIR = Obj
+SOURCE_DIR = Src
+CFLAGS += -ggdb -O2 -Wall -Wextra -Werror
+LDFLAGS += -ggdb
+TESTDAT = Dat/41802513110D2711018C00.dat
 
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
 all: directories fsk2_demod rf_clip
 
+.PHONY: all directories test lint check clean realclean p
 
-
-.PHONY: directories test
-
-directories: ${OBJECTS_DIR}
-
-PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+directories: $(OBJECTS_DIR)
 
 test: fsk2_demod
 	$(PYTHON) -m pytest -q
 
-fsk2_mod: $(OBJECTS_DIR)/fsk2_mod.o 
-	$(CC) $(LDFLAGS) -O2 -pipe $+ -o $@ -lm -lliquid
+lint:
+	$(PYTHON) -m ruff check .
+	$(PYTHON) -m mypy
+
+check: lint test
+
+# Decode the reference capture — the line the README and tests assert.
+fixture: fsk2_demod
+	./fsk2_demod -U < $(TESTDAT) | $(PYTHON) -m insteonrf.cli print
 
 fsk2_demod: $(OBJECTS_DIR)/fsk2_demod.o $(OBJECTS_DIR)/fxpt_atan2.o
 	$(CC) $(LDFLAGS) -O2 -pipe $+ -o $@ -lm
-#	$(CC) $(LDFLAGS) -O2 -pipe $< $(OBJECTS_DIR)/fxpt_atan2.o -o $@ -lm
 
-rf_clip:  $(OBJECTS_DIR)/rf_clip.o
+rf_clip: $(OBJECTS_DIR)/rf_clip.o
 	$(CC) $(LDFLAGS) -O2 -pipe $< -o $@
 
-
-
-########## 8 bit
-
-$(OBJECTS_DIR)/rf_clip.o: ${SOURCE_DIR}/rf_clip.c
-	$(CC) -g  -c $(CFLAGS) -o $@ $<
-
-$(OBJECTS_DIR)/fxpt_atan2.o: ${SOURCE_DIR}/fxpt_atan2.c
-	$(CC) -g -c $(CFLAGS) -o $@ $<
-
-$(OBJECTS_DIR)/fsk2_mod.o: ${SOURCE_DIR}/fsk2_mod.c
-	$(CC) -g  -c $(CFLAGS) -o $@ $< -I/usr/local/include/liquid 
-
-$(OBJECTS_DIR)/fsk2_demod.o: ${SOURCE_DIR}/fsk2_demod.c
-	$(CC) -g  -c $(CFLAGS) -o $@ $<
-
-##########
-
-$(OBJECTS_DIR)/insteon_lib.o: ${SOURCE_DIR}/insteon_lib.c
-	$(CC) -g -c $(CFLAGS) -o $@ $<
-
-$(OBJECTS_DIR)/convert.o: ${SOURCE_DIR}/convert.c
-	$(CC) -g -c $(CFLAGS) -o $@ $<
-
-$(OBJECTS_DIR)/convert_lib.o: ${SOURCE_DIR}/convert_lib.c
-	$(CC) -g -c $(CFLAGS) -o $@ $<
-
-convert: $(OBJECTS_DIR)/convert.o $(OBJECTS_DIR)/convert_lib.o 
-	$(CC) $(LDFLAGS) -O2 -pipe $^ -o $@
-
-insteon_pkt_crc: insteon_pkt_crc.o $(OBJECTS_DIR)/insteon_lib.o 
-	$(CC) $(LDFLAGS) -O2 -pipe $^ -o $@
-
+$(OBJECTS_DIR)/%.o: $(SOURCE_DIR)/%.c
+	$(CC) -c $(CFLAGS) -o $@ $<
 
 $(OBJECTS_DIR):
-	@mkdir $(OBJECTS_DIR)
-
-lint:
-	@lint $(LINTFLAGS) ${SOURCE_DIR}/fsk2_demod.c
-	@lint $(LINTFLAGS) ${SOURCE_DIR}/rf_clip.c
-	@lint $(LINTFLAGS) ${SOURCE_DIR}/fsk2_mod.c
-	@lint $(LINTFLAGS) ${SOURCE_DIR}/convert.c
-	@lint $(LINTFLAGS) ${SOURCE_DIR}/conver_lib.c
-
+	@$(MKDIR_P) $(OBJECTS_DIR)
 
 p:
-	echo UNAME ${UNAME}
-	echo OSTYPE ${OSTYPE}
-	echo CC ${CC}
+	@echo UNAME $(UNAME)
+	@echo CC $(CC)
+	@echo PYTHON $(PYTHON)
 
 clean:
 	@/bin/rm -rf $(OBJECTS_DIR)
 
-realclean:
-	@/bin/rm -rf $(OBJECTS_DIR)
-	@/bin/rm -f ./rf_clip ./fsk2_demod ./fsk2_mod
+realclean: clean
+	@/bin/rm -f ./rf_clip ./fsk2_demod

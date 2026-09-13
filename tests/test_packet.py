@@ -1,10 +1,21 @@
+import json
 import pathlib
 
 import pytest
 
+from insteonrf.cmds import Command
+from insteonrf.debug import dump_frames
 from insteonrf.packet import (
-    Packet, START_HEADER, START_HEADER_INV, addr_to_wire, decode_frames, dump_frames,
-    ext_crc, parse_addr, parse_bits, pkt_crc, wire_to_addr,
+    START_HEADER,
+    START_HEADER_INV,
+    Address,
+    Flags,
+    MsgType,
+    Packet,
+    decode_frames,
+    ext_crc,
+    parse_bits,
+    pkt_crc,
 )
 
 DATA = pathlib.Path(__file__).parent / "data"
@@ -37,12 +48,43 @@ def test_doc_example_crc():
 
 
 def test_addresses():
-    assert parse_addr("16.3F.E5") == [0x16, 0x3F, 0xE5]
-    assert parse_addr("163fe5") == parse_addr("16:3F:E5") == parse_addr(0x163FE5)
-    assert addr_to_wire("16.3F.E5") == [0xE5, 0x3F, 0x16]
-    assert wire_to_addr([0xE5, 0x3F, 0x16]) == "16.3F.E5"
-    with pytest.raises(ValueError):
-        parse_addr("1234")
+    a = Address("16.3F.E5")
+    assert a.bytes == (0x16, 0x3F, 0xE5) and a.wire == (0xE5, 0x3F, 0x16)
+    assert a.value == 0x163FE5 and str(a) == "16.3F.E5" and repr(a) == "Address('16.3F.E5')"
+    assert a == Address("163fe5") == Address("16:3F:E5") == Address(0x163FE5) == Address(a)
+    assert Address.from_wire([0xE5, 0x3F, 0x16]) == a
+    assert Address([0x16, 0x3F, 0xE5]) == a
+    for bad in ("1234", "16.3F.EZ", -1, 1 << 24):
+        with pytest.raises(ValueError):
+            Address(bad)
+    with pytest.raises(TypeError):
+        Address(True)
+
+
+def test_address_interop_with_strings():
+    """Address compares and hashes like its string form, so old code keeps working."""
+    a = Address("16.3F.E5")
+    assert a == "16.3F.E5" and "16.3f.e5" == a and a != "13.25.80"
+    assert {a: 1}["16.3F.E5"] == 1 and a in {"16.3F.E5"}
+    assert f"{a}" == "16.3F.E5" and f"{a:>12}" == "    16.3F.E5"
+    assert (a == 0x163FE5) is False  # ints are not addresses for equality
+
+
+def test_flags_roundtrip():
+    for byte in range(256):
+        f = Flags.from_byte(byte)
+        assert f.to_byte() == byte
+    f = Flags.from_byte(0x9F)
+    assert f.msg_type is MsgType.BROADCAST and f.extended and f.group is False
+    assert f.hops_left == 3 and f.max_hops == 3 and "Broadcast" in str(f)
+
+
+def test_msg_type_and_command_enums():
+    p = Packet.build("13.25.80", "16.3F.E5", cmd1=0x11, cmd2=0xFF)
+    assert p.msg_type is MsgType.DIRECT and p.msg_type.label == "Direct"
+    assert p.command is Command.ON and p.command.label == "On"
+    assert p.flags.to_byte() == p.flags_byte
+    assert Packet.build("13.25.80", "16.3F.E5", cmd1=0xC7).command is None
 
 
 def test_build_direct_matches_original():
@@ -71,6 +113,29 @@ def test_build_requires_one_target():
         Packet.build("13.25.80", cmd1=0x11)
     with pytest.raises(ValueError):
         Packet.build("13.25.80", "16.3F.E5", group=1, cmd1=0x11)
+
+
+def test_bytes_and_dict_roundtrip():
+    for p in (Packet.build("13.25.80", "16.3F.E5", cmd1=0x13),
+              Packet.build("2B.93.07", "29.4E.52", cmd1=0x2F, ext_data=[1, 2, 3])):
+        assert Packet.parse(bytes(p)) == p
+        d = p.to_dict()
+        assert Packet.from_dict(d) == p
+        assert json.loads(json.dumps(d))["raw"] == bytes(p).hex().upper()
+        assert d["to"] == str(p.to_addr) and d["from"] == str(p.from_addr)
+        assert d["crc_ok"] is True and d["msg_type"] == "DIRECT"
+    p = Packet.build("13.25.80", group=7, cmd1=0x11, bcast=True)
+    d = p.to_dict()
+    assert d["group"] == 7 and d["from"] is None and d["msg_type"] == "GROUP_BROADCAST"
+    with pytest.raises(ValueError):
+        Packet.from_dict({})
+
+
+def test_packet_equality_ignores_metadata():
+    a = Packet.build("13.25.80", "16.3F.E5", cmd1=0x13)
+    b = Packet(list(a.data), bits="0101", timestamp=123.0, complete=False)
+    assert a == b and a != Packet.build("13.25.80", "16.3F.E5", cmd1=0x11)
+    assert len(a) == len(a.data)
 
 
 def test_from_wire_appends_crc():

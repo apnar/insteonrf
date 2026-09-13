@@ -208,8 +208,7 @@ extern int optind, opterr, optopt;
 }
 
 int resync_shift(struct IQ *iq, int loc, int pkt_offset, int ph) {
-int x, y;
-char i, q;
+int x;
 uint16_t ui;
 uint16_t up;
 int8_t prev_i;
@@ -226,9 +225,9 @@ int x_start;
     }
     prev_i =  iq[ loc ].i;
     prev_q =  iq[ loc ].q;
-    up = fxpt_atan2( (int16_t)  prev_i,  (int16_t)  prev_q);
+    up = fxpt_atan2( (int16_t)  prev_q,  (int16_t)  prev_i);
     for(x=loc; x > x_start; x--) {
-	ui = fxpt_atan2( (int16_t)  iq[x].i, (int16_t)  iq[x].q);
+	ui = fxpt_atan2( (int16_t)  iq[x].q, (int16_t)  iq[x].i);
 	tp = up - ui;
 	up = ui;
 
@@ -243,7 +242,8 @@ int x_start;
 	}
     }
 
-
+    /* walked the whole window without finding an opposite phase step */
+    return -1;
 }
 
 /* look fof first phase shift so we can sync with the data */
@@ -283,13 +283,10 @@ uint16_t ui;
 uint16_t up;
 int phased=0;
 static int stateMark_add=0;
-static int stateMark_val=0;
 static int stateMark_cnt=0;
 static int stateMark_score=0;
 static int8_t prev_i;
 static int8_t prev_q;
-    
-int m;
 
     iq = (struct IQ *) data;
     iq_len = data_len / sizeof(struct IQ);
@@ -350,8 +347,13 @@ int m;
 	     /*
 		check phase by waiting and calc phased
 	    */
-	    up = fxpt_atan2( (int16_t)  prev_i,  (int16_t)  prev_q);
-	    ui = fxpt_atan2( (int16_t)  iq[i].i, (int16_t)  iq[i].q);
+	    /* fxpt_atan2() takes (y, x): the phase of I+jQ is atan2(q, i).
+	       The original code passed (i, q), which negates the phase and so
+	       complemented every bit; the packet still decoded because the
+	       parser accepts either polarity, but generated samples and real
+	       captures came out with opposite polarity. */
+	    up = fxpt_atan2( (int16_t)  prev_q,  (int16_t)  prev_i);
+	    ui = fxpt_atan2( (int16_t)  iq[i].q, (int16_t)  iq[i].i);
 	    tp = ui - up;
 
 	    /* avoid transitions */
@@ -377,10 +379,8 @@ int m;
 		char data_val='?';
 		if (stateMark_score < 0 ) {
 		    data_val = data_zero;
-		    stateMark_val=1;
 		} else if (stateMark_score > 0 ) {
 		    data_val = data_one;
-		    stateMark_val=-1;
 		}
 
 
@@ -396,8 +396,6 @@ int m;
 		}
 
 	    }
-
-	stateMark_val=0;
 
 	prev_i = iq[i].i;
 	prev_q = iq[i].q;
@@ -466,7 +464,7 @@ int carrier_detect=0;
 		carrier_detect = 1;
 
 		if ( verbose > 1) {
-		    fprintf(stderr,"# %d: k = %d : %d\n", c, k, ( c * sizeof(buff) ) );
+		    fprintf(stderr,"# %d: k = %u : %zu\n", c, k, ( (size_t) c * sizeof(buff) ) );
 		}
 
 		bit_count=0;  // reset 

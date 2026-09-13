@@ -23,10 +23,13 @@ a receiver may see either polarity — :func:`parse_bits` accepts both.
 from __future__ import annotations
 
 import datetime as _dt
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from enum import IntEnum
+from typing import Any
 
 from . import cmds
+from .cmds import Command
 from .manchester import ManchesterError, invert_bits, manchester_decode, manchester_encode
 
 # The marker of the first frame plus the surrounding preamble/index bits.
@@ -42,6 +45,34 @@ FLAG_GROUP = 0x40
 FLAG_ACK = 0x20
 FLAG_EXT = 0x10
 
+STD_LEN = 13  # 10 bytes + 00 00 AA pad
+EXT_LEN = 32  # 24 bytes + 8 pad bytes
+STD_CRC_INDEX = 9
+EXT_CRC_INDEX = 23
+EXT_DATA_CRC_INDEX = 22
+EXT_DATA_LEN = 13
+
+
+class MsgType(IntEnum):
+    """The message type encoded in the top three flag bits."""
+
+    DIRECT = 0
+    DIRECT_ACK = 1
+    GROUP_CLEANUP = 2
+    GROUP_CLEANUP_ACK = 3
+    BROADCAST = 4
+    DIRECT_NAK = 5
+    GROUP_BROADCAST = 6
+    GROUP_CLEANUP_NAK = 7
+
+    @property
+    def label(self) -> str:
+        return MESSAGE_TYPES[int(self)]
+
+    def __str__(self) -> str:
+        return self.label
+
+
 MESSAGE_TYPES = (
     "Direct",
     "ACK of Direct",
@@ -52,12 +83,6 @@ MESSAGE_TYPES = (
     "Group Broadcast",
     "NAK of Group Cleanup",
 )
-
-STD_LEN = 13  # 10 bytes + 00 00 AA pad
-EXT_LEN = 32  # 24 bytes + 8 pad bytes
-STD_CRC_INDEX = 9
-EXT_CRC_INDEX = 23
-EXT_DATA_CRC_INDEX = 22
 
 
 # --------------------------------------------------------------------------- CRCs
@@ -86,53 +111,161 @@ def ext_crc(data: Sequence[int]) -> int:
 
 # --------------------------------------------------------------------------- addresses
 
-def parse_addr(addr: str | Sequence[int] | int) -> list[int]:
-    """Return an address as 3 bytes, high byte first.
 
-    Accepts ``"16.3F.E5"``, ``"16:3F:E5"``, ``"163FE5"``, an int, or a 3-item sequence.
+class Address:
+    """An Insteon device address, printed as ``16.3F.E5``.
+
+    Accepts ``"16.3F.E5"``, ``"16:3F:E5"``, ``"163FE5"``, an int, another
+    :class:`Address`, or a 3-item high-byte-first sequence. Compares equal to
+    (and hashes like) its string form, so it drops into code and dicts that
+    still use address strings.
     """
-    if isinstance(addr, int):
-        if not 0 <= addr <= 0xFFFFFF:
-            raise ValueError(f"address out of range: {addr:#x}")
-        return [(addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF]
-    if isinstance(addr, str):
-        hexs = addr.replace(".", "").replace(":", "").replace(" ", "")
-        if len(hexs) != 6:
-            raise ValueError(f"bad Insteon address {addr!r}")
-        return [int(hexs[i : i + 2], 16) for i in (0, 2, 4)]
-    if len(addr) != 3:
-        raise ValueError(f"bad Insteon address {addr!r}")
-    return [int(b) & 0xFF for b in addr]
+
+    __slots__ = ("_value",)
+
+    _value: int
+
+    def __init__(self, addr: Address | str | int | Sequence[int]):
+        if isinstance(addr, Address):
+            value = addr._value
+        elif isinstance(addr, bool):
+            raise TypeError("bool is not an Insteon address")
+        elif isinstance(addr, int):
+            if not 0 <= addr <= 0xFFFFFF:
+                raise ValueError(f"address out of range: {addr:#x}")
+            value = addr
+        elif isinstance(addr, str):
+            hexs = addr.replace(".", "").replace(":", "").replace(" ", "")
+            if len(hexs) != 6:
+                raise ValueError(f"bad Insteon address {addr!r}")
+            try:
+                value = int(hexs, 16)
+            except ValueError:
+                raise ValueError(f"bad Insteon address {addr!r}") from None
+        else:
+            b = list(addr)
+            if len(b) != 3 or any(not 0 <= int(x) <= 0xFF for x in b):
+                raise ValueError(f"bad Insteon address {addr!r}")
+            value = (int(b[0]) << 16) | (int(b[1]) << 8) | int(b[2])
+        self._value = value
+
+    # ---- alternate constructors ----
+
+    @classmethod
+    def from_wire(cls, b: Sequence[int]) -> Address:
+        """Build from the 3 bytes as they appear on the wire (low byte first)."""
+        if len(b) < 3:
+            raise ValueError("need 3 wire bytes")
+        return cls([int(b[2]) & 0xFF, int(b[1]) & 0xFF, int(b[0]) & 0xFF])
+
+    # ---- views ----
+
+    @property
+    def value(self) -> int:
+        """The address as a 24-bit int."""
+        return self._value
+
+    @property
+    def bytes(self) -> tuple[int, int, int]:
+        """High byte first, the order the address is written in."""
+        v = self._value
+        return ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+
+    @property
+    def wire(self) -> tuple[int, int, int]:
+        """Low byte first, the order the address goes on the air."""
+        return self.bytes[::-1]
+
+    # ---- protocol ----
+
+    def __str__(self) -> str:
+        return "{:02X}.{:02X}.{:02X}".format(*self.bytes)
+
+    def __repr__(self) -> str:
+        return f"Address('{self}')"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Address):
+            return self._value == other._value
+        if isinstance(other, str):
+            try:
+                return self._value == Address(other)._value
+            except ValueError:
+                return False
+        return NotImplemented  # type: ignore[unreachable]
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def __format__(self, spec: str) -> str:
+        return format(str(self), spec)
 
 
-def addr_to_wire(addr) -> list[int]:
-    """Address → the 3 bytes as they appear on the wire (low byte first)."""
-    return parse_addr(addr)[::-1]
+# --------------------------------------------------------------------------- flags
 
 
-def wire_to_addr(b: Sequence[int]) -> str:
-    """3 wire bytes (low byte first) → ``"16.3F.E5"``."""
-    return f"{b[2]:02X}.{b[1]:02X}.{b[0]:02X}"
+@dataclass(frozen=True)
+class Flags:
+    """The flags byte, unpacked."""
+
+    msg_type: MsgType = MsgType.DIRECT
+    extended: bool = False
+    hops_left: int = 3
+    max_hops: int = 3
+
+    @classmethod
+    def from_byte(cls, b: int) -> Flags:
+        return cls(
+            msg_type=MsgType(b >> 5),
+            extended=bool(b & FLAG_EXT),
+            hops_left=(b >> 2) & 3,
+            max_hops=b & 3,
+        )
+
+    def to_byte(self) -> int:
+        return ((int(self.msg_type) & 7) << 5
+                | (FLAG_EXT if self.extended else 0)
+                | ((self.hops_left & 3) << 2)
+                | (self.max_hops & 3))
+
+    @property
+    def bcast(self) -> bool:
+        return bool(self.to_byte() & FLAG_BCAST)
+
+    @property
+    def group(self) -> bool:
+        return bool(self.to_byte() & FLAG_GROUP)
+
+    @property
+    def ack(self) -> bool:
+        return bool(self.to_byte() & FLAG_ACK)
+
+    def __str__(self) -> str:
+        s = self.msg_type.label
+        if self.extended:
+            s += ", extended"
+        return f"{s}, hops {self.hops_left}/{self.max_hops}"
 
 
 # --------------------------------------------------------------------------- packet
+
 
 @dataclass
 class Packet:
     """A decoded or generated Insteon RF packet, in wire byte order."""
 
     data: list[int]
-    bits: str = field(default="", repr=False)
-    timestamp: float | None = field(default=None, repr=False)
-    complete: bool = True  # frame index counted down to 0
+    bits: str = field(default="", repr=False, compare=False)
+    timestamp: float | None = field(default=None, repr=False, compare=False)
+    complete: bool = field(default=True, compare=False)  # frame index counted down to 0
 
     # ---- construction ----------------------------------------------------
 
     @classmethod
     def build(
         cls,
-        src,
-        dst=None,
+        src: Address | str | int,
+        dst: Address | str | int | None = None,
         *,
         group: int | None = None,
         cmd1: int = 0,
@@ -145,7 +278,7 @@ class Packet:
         hops_left: int = 3,
         crc: int | None = None,
         pad: bool = True,
-    ) -> "Packet":
+    ) -> Packet:
         """Assemble a packet from its fields.
 
         ``dst`` is the destination address for direct messages; ``group`` makes
@@ -157,8 +290,8 @@ class Packet:
         ext_data = list(ext_data or [])
         if extended is None:
             extended = bool(ext_data)
-        if len(ext_data) > 13:
-            raise ValueError("extended data is at most 13 bytes")
+        if len(ext_data) > EXT_DATA_LEN:
+            raise ValueError(f"extended data is at most {EXT_DATA_LEN} bytes")
 
         flags = (max_hops & 3) | ((hops_left & 3) << 2)
         if extended:
@@ -172,13 +305,14 @@ class Packet:
 
         data = [flags]
         if group is not None:
-            data += addr_to_wire(src) + [group & 0xFF, 0, 0]
+            data += list(Address(src).wire) + [group & 0xFF, 0, 0]
         else:
-            data += addr_to_wire(dst) + addr_to_wire(src)
+            assert dst is not None  # guaranteed by the check above
+            data += list(Address(dst).wire) + list(Address(src).wire)
         data += [cmd1 & 0xFF, cmd2 & 0xFF]
 
         if extended:
-            data += ext_data + [0] * (13 - len(ext_data))
+            data += ext_data + [0] * (EXT_DATA_LEN - len(ext_data))
             data.append(ext_crc(data))
         data.append(pkt_crc(data) if crc is None else crc & 0xFF)
         if pad:
@@ -186,7 +320,7 @@ class Packet:
         return cls(data)
 
     @classmethod
-    def from_wire(cls, data: Iterable[int], *, pad: bool = False, crc: bool = False) -> "Packet":
+    def from_wire(cls, data: Iterable[int], *, pad: bool = False, crc: bool = False) -> Packet:
         """Wrap raw wire bytes; optionally append the packet CRC and/or pad bytes."""
         data = [int(b) & 0xFF for b in data]
         if len(data) < 1:
@@ -200,6 +334,11 @@ class Packet:
             data += cls._pad(len(data), extended)
         return cls(data)
 
+    @classmethod
+    def parse(cls, raw: bytes | bytearray | memoryview) -> Packet:
+        """Wrap raw wire bytes exactly as given (the inverse of ``bytes(pkt)``)."""
+        return cls(list(bytes(raw)))
+
     @staticmethod
     def _pad(length: int, extended: bool) -> list[int]:
         if extended:
@@ -207,58 +346,68 @@ class Packet:
         n = STD_LEN - length
         return ([0] * (n - 1) + [0xAA]) if n > 0 else []
 
+    def __bytes__(self) -> bytes:
+        return bytes(self.data)
+
+    def __len__(self) -> int:
+        return len(self.data)
+
     # ---- fields ----------------------------------------------------------
 
     @property
-    def flags(self) -> int:
+    def flags_byte(self) -> int:
         return self.data[0]
 
     @property
+    def flags(self) -> Flags:
+        return Flags.from_byte(self.data[0])
+
+    @property
     def extended(self) -> bool:
-        return bool(self.flags & FLAG_EXT)
+        return bool(self.flags_byte & FLAG_EXT)
 
     @property
     def bcast(self) -> bool:
-        return bool(self.flags & FLAG_BCAST)
+        return bool(self.flags_byte & FLAG_BCAST)
 
     @property
     def group_msg(self) -> bool:
-        return bool(self.flags & FLAG_GROUP)
+        return bool(self.flags_byte & FLAG_GROUP)
 
     @property
     def ack(self) -> bool:
-        return bool(self.flags & FLAG_ACK)
+        return bool(self.flags_byte & FLAG_ACK)
 
     @property
     def max_hops(self) -> int:
-        return self.flags & 3
+        return self.flags_byte & 3
 
     @property
     def hops_left(self) -> int:
-        return (self.flags >> 2) & 3
+        return (self.flags_byte >> 2) & 3
 
     @property
-    def msg_type(self) -> int:
-        return self.flags >> 5
+    def msg_type(self) -> MsgType:
+        return MsgType(self.flags_byte >> 5)
 
     @property
     def msg_type_name(self) -> str:
-        return MESSAGE_TYPES[self.msg_type]
+        return self.msg_type.label
 
     @property
     def is_group_broadcast(self) -> bool:
         return self.bcast and self.group_msg
 
     @property
-    def to_addr(self) -> str | None:
+    def to_addr(self) -> Address | None:
         """Destination address, or the sender for group broadcasts (wire slot 1)."""
-        return wire_to_addr(self.data[1:4]) if len(self.data) >= 4 else None
+        return Address.from_wire(self.data[1:4]) if len(self.data) >= 4 else None
 
     @property
-    def from_addr(self) -> str | None:
+    def from_addr(self) -> Address | None:
         if len(self.data) < 7 or self.is_group_broadcast:
             return None
-        return wire_to_addr(self.data[4:7])
+        return Address.from_wire(self.data[4:7])
 
     @property
     def group(self) -> int | None:
@@ -272,6 +421,16 @@ class Packet:
     @property
     def cmd2(self) -> int | None:
         return self.data[8] if len(self.data) > 8 else None
+
+    @property
+    def command(self) -> Command | None:
+        """``cmd1`` as a :class:`~insteonrf.cmds.Command` when it is a known one."""
+        if self.cmd1 is None:
+            return None
+        try:
+            return Command(self.cmd1)
+        except ValueError:
+            return None
 
     @property
     def cmd_name(self) -> str | None:
@@ -315,6 +474,46 @@ class Packet:
     def time_str(self) -> str:
         ts = _dt.datetime.fromtimestamp(self.timestamp) if self.timestamp else _dt.datetime.now()
         return ts.strftime("%H:%M:%S.%f")[:-3]
+
+    # ---- serialisation ---------------------------------------------------
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-ready view of the packet (see the schema in the README)."""
+        d: dict[str, Any] = {
+            "time": (_dt.datetime.fromtimestamp(self.timestamp).isoformat(timespec="milliseconds")
+                     if self.timestamp else None),
+            "timestamp": self.timestamp,
+            "msg_type": self.msg_type.name,
+            "msg_type_name": self.msg_type_name,
+            "extended": self.extended,
+            "ack": self.ack,
+            "broadcast": self.bcast,
+            "group_msg": self.group_msg,
+            "hops_left": self.hops_left,
+            "max_hops": self.max_hops,
+            "to": str(self.to_addr) if self.to_addr else None,
+            "from": str(self.from_addr) if self.from_addr else None,
+            "group": self.group,
+            "cmd1": self.cmd1,
+            "cmd2": self.cmd2,
+            "command": self.cmd_name,
+            "ext_data": self.ext_data,
+            "crc": self.crc,
+            "crc_ok": self.crc_ok,
+            "ext_crc_ok": self.ext_crc_ok,
+            "complete": self.complete,
+            "raw": bytes(self.data).hex().upper(),
+        }
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Packet:
+        """Rebuild a packet from :meth:`to_dict` output (``raw`` is authoritative)."""
+        raw = d.get("raw")
+        if raw is None:
+            raise ValueError("packet dict needs a 'raw' hex string")
+        return cls(list(bytes.fromhex(raw)), timestamp=d.get("timestamp"),
+                   complete=bool(d.get("complete", True)))
 
     # ---- encoding --------------------------------------------------------
 
@@ -440,7 +639,7 @@ def parse_bits(line: str, timestamp: float | None = None, *, min_bytes: int = 4)
     return packets
 
 
-def iter_bit_lines(lines: Iterable[str]):
+def iter_bit_lines(lines: Iterable[str]) -> Iterator[tuple[str, str]]:
     """Yield ``(kind, text)`` for a pipeline stream: ``'meta'`` for ``#`` lines, ``'bits'`` for data."""
     for raw in lines:
         s = raw.rstrip("\n")
@@ -452,47 +651,3 @@ def iter_bit_lines(lines: Iterable[str]):
             yield "bits", s.strip()
         else:
             yield "junk", s
-
-
-def dump_frames(line: str) -> str:
-    """Verbose per-frame breakdown of a bit string, for debugging demodulator output."""
-    bits, offsets = find_headers(line.strip())
-    out = [f"len {len(bits)} bits, {len(offsets)} start header(s)" + (" (inverted input)" if bits != line.strip() else "")]
-    for n, pos in enumerate(offsets):
-        out.append(f"-- packet {n} at bit {pos}")
-        i = pos + MARKER_OFFSET
-        data: list[int] = []
-        j = 0
-        while bits[i : i + 2] == "11":
-            raw = bits[i + 2 : i + FRAME_BITS]
-            try:
-                dm = manchester_decode(raw)
-            except ManchesterError as err:
-                out.append(f"   {j:2d} @{i:5d} 11 {raw}  {err}")
-                break
-            if len(dm) < 13:
-                out.append(f"   {j:2d} @{i:5d} 11 {raw}  short frame")
-                break
-            idx = int(dm[:5][::-1], 2)
-            byte = int(dm[5:13][::-1], 2)
-            data.append(byte)
-            note = ""
-            if j == 0:
-                p = Packet(data)
-                note = f"flags: {p.msg_type_name}, ext={int(p.extended)}, hops {p.hops_left}/{p.max_hops}"
-            elif j == 7:
-                note = cmds.lookup(byte, extended=bool(data[0] & FLAG_EXT), bcast=bool(data[0] & FLAG_BCAST))
-            elif j == (EXT_CRC_INDEX if data[0] & FLAG_EXT else STD_CRC_INDEX):
-                c = pkt_crc(data)
-                note = "crc OK" if c == byte else f"CRC mismatch, expected {c:02X}"
-            elif data[0] & FLAG_EXT and j == EXT_DATA_CRC_INDEX:
-                c = ext_crc(data)
-                note = "data checksum OK" if c == byte else f"data checksum mismatch, expected {c:02X}"
-            out.append(f"   {j:2d} @{i:5d} 11 {raw} idx={idx:2d} {byte:02X}  {note}")
-            i += FRAME_BITS
-            j += 1
-            if idx == 0:
-                break
-        if data:
-            out.append("   bytes: " + " ".join(f"{b:02X}" for b in data))
-    return "\n".join(out)

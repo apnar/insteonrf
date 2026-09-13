@@ -1,0 +1,89 @@
+# insteon-rf RF logger for the home server (microk8s on alpha, /k8s/yaml
+# conventions: bare Pod, hostPath config, no Deployment).
+#
+# What it does: listens on 914.95 MHz with the rfcat dongle and publishes every
+# decoded Insteon packet as JSON to the house broker, plus a rotating JSON-lines
+# log under the config dir. It is RECEIVE ONLY — never add a transmit command
+# here; the PLM owns the air.
+#
+# Deploy:
+#   mkdir -p /nvme/k8s/insteonrf-config/log
+#   cp -r /root/insteon/insteonrf /nvme/k8s/insteonrf-config/src
+#   cp deploy/insteonrf.yaml /k8s/yaml/insteonrf.yaml
+#   microk8s kubectl apply -f /k8s/yaml/insteonrf.yaml
+#
+# Broker credentials come from the `mosquitto` Secret (keys `username` and
+# `password`) — add it to one-time/secrets.yaml rather than putting a password
+# in this file or on the command line, where `ps` would show it:
+#   microk8s kubectl create secret generic mosquitto \
+#       --from-literal=username=<user> --from-literal=password=<pass>
+#
+# Topics: insteon-rf (all packets) and insteon-rf/<address>. The insteon-mqtt
+# bridge owns the insteon/ prefix — do not publish there.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insteonrf
+  labels:
+    app: insteonrf
+spec:
+  restartPolicy: Always
+  containers:
+    - name: insteonrf
+      image: python:3.13-slim
+      imagePullPolicy: Always
+      # privileged + /dev/bus/usb: rflib talks to the CC1111 over raw USB.
+      securityContext:
+        privileged: true
+      env:
+        - name: TZ
+          value: "America/New_York"
+        - name: PIP_ROOT_USER_ACTION
+          value: "ignore"
+        - name: INSTEONRF_MQTT_USER
+          valueFrom:
+            secretKeyRef:
+              name: mosquitto
+              key: username
+        - name: INSTEONRF_MQTT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: mosquitto
+              key: password
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          # pip builds a local directory in place, and /src is mounted
+          # read-only, so build from a copy.
+          cp -a /src /build
+          pip install --quiet --no-cache-dir "/build[mqtt,radio]" \
+              "git+https://github.com/atlas0fd00m/rfcat"
+          # Credentials come from INSTEONRF_MQTT_USER/PASS in the environment.
+          exec insteon-rf monitor \
+              --mqtt 192.168.88.5:1883 \
+              --topic insteon-rf \
+              -o /config/log/insteon-rf.jsonl \
+              --quiet -v
+      volumeMounts:
+        - mountPath: /src
+          name: src
+          readOnly: true
+        - mountPath: /config
+          name: config
+        - mountPath: /dev/bus/usb
+          name: usb
+  volumes:
+    - name: src
+      hostPath:
+        path: /nvme/k8s/insteonrf-config/src
+        type: Directory
+    - name: config
+      hostPath:
+        path: /nvme/k8s/insteonrf-config
+        type: Directory
+    - name: usb
+      hostPath:
+        path: /dev/bus/usb
+        type: Directory

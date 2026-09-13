@@ -2,11 +2,65 @@
 
 Each table maps ``cmd1`` to a label and, optionally, a ``sub`` table keyed
 by ``cmd2``. :func:`lookup` picks the table from the packet flags.
+:class:`Command` is the enum code should use for the well-known ``cmd1``
+values; the tables stay the place for the descriptive text.
 """
 
 from __future__ import annotations
 
-STD_CMDS: dict[int, dict] = {
+from enum import IntEnum
+from typing import Any
+
+
+class Command(IntEnum):
+    """Well-known ``cmd1`` values."""
+
+    ASSIGN_TO_GROUP = 0x01
+    DELETE_FROM_GROUP = 0x02
+    PRODUCT_DATA_REQUEST = 0x03
+    ENTER_LINK_MODE = 0x09
+    ENTER_UNLINK_MODE = 0x0A
+    GET_ENGINE_VERSION = 0x0D
+    PING = 0x0F
+    ID_REQUEST = 0x10
+    ON = 0x11
+    FAST_ON = 0x12
+    OFF = 0x13
+    FAST_OFF = 0x14
+    BRIGHT_ONE_STEP = 0x15
+    DIM_ONE_STEP = 0x16
+    START_MANUAL_CHANGE = 0x17
+    STOP_MANUAL_CHANGE = 0x18
+    STATUS_REQUEST = 0x19
+    GET_OPERATING_FLAGS = 0x1F
+    SET_OPERATING_FLAGS = 0x20
+    INSTANT_CHANGE = 0x21
+    MANUALLY_TURNED_OFF = 0x22
+    MANUALLY_TURNED_ON = 0x23
+    REMOTE_SET_BUTTON_TAP = 0x25
+    SET_STATUS = 0x27
+    SET_MSB = 0x28
+    POKE = 0x29
+    PEEK = 0x2B
+    # 0x2E/0x2F mean "on/off at rate" as standard messages and
+    # "extended set/get" / "read-write ALDB" as extended ones (see EXT_CMDS).
+    ON_AT_RATE = 0x2E
+    OFF_AT_RATE = 0x2F
+    BEEP = 0x30
+
+    @property
+    def label(self) -> str:
+        """The descriptive name from the standard-command table."""
+        entry = STD_CMDS.get(int(self))
+        return str(entry["label"]) if entry else self.name.replace("_", " ").title()
+
+
+#: Commands that are safe to transmit at a device: they only ask questions.
+BENIGN_COMMANDS = frozenset(
+    {Command.PING, Command.GET_ENGINE_VERSION, Command.STATUS_REQUEST, Command.ID_REQUEST}
+)
+
+STD_CMDS: dict[int, dict[str, Any]] = {
     0x01: {"label": "Assign to Group"},
     0x02: {"label": "Delete from Group"},
     0x03: {"label": "Product Data Request",
@@ -58,7 +112,7 @@ STD_CMDS: dict[int, dict] = {
     0x81: {"label": "Assign to Companion Group"},
 }
 
-EXT_CMDS: dict[int, dict] = {
+EXT_CMDS: dict[int, dict[str, Any]] = {
     0x03: {"label": "Data Response",
            "sub": {0x00: "Product Data", 0x01: "FX Username", 0x02: "Device Text String",
                    0x03: "Set Device Text String", 0x04: "Set ALL-Link Command Alias",
@@ -74,7 +128,7 @@ EXT_CMDS: dict[int, dict] = {
     **{c: {"label": "FX User-specific Command"} for c in range(0xF0, 0x100)},
 }
 
-BCAST_STD_CMDS: dict[int, dict] = {
+BCAST_STD_CMDS: dict[int, dict[str, Any]] = {
     0x01: {"label": "Set Button Pressed (Responder)"},
     0x02: {"label": "Set Button Pressed (Controller)"},
     0x03: {"label": "Test Powerline Phase", "sub": {0x00: "Phase A", 0x01: "Phase B"}},
@@ -91,7 +145,7 @@ BCAST_STD_CMDS: dict[int, dict] = {
     0x49: {"label": "SALad Debug Report"},
 }
 
-BCAST_EXT_CMDS: dict[int, dict] = {}
+BCAST_EXT_CMDS: dict[int, dict[str, Any]] = {}
 
 _TABLE_NAMES = {
     (False, False): ("Std", STD_CMDS),
@@ -110,4 +164,4 @@ def lookup(cmd1: int, cmd2: int | None = None, *, extended: bool = False, bcast:
     sub = entry.get("sub")
     if sub and cmd2 is not None and cmd2 in sub:
         return f"{entry['label']}: {sub[cmd2]}"
-    return entry["label"]
+    return str(entry["label"])

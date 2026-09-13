@@ -4,20 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "insteonrf"
-version = "2.0.0"
+version = "2.1.0"
 description = "Receive, decode, build and transmit Insteon 915 MHz RF packets (rfcat / SDR)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "BSD-2-Clause" }
 authors = [{ name = "Peter Shipley", email = "evilpete@gmail.com" }]
 keywords = ["insteon", "rf", "rfcat", "cc1111", "sdr", "home-automation"]
-dependencies = []
+dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]
-# rfcat is not on PyPI in a usable form; install from GitHub:
-#   pip install "git+https://github.com/atlas0fd00m/rfcat"
+# rfcat is not on PyPI in a usable form; install it from GitHub alongside:
+#   pip install "insteonrf[radio]" "git+https://github.com/atlas0fd00m/rfcat"
 radio = ["pyusb>=1.2", "pyserial"]
+mqtt = ["paho-mqtt>=1.6"]
+dev = ["pytest>=7", "ruff>=0.6", "mypy>=1.11"]
 test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/evilpete/insteonrf"
 
 [project.scripts]
 insteon-rf = "insteonrf.cli:main"
@@ -27,3 +32,26 @@ include = ["insteonrf*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["hardware: needs a real radio (set INSTEONRF_HW=1)"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+# No python_version pin: numpy's stubs need 3.12+ syntax support, so mypy runs
+# against the interpreter it is installed on (3.12+ in CI).
+files = ["insteonrf"]
+strict = true
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["rflib.*", "usb.*", "paho.*"]
+ignore_missing_imports = true

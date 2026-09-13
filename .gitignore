@@ -64,3 +64,5 @@ Obj/
 /fsk2_demod
 /rf_clip
 /fsk2_mod
+.pytest_cache/
+*.iq

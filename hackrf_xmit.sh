@@ -1,24 +1,22 @@
 #!/bin/sh
+# Transmit Insteon packets with a HackRF.
+#
+# Reads bit strings (from `insteon-rf pkt`) on stdin, modulates them with
+# `insteon-rf modulate` into a temp file and hands that to hackrf_transfer.
+# Superseded by:  insteon-rf send --backend hackrf
+#
+#   insteon-rf pkt -s 2B.93.07 -d 29.4E.52 0F 00 | ./hackrf_xmit.sh
 
+set -e
 
-freq=914950000
-#freq=914973000
-sample_rate=2400000
+freq=${FREQ:-914950000}
+sample_rate=${SAMPLE_RATE:-2400000}
+tx_gain=${TX_GAIN:-20}
 
-rm -f /tmp/hrf.$$
+iq=$(mktemp -t insteonrf-XXXXXX.iq)
+trap 'rm -f "$iq"' EXIT
 
-cat > /tmp/hrf.$$
+insteon-rf modulate -s "${sample_rate}" -o "$iq"
+ls -l "$iq"
 
-ls -ls /tmp/hrf.$$
-
-#this generated sample fails to transmit
-dat_file="garage_on.dat"
- 
-# this recored sameple works
-# dat_file="rf-garage_on.dat"
-
-
-hackrf_transfer -x 20 -a 1 -s ${sample_rate} -f ${freq} -t /tmp/hrf.$$
-
-
-rm /tmp/hrf.$$
+hackrf_transfer -x "${tx_gain}" -a 1 -s "${sample_rate}" -f "${freq}" -t "$iq"

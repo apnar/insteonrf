@@ -1,6 +1,28 @@
 """Tools for receiving, decoding, building and transmitting Insteon RF packets."""
 
-from .packet import Packet, parse_bits, pkt_crc, ext_crc, parse_addr, dump_frames
+from .cmds import Command
+from .debug import dump_frames
+from .packet import (
+    Address,
+    Flags,
+    MsgType,
+    Packet,
+    ext_crc,
+    iter_bit_lines,
+    parse_bits,
+    pkt_crc,
+)
 
-__version__ = "2.0.0"
-__all__ = ["Packet", "parse_bits", "pkt_crc", "ext_crc", "parse_addr", "dump_frames"]
+__version__ = "2.1.0"
+__all__ = [
+    "Address",
+    "Command",
+    "Flags",
+    "MsgType",
+    "Packet",
+    "dump_frames",
+    "ext_crc",
+    "iter_bit_lines",
+    "parse_bits",
+    "pkt_crc",
+]

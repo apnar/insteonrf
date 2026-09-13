@@ -5,10 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Tools for encoding/decoding the **Insteon 915 MHz RF protocol** with a TI CC1111 rfcat dongle
-(the Yard Stick One attached to this host) or SDR hardware (rtl-sdr, HackRF). A small Python 3
+(the Yard Stick One attached to this host) or SDR hardware (rtl-sdr, HackRF). A Python 3
 package (`insteonrf/`) plus a C FSK2 demodulator (`Src/`), glued together as Unix pipeline
 stages that exchange ASCII bit strings. Ported from the original Python 2 proof of concept in
-2026-09; the legacy script names are kept as thin wrappers.
+2026-09; the legacy script names are kept as thin wrappers. `CHANGELOG.md` has the history.
 
 Protocol reference: `Doc/pkt_format.md` (packet layout, 28-bit-per-byte Manchester framing,
 both CRC algorithms). `Doc/crc.txt` is the CRC reverse-engineering write-up.
@@ -16,10 +16,11 @@ both CRC algorithms). `Doc/crc.txt` is the CRC reverse-engineering write-up.
 ## Build, test, run
 
 ```bash
-. .venv/bin/activate        # venv with rfcat (rflib), pyusb, pytest and this package (-e)
-pytest                      # 35 tests, no hardware; real captures live in tests/data/
-make                        # fsk2_demod + rf_clip (C, SDR input path); objects in Obj/
-insteon-rf                  # lists commands: recv send print pkt dump reset
+. .venv/bin/activate        # venv with rfcat (rflib), pyusb, numpy, pytest, ruff, mypy, this package (-e)
+pytest                      # ~100 tests, no hardware; real captures live in tests/data/
+make                        # fsk2_demod + rf_clip (C, -Wall -Wextra -Werror); objects in Obj/
+make check                  # ruff + mypy (strict) + pytest
+insteon-rf                  # lists commands: recv send print pkt dump monitor modulate demod clip reset
 
 # Regression fixture (expected line is asserted by tests/test_packet.py):
 ./fsk2_demod -U < Dat/41802513110D2711018C00.dat | insteon-rf print
@@ -27,26 +28,32 @@ insteon-rf                  # lists commands: recv send print pkt dump reset
 
 insteon-rf recv -D -t -v                                 # live decode from the dongle
 insteon-rf pkt -s 2B.93.07 -d 29.4E.52 0F 00 | insteon-rf send -L 1500   # Ping, show the ACK
+insteon-rf pkt -s 2B.93.07 -d 29.4E.52 0F 00 | insteon-rf modulate -o /tmp/ping.iq  # SDR TX
+python tools/usb_stress.py all                           # USB robustness harness (hardware)
 ```
 
-Recreate the venv with `uv venv .venv && uv pip install -e ".[test]" pyusb pyserial
+Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb pyserial
 "git+https://github.com/atlas0fd00m/rfcat"` (a checkout is at `/root/insteon/rfcat-src`).
-`fsk2_mod` (SDR transmit) needs liquid-dsp and is still BROKEN.
 
 ## Architecture
 
 | Module | Role |
 |---|---|
-| `insteonrf/packet.py` | `Packet` (wire bytes + properties), `pkt_crc`/`ext_crc`, `parse_bits()` (find start header in either polarity, decode 28-bit frames), `Packet.to_bits()` (frame + Manchester + invert), `dump_frames()` |
+| `insteonrf/packet.py` | `Address`, `Flags`, `MsgType`, `Packet` (wire bytes + properties, `to_dict()`/`from_dict()`), `pkt_crc`/`ext_crc`, `parse_bits()` (find start header in either polarity, decode 28-bit frames), `Packet.to_bits()` (frame + Manchester + invert) |
 | `insteonrf/manchester.py` | Manchester encode/decode, `invert_bits` |
-| `insteonrf/cmds.py` | cmd1/cmd2 → name tables, `lookup()` |
-| `insteonrf/radio.py` | `Radio`: rfcat setup (2FSK, 914.95 MHz, 9124 baud, 200 kHz BW, 75 kHz dev), `configure_rx()` (default: sync on the inverted start header `0x3155`; `sync_header=False` = carrier detect), `configure_tx()` (sync word `0x6666` continues the Insteon preamble), `receive_bits()`, `transmit_bits()` |
-| `insteonrf/cli.py` | `recv`, `send`, `print`, `pkt`, `dump`, `reset` subcommands; `rf_reciv.py` etc. call these |
+| `insteonrf/cmds.py` | `Command` enum, cmd1/cmd2 → name tables, `lookup()` |
+| `insteonrf/dsp.py` | numpy `modulate_fsk2()` / `demodulate_fsk2()` / `iq_bursts()` — the SDR path without a compiler |
+| `insteonrf/radio/` | `rfcat.py` (`RfcatRadio`, aliased `Radio`: 2FSK, 914.95 MHz, 9124 baud, 200 kHz BW, 75 kHz dev; `configure_rx()` syncs on the inverted start header `0x3155`, `sync_header=False` = carrier detect; `configure_tx()` sync word `0x6666`), `sdr.py` (`SdrReceiver`/`SdrTransmitter`), `file.py` (`FileRadio`), `__init__.py` (`RadioBackend` protocol, `open_backend()`) |
+| `insteonrf/monitor.py` | JSON-lines writer with rotation, mesh-repeat `Deduper`, `MqttPublisher` |
+| `insteonrf/debug.py` | `dump_frames()` — frame-by-frame breakdown |
+| `insteonrf/cli.py` | `recv send print pkt dump monitor modulate demod clip reset`; `rf_reciv.py` etc. call these |
 | `Src/fsk2_demod.c` | FSK2 demod + squelch + framing for raw 8-bit I/Q (`-U` signed/HackRF) |
 | `Src/rf_clip.c` | split an I/Q stream into per-burst files |
+| `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/k8s/yaml/AGENTS.md` conventions) |
 
 Pipeline contract: one burst per line of `0`/`1` characters; blank lines ignored; `#` lines are
 metadata passed through. Packets inside a line may be in either polarity and at any offset.
+The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q instead.
 
 ## Facts worth knowing
 
@@ -55,14 +62,33 @@ metadata passed through. Packets inside a line may be in either polarity and at 
   the sender sits in the "to" slot and `group 00 00` in the "from" slot.
 - Frame index: first byte 31, then 11..0 (standard) or 30..0 (extended). The original code
   emitted 31..1 for extended packets; that was a bug.
+- **Bit polarity**: a data `1` is the higher frequency (+75 kHz deviation) — the CC1111
+  convention, confirmed by demodulating `Dat/41802513110D2711018C00.dat` with a standard
+  discriminator and finding the inverted start header the dongle syncs on. `fsk2_demod` used
+  to complement every bit because it called `fxpt_atan2(i, q)` on a `(y, x)` function; fixed
+  2026-09-13, and `tests/data/sample-demod.txt` was regenerated. Packet-level output never
+  changed, because `parse_bits()` accepts either polarity.
 - i2cs devices only ACK senders in their link database — spoof the PLM (`2B.93.07` here).
   A spoofed command's ACK also reaches the real PLM, so keep test traffic benign (Ping `0F`,
   Get Engine Version `0D`, Status `19`).
-- Radio registers persist in the dongle while powered; `Radio` re-writes all of them. If USB
-  calls time out (`Error in resetup()`), `insteon-rf reset` and wait a few seconds. Always
-  close the `Radio` (context manager) — skipping `cleanup()` segfaults at interpreter exit.
+- Radio registers persist in the dongle while powered; `RfcatRadio` re-writes all of them.
+- **USB**: rflib's `cleanup()` does not release the USB interface or stop its three worker
+  threads, so a second open (same process or next run) used to fail with
+  `USBError(16, 'Resource busy')` and then spin in `Error in resetup()` forever. `close()`
+  now idles the radio, clears `_threadGo`, releases and finalizes the interface — always
+  use the context manager. rflib also *swallows* `KeyboardInterrupt` inside
+  `USBDongle.recv()` (it prints a traceback and continues), so signals cannot stop a
+  receive loop by exception alone: `cli.STOP` is an event set by the SIGINT/SIGTERM/SIGHUP
+  handlers and checked after every block (`py-spy dump --pid` is how that one was found). On top of that, `resetup()` is bounded and quiet, opening is
+  health-checked with one automatic USB reset, and `receive()` self-heals a dongle that only
+  returns timeouts plus USB errors (`--no-auto-reset` to disable). `insteon-rf reset` is
+  bounded to 10 s. After that fix, 200 open/receive/close cycles, 50 kill-mid-receive cycles
+  and 20 two-process races run clean (`tools/usb_stress.py`); the dongle firmware
+  (`DONSDONGLE r5535`, Feb 2015) was left alone.
+- The numpy demodulator integrates over each bit, so it decodes packets the C one loses in
+  noise (~7x more tolerance); the C one is the fast path for live streams.
 - Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
   Assistant `mqtt.publish` service (no `mosquitto_pub` on the host or in the pod), e.g.
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.
-- `Makefile.kali`, the WAV-header readers and other one-off analysis scripts from the original
-  repo were removed in the port; see git history if needed.
+- `Makefile.kali`, the WAV-header readers, `Doc/pkt_format.txt` and the never-committed
+  `fsk2_mod.c` (liquid-dsp) are gone; `insteon-rf modulate` replaced the last of these.

@@ -1,23 +1,13 @@
 #!/bin/sh
-# This script recieves input from rtl_sdr and outputs it to stdout
-# To debug packets:
-# <this_script>  | python print_pkt.py 
+# Receive Insteon RF with an rtl-sdr and print bit strings.
+# Thin wrapper kept for compatibility; equivalent to:
+#
+#   insteon-rf recv --backend rtlsdr
+#
+# To decode:  ./rtl_reciv.sh | insteon-rf print
 
-rtlsdr_path=$(which rtl_sdr)
-if [[ $? != 0 ]]; then
-    echo "Could not find rtl_sdr in path."
-    exit 1
-fi
+freq=${FREQ:-914950000}
+sample_rate=${SAMPLE_RATE:-2400000}
+gain=${RF_GAIN:-19.9}
 
-freq=914950000
-samprate=2400000
-rfgain=19.9
-
-writeblksize=65536
-
-while true ; do
-    rtl_sdr -g ${rfgain} -f ${freq} -s ${samprate} -b ${writeblksize} -
-    ret=$?
-    echo "rtl_sdr exit code : ${ret}" >&2
-    # -v -d
-done
+exec insteon-rf recv --backend rtlsdr -f "${freq}" -s "${sample_rate}" --gain "${gain}" "$@"
