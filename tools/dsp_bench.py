@@ -120,7 +120,10 @@ def sweep(args: argparse.Namespace) -> int:
     print(f"noise sigma {args.sigma}, {args.trials} trials per point, {args.packet} packet"
           f"{f', cfo {args.cfo} Hz' if args.cfo else ''}"
           f"{f', clock {args.rate_ppm} ppm' if args.rate_ppm else ''}\n")
-    names = list(DETECTORS)
+    names = [n for n in DETECTORS if not args.detectors or n in args.detectors.split(",")]
+    if not names:
+        print(f"no detector matched {args.detectors!r}; known: {', '.join(DETECTORS)}")
+        return 1
     print(f"{'ampl':>5} {'symSNR*':>8} " + " ".join(f"{n:>21}" for n in names))
     for amp in amps:
         # Approximate per-symbol SNR after integrating sps samples of a
@@ -137,7 +140,14 @@ def sweep(args: argparse.Namespace) -> int:
             for name in names:
                 if recovered(pkt, DETECTORS[name](samples)):
                     ok[name] += 1
-        row = [f"{100 * ok[name] / args.trials:20.0f}%" for name in names]
+        # Report the binomial standard error with each point: near threshold a
+        # 40-trial sample is worth about +-8%, which is enough to make two runs
+        # look like they disagree when they do not.
+        row = []
+        for name in names:
+            frac = ok[name] / args.trials
+            se = 100 * (frac * (1 - frac) / args.trials) ** 0.5
+            row.append(f"{100 * frac:14.0f}% ±{se:<4.0f}")
         print(f"{amp:>5} {ebn0:>7.1f}dB " + " ".join(row))
     return 0
 
@@ -179,6 +189,8 @@ def main() -> int:
     p.add_argument("--amplitude", type=int, default=0,
                    help="single signal amplitude instead of a sweep")
     p.add_argument("--amplitudes", default="", help="comma-separated amplitude list")
+    p.add_argument("--detectors", default="",
+                   help="comma-separated subset of: " + ", ".join(DETECTORS))
     p.add_argument("--packet", choices=("std", "ext"), default="std")
     p.add_argument("--cfo", type=float, default=0.0, help="carrier offset in Hz")
     p.add_argument("--rate-ppm", type=float, default=0.0, help="symbol clock error in ppm")

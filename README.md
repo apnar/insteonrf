@@ -107,15 +107,26 @@ counting exact recoveries (paired trials — every detector sees the same noise)
 | 31.6 dB | 0% | 100% | 100% | 100% | 100% |
 | 25.6 dB | 0% | 72% | 95% | 98% | 98% |
 | 23.7 dB | 0% | 0% | 100% | 100% | 100% |
-| 15.7 dB | 0% | 0% | 100% | 100% | 100% |
-| 11.6 dB | 0% | 0% | 88% | 100% | 100% |
-| 10.7 dB | 0% | 0% | 38% | 95% | 98% |
-| 8.5 dB | 0% | 0% | 0% | 78% | 85% |
+| 13.2 dB | 0% | 0% | 99% | 100% | 100% |
+| 11.6 dB | 0% | 0% | 90% | 100% | 100% |
+| 10.7 dB | 0% | 0% | 48% | 95% | 96% |
+| 9.7 dB | 0% | 0% | 22% | 94% | 94% |
+| 8.5 dB | 0% | 0% | 0% | 66% | 74% |
+| 7.2 dB | 0% | 0% | 0% | 22% | 30% |
 
-The default chain works about 18 dB below where the previous numpy path gave
-up, and sits near the theoretical limit for uncoded noncoherent 2-FSK (~13 dB
-per symbol) because the Manchester coding and frame-index counters are decoded
-rather than discarded. No noise-only burst was ever accepted as a packet
+Rows from 13.2 dB down were measured at 200 trials (±3% or better); the rest at
+40 trials, where the columns are saturated and sampling error does not matter.
+The C and discriminator columns were not re-run below 23.7 dB — both are 0%
+there. `tools/dsp_bench.py` prints the binomial standard error with every
+point, because near threshold a 40-trial sample is worth only about ±8%, which
+is enough to make two honest runs look like they disagree.
+
+50% recovery moves from about 25 dB (the previous numpy path) to about 11 dB
+with matched-filter detection and about 8 dB once the frame layer decodes the
+Manchester pairs and index counters instead of discarding them — **roughly
+17 dB** end to end. The matched filter lands where theory says an uncoded
+noncoherent 2-FSK detector should, and the ~3 dB past it is the Manchester
+coding gain, which is free. No noise-only burst was ever accepted as a packet
 (150 noise bursts, plus 2000 random bit strings), and a well-formed frame
 sequence whose counters are impossible is rejected even when its CRC matches.
 

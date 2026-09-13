@@ -103,10 +103,13 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   matches (the CRC does not cover the index bits) — that is what killed a phantom
   `29.41.E0 -> 5D.99.3C cmd 0x69` decode seen on live air. Measured: 0 false accepts over
   150 noise bursts and 2000 random bit strings.
-- **Numbers** (`tools/dsp_bench.py`, paired trials): 50% recovery at ~25 dB symbol SNR for
-  the old discriminator path, ~10.5 dB for ML, ~7.5 dB with soft framing — ~18 dB gained,
-  and near the ~13 dB theoretical limit for uncoded noncoherent 2-FSK. The C `fsk2_demod`
-  fails even at 31 dB. On *hard* bits (what the dongle gives), repair takes one-symbol-error
+- **Numbers** (`tools/dsp_bench.py`, paired trials, 200 per point near threshold): 50%
+  recovery at ~25 dB symbol SNR for the old discriminator path, ~11 dB for ML, ~8 dB with
+  soft framing — ~17 dB gained. The matched filter sits where theory puts an uncoded
+  noncoherent 2-FSK detector; the ~3 dB beyond it is Manchester coding gain. The C
+  `fsk2_demod` fails even at 31 dB. Quote numbers from a 200-trial run: at 40 trials a
+  near-threshold point carries ±8%, and an earlier table published 78%/85% at 8.5 dB where
+  200 trials give 66%/74%. On *hard* bits (what the dongle gives), repair takes one-symbol-error
   recovery from 26% to 94%, two from 4% to 85%, three from 0% to 75%.
 - `read_rssi()` reads the CC1111 RSSI register (offset 74 dB) *after* a block, while the
   radio is still in RX — a channel snapshot, not a latched per-packet measurement. Idle

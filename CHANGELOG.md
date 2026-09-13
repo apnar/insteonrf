@@ -16,13 +16,22 @@ sees the same noise), sweeping signal amplitude against a fixed noise floor:
 | 31.6 dB | 0% | 100% | 100% | 100% | 100% |
 | 25.6 dB | 0% | 72% | 95% | 98% | 98% |
 | 23.7 dB | 0% | 0% | 100% | 100% | 100% |
-| 15.7 dB | 0% | 0% | 100% | 100% | 100% |
-| 11.6 dB | 0% | 0% | 88% | 100% | 100% |
-| 10.7 dB | 0% | 0% | 38% | 95% | 98% |
-| 8.5 dB | 0% | 0% | 0% | 78% | 85% |
+| 13.2 dB | 0% | 0% | 99% | 100% | 100% |
+| 11.6 dB | 0% | 0% | 90% | 100% | 100% |
+| 10.7 dB | 0% | 0% | 48% | 95% | 96% |
+| 9.7 dB | 0% | 0% | 22% | 94% | 94% |
+| 8.5 dB | 0% | 0% | 0% | 66% | 74% |
+| 7.2 dB | 0% | 0% | 0% | 22% | 30% |
 
-The 50% point moves from ~26 dB to ~7.5 dB: **about 18 dB more sensitivity**
-than 2.1.0's numpy path, and the C binary needs more than 30 dB. False accepts
+Rows from 13.2 dB down were measured at 200 trials (±3% or better); the rest at
+40 trials, where the columns are saturated and sampling error does not matter.
+The C and discriminator columns were not re-run below 23.7 dB — both are 0%
+there. `tools/dsp_bench.py` prints the binomial standard error with every
+point, because near threshold a 40-trial sample is worth only about ±8%, which
+is enough to make two honest runs look like they disagree.
+
+The 50% point moves from ~25 dB to ~8 dB: **about 17 dB more sensitivity** than
+2.1.0's numpy path, and the C binary needs more than 30 dB. False accepts
 stayed at zero across 150 noise-only bursts and 2000 random bit strings.
 
 ### Added
