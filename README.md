@@ -312,9 +312,21 @@ mesh did next — plus an attribution report:
 Triggers are: a **group-0** broadcast (any command), an **On to a group your
 network does not use** (needs `--known-groups`, since a novel group number is
 only suspicious if you know which are real), and a **storm** of group
-broadcasts. Every sender also accumulates a suspicion score from malformed
+broadcasts. Device-side groups 1–8 are never suspicious — group 1 is a
+switch's main load, 2–8 are KeypadLinc buttons, and battery sensors use 1–4
+(a leak sensor sends 1 dry, 2 wet, 4 heartbeat), none of which appear in a
+hub's scene list. A repeated trigger is reported once and then counted for
+five minutes (`cooldown`), because an unattended watch that fills the disk
+with the same fault buries the event you are waiting for. Every sender also accumulates a suspicion score from malformed
 all-link traffic, CRC failures and repaired bits, so a repeat offender rises to
 the top of the exit summary even between events.
+
+[deploy/insteonrf.yaml](deploy/insteonrf.yaml) runs exactly this as a
+receive-only Kubernetes Pod (built from [deploy/Containerfile](deploy/Containerfile)
+— note it installs `libusb-1.0-0`, which `python:*-slim` lacks and without
+which `rflib` cannot see the dongle). The pod exits with a one-line error if
+the dongle is busy and lets the supervisor retry, which is what happens for a
+moment when a previous process still holds the USB interface.
 
 With `--mqtt`, triggers publish as alerts so an automation can notify you. And
 because attribution leans on RSSI, **several receivers are much better than

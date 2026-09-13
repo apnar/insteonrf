@@ -191,3 +191,59 @@ def test_cli_allon_runs_over_a_capture(tmp_path, monkeypatch):
     rc = cli.allon_main(["--backend", "file", "--replay", str(data), "--quiet"])
     assert rc == 0
     assert (tmp_path / "allon.jsonl").exists()
+
+
+# ---- device-side groups are normal traffic, not alarms ----
+
+
+@pytest.mark.parametrize("group,what", [
+    (1, "a switch's main load"),
+    (2, "a KeypadLinc button"),
+    (4, "a leak sensor heartbeat"),
+    (8, "the last KeypadLinc button"),
+])
+def test_device_groups_are_not_suspicious(group, what):
+    """Caught live: a water sensor's group-4 heartbeat fired a false alarm.
+
+    Device-side groups never appear in a hub's scene list, so a known-groups
+    list built from scene definitions does not contain them.
+    """
+    w = scan([bcast("3F.58.18", group)], known_groups={68, 21, 115})
+    assert w.triggers == [], f"{what} (group {group}) must not alarm"
+    assert w.suspects["3F.58.18"].unknown_group == 0
+
+
+def test_group_zero_still_alarms_even_though_it_is_low():
+    w = scan([bcast("3F.58.18", ALL_DEVICES_GROUP)], known_groups={68})
+    assert len(w.triggers) == 1
+
+
+def test_a_genuinely_novel_group_still_alarms():
+    w = scan([bcast("3F.58.18", 200)], known_groups={68})
+    assert len(w.triggers) == 1 and w.triggers[0].kind == "unknown-group"
+
+
+# ---- cooldown, so an unattended watch stays useful ----
+
+
+def test_repeat_triggers_are_suppressed_but_counted():
+    w = AllOnWatcher(cooldown_s=300.0)
+    for i in range(5):
+        w.observe(bcast(KPL, ALL_DEVICES_GROUP, at=1000.0 + i * 10))
+    assert len(w.triggers) == 1
+    assert sum(w.suppressed.values()) == 4
+    assert "suppressed by the 300s cooldown" in w.summary()
+
+
+def test_cooldown_expires():
+    w = AllOnWatcher(cooldown_s=60.0)
+    w.observe(bcast(KPL, ALL_DEVICES_GROUP, at=1000.0))
+    w.observe(bcast(KPL, ALL_DEVICES_GROUP, at=1100.0))
+    assert len(w.triggers) == 2
+
+
+def test_cooldown_is_per_sender():
+    w = AllOnWatcher(cooldown_s=300.0)
+    w.observe(bcast(KPL, ALL_DEVICES_GROUP, at=1000.0))
+    w.observe(bcast("25.0C.46", ALL_DEVICES_GROUP, at=1001.0))
+    assert len(w.triggers) == 2

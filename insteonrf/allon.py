@@ -43,6 +43,18 @@ ON_COMMANDS = (0x11, 0x12)
 #: The all-devices group. Nothing legitimate on a modern network addresses it.
 ALL_DEVICES_GROUP = 0
 
+#: Groups devices use for their *own* purposes, which never appear in a hub's
+#: scene list and are entirely normal on the air: 1 is a switch's main load,
+#: 2-8 are KeypadLinc buttons, and battery sensors use 1-4 (a leak sensor sends
+#: 1 dry, 2 wet, 4 heartbeat). Without this, every heartbeat and button press
+#: looks like an unknown group — which is worse than useless, because a stream
+#: of false alarms buries the real event.
+DEVICE_GROUPS = frozenset(range(1, 9))
+
+#: Don't re-raise the same trigger signature more often than this. An
+#: unattended watch must not fill the disk with dumps of a repeating fault.
+DEFAULT_COOLDOWN_S = 300.0
+
 #: How much history to keep for context around a trigger.
 DEFAULT_WINDOW_S = 30.0
 
@@ -118,11 +130,15 @@ class AllOnWatcher:
                  window_s: float = DEFAULT_WINDOW_S,
                  storm_count: int = DEFAULT_STORM_COUNT,
                  storm_window_s: float = DEFAULT_STORM_WINDOW_S,
-                 dump_dir: str | Path | None = None):
+                 dump_dir: str | Path | None = None,
+                 device_groups: Iterable[int] = DEVICE_GROUPS,
+                 cooldown_s: float = DEFAULT_COOLDOWN_S):
         #: Groups the network legitimately uses. Without this, only group 0 is
         #: flagged — a novel group number is only suspicious if you know which
         #: ones are real (generate the list from your scene definitions).
         self.known_groups = set(known_groups) if known_groups is not None else None
+        self.device_groups = frozenset(device_groups)
+        self.cooldown_s = cooldown_s
         self.window_s = window_s
         self.storm_count = storm_count
         self.storm_window_s = storm_window_s
@@ -132,7 +148,10 @@ class AllOnWatcher:
         self.history: list[Seen] = []
         self.suspects: dict[str, Suspect] = {}
         self.triggers: list[Trigger] = []
+        #: How many repeats of each trigger signature the cooldown swallowed.
+        self.suppressed: dict[tuple[str, str, int], int] = {}
         self._recent_groups: list[tuple[float, int]] = []
+        self._last_fired: dict[tuple[str, str, int], float] = {}
 
     # ---- ingest ----
 
@@ -145,7 +164,7 @@ class AllOnWatcher:
         if pkt is None:
             return []
         self._tally(pkt, rssi_dbm)
-        found = self._check(pkt, now)
+        found = [t for t in self._check(pkt, now) if self._fresh(t, now)]
         for trig in found:
             self.triggers.append(trig)
             if self.dump_dir:
@@ -163,7 +182,8 @@ class AllOnWatcher:
         if pkt.is_group_broadcast:
             if pkt.group == ALL_DEVICES_GROUP:
                 s.group0 += 1
-            elif self.known_groups is not None and pkt.group not in self.known_groups:
+            elif (self.known_groups is not None and pkt.group not in self.known_groups
+                  and pkt.group not in self.device_groups):
                 s.unknown_group += 1
         if rssi_dbm is not None:
             s.rssi_sum += rssi_dbm
@@ -185,7 +205,7 @@ class AllOnWatcher:
                     f"from {pkt.from_addr or pkt.to_addr}, hops {pkt.hops_left}/{pkt.max_hops}, "
                     f"{how}", pkt))
             elif (self.known_groups is not None and pkt.group not in self.known_groups
-                  and pkt.cmd1 in ON_COMMANDS):
+                  and pkt.group not in self.device_groups and pkt.cmd1 in ON_COMMANDS):
                 out.append(Trigger(
                     "unknown-group", now,
                     f"On broadcast to unknown group {pkt.group} from "
@@ -197,6 +217,19 @@ class AllOnWatcher:
                     f"{self.storm_window_s:g}s", pkt))
                 self._recent_groups.clear()
         return out
+
+    def _fresh(self, trig: Trigger, now: float) -> bool:
+        """False when this trigger signature fired recently (counts it instead)."""
+        p = trig.packet
+        who = str(p.from_addr or p.to_addr) if p is not None else "?"
+        group = (p.group if p is not None and p.group is not None else -1)
+        key = (trig.kind, who, group)
+        last = self._last_fired.get(key)
+        if last is not None and now - last < self.cooldown_s:
+            self.suppressed[key] = self.suppressed.get(key, 0) + 1
+            return False
+        self._last_fired[key] = now
+        return True
 
     def _expire(self, now: float) -> None:
         cut = now - self.window_s
@@ -275,6 +308,11 @@ class AllOnWatcher:
             counts[t.kind] = counts.get(t.kind, 0) + 1
         for kind, n in sorted(counts.items()):
             lines.append(f"    {kind}: {n}")
+        if self.suppressed:
+            lines.append(f"{sum(self.suppressed.values())} repeat trigger(s) suppressed by the "
+                         f"{self.cooldown_s:g}s cooldown:")
+            for (kind, who, group), n in sorted(self.suppressed.items(), key=lambda kv: -kv[1])[:5]:
+                lines.append(f"    {kind} from {who} group {group}: {n} more")
         ranked = self.ranked_suspects()
         if ranked:
             lines.append("suspicious senders (worst first):")

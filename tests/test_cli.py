@@ -313,3 +313,19 @@ def test_broken_pipe_still_releases_the_radio():
     finally:
         climod._open_radio, sys.stdout = old_open, old_out
     assert radio.closed
+
+
+def test_dongle_error_exits_cleanly_for_a_supervisor(monkeypatch, caplog):
+    """k8s restarts us, so report the problem in one line, not as a traceback."""
+    import logging
+
+    from insteonrf.radio import DongleError
+
+    def boom(*a, **k):
+        raise DongleError("rfcat dongle is not responding")
+
+    monkeypatch.setattr(cli, "_open_radio", boom)
+    with caplog.at_level(logging.ERROR, logger="insteonrf"):
+        rc = cli.main(["recv", "-D"])
+    assert rc == 1
+    assert any("not responding" in r.getMessage() for r in caplog.records)

@@ -27,7 +27,14 @@ from typing import IO, Any, TextIO
 from .context import CommandTracker
 from .debug import dump_frames
 from .packet import Packet, iter_bit_lines, parse_bits
-from .radio import BACKENDS, DEFAULT_DRATE, DEFAULT_FREQ, DEFAULT_SAMPLE_RATE, open_backend
+from .radio import (
+    BACKENDS,
+    DEFAULT_DRATE,
+    DEFAULT_FREQ,
+    DEFAULT_SAMPLE_RATE,
+    DongleError,
+    open_backend,
+)
 
 log = logging.getLogger("insteonrf")
 
@@ -863,6 +870,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         return cmd[0](argv[1:])
+    except DongleError as err:
+        # Running under a supervisor (k8s restartPolicy, systemd): report the
+        # problem in one line and let the supervisor retry, rather than dumping
+        # a traceback. Happens routinely when a previous process still holds
+        # the USB interface for a moment.
+        log.error("%s", err)
+        return 1
     except BrokenPipeError:
         # Downstream closed the pipe ('... | head'), which is normal for a
         # pipeline tool. Let the exception unwind first so the radio is

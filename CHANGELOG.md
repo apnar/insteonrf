@@ -4,6 +4,30 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.4.1 — 2026-09-13
+
+Deployed the all-on watch as a pod and fixed what running it for real exposed.
+
+- **Device-side groups are not suspicious.** The `unknown-group` trigger fired
+  within a minute of going live, on a water sensor's group-4 heartbeat. Groups
+  1-8 belong to devices, not to hub scenes — 1 is a switch's main load, 2-8 are
+  KeypadLinc buttons, and battery sensors use 1-4 — so a known-groups list
+  built from scene definitions never contains them. `DEVICE_GROUPS` now covers
+  that; group 0 is still always flagged.
+- **A cooldown on repeat triggers** (`cooldown_s`, 5 minutes, per kind/sender/
+  group). An unattended watch that writes a dump per repetition of the same
+  fault fills the disk and buries the event it was waiting for; repeats are now
+  counted and reported in the summary instead.
+- **`DongleError` exits with one line, not a traceback.** Under a supervisor
+  (k8s `restartPolicy`, systemd) the retry is the supervisor's job. This
+  happens routinely for a moment when a previous process still holds the USB
+  interface.
+- `deploy/Containerfile` plus a rewritten `deploy/insteonrf.yaml`: a locally
+  built image (buildah → `ctr image import`) so restarts need no network, MQTT
+  credentials from a secret, and the all-on watch enabled. The part that is
+  easy to miss is `libusb-1.0-0`: `python:*-slim` does not ship it, and without
+  it `rflib` cannot see the dongle at all.
+
 ## 2.4.0 — 2026-09-13
 
 ### Added

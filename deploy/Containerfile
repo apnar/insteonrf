@@ -1,0 +1,23 @@
+# insteon-rf RF listener for the house.
+#
+# Built locally (buildah bud → ctr image import) so restarts do not re-download
+# anything and the pod works without internet:
+#   cd /nvme/k8s/insteonrf-config/build && buildah bud -t insteonrf:local .
+#   buildah push localhost/insteonrf:local docker-archive:/var/tmp/insteonrf.tar:localhost/insteonrf:local
+#   microk8s ctr image import /var/tmp/insteonrf.tar
+#
+# libusb-1.0-0 is the part that is easy to miss: pyusb needs the shared library,
+# and python:*-slim does not ship it, so rflib cannot see the dongle without it.
+FROM python:3.13-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libusb-1.0-0 git \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY src /src
+RUN pip install --no-cache-dir /src "/src[mqtt,radio]" \
+ && pip install --no-cache-dir "git+https://github.com/atlas0fd00m/rfcat" \
+ && python -c "import insteonrf, rflib, usb.core, numpy, paho.mqtt.client; print(insteonrf.__version__)"
+
+WORKDIR /config
+ENTRYPOINT ["insteon-rf"]
