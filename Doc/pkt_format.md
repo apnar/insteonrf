@@ -43,8 +43,8 @@ Each byte (X) is encoded as 28 bits:
  
 All values are written in LSB format (Least Significant Bit first)
 
-The first byte is always transmitted with a index of 32 ( 11111 )
-all following bytes are transmitted with a decrementing index count with the final byte with index 0
+The first byte is always transmitted with a index of 31 ( 11111 )
+all following bytes are transmitted with a decrementing index count ending at 0 (starting at 11 for standard packets, 30 for extended ones)
  
     Dat   index dat         LSB index dat     manchester                     '11' + manchester
     03 -> 11111 00000011 -> 11111 11000000 -> 0101010101 0101101010101010 -> 1101010101010101101010101010

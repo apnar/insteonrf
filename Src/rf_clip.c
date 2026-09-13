@@ -69,7 +69,7 @@ void print_help(char *prog_name) {
 
 }
 
-int new_file(buf_count) {
+int new_file(int buf_count) {
 int nfd;
 char text[100];
 time_t now = time(NULL);
@@ -226,7 +226,7 @@ int lb; // last byte
 	} else if ( k < low_thr ) {
 	    if ( (ofd != -1) && ( (b - lb) > squ_timeout ) ) {
 		int sm;
-		write(ofd, buff, i);
+		if (write(ofd, buff, i) < 0) perror("write");
 		close(ofd);
 		cb=b;
 		sm = ((b -ob) * sizeof(buff))/2;
@@ -241,7 +241,7 @@ int lb; // last byte
 	    }
 	}
 	if ( ofd > -1 ) {
-	    write(ofd, buff, i);
+	    if (write(ofd, buff, i) < 0) perror("write");
 	} else {
 	    // 2^30 = 1073741824
 	    if ( b >= 1073741824 ) {

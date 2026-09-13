@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insteonrf"
+version = "2.0.0"
+description = "Receive, decode, build and transmit Insteon 915 MHz RF packets (rfcat / SDR)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-2-Clause" }
+authors = [{ name = "Peter Shipley", email = "evilpete@gmail.com" }]
+keywords = ["insteon", "rf", "rfcat", "cc1111", "sdr", "home-automation"]
+dependencies = []
+
+[project.optional-dependencies]
+# rfcat is not on PyPI in a usable form; install from GitHub:
+#   pip install "git+https://github.com/atlas0fd00m/rfcat"
+radio = ["pyusb>=1.2", "pyserial"]
+test = ["pytest>=7"]
+
+[project.scripts]
+insteon-rf = "insteonrf.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["insteonrf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

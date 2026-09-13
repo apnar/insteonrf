@@ -25,17 +25,18 @@ LINTFLAGS=-g -n -u -z
 TESTWAV=Dat/41802513110D2711018C00.dat
 
 
-all: directories  fsk2_demod rf_clip
-	if [ -d "MStar_lock" ]; then ( cd "MStar_lock" ; make );  fi
+all: directories fsk2_demod rf_clip
 
 
 
-.PHONY: directories
+.PHONY: directories test
 
-directories: ${OBJECTS_DIR} ${SOURCE_DIR}
+directories: ${OBJECTS_DIR}
 
-${OUT_DIR}:
-	${MKDIR_P} ${OUT_DIR}
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+
+test: fsk2_demod
+	$(PYTHON) -m pytest -q
 
 fsk2_mod: $(OBJECTS_DIR)/fsk2_mod.o 
 	$(CC) $(LDFLAGS) -O2 -pipe $+ -o $@ -lm -lliquid

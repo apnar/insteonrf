@@ -57,3 +57,10 @@ docs/_build/
 
 # PyBuilder
 target/
+
+# local
+.venv/
+Obj/
+/fsk2_demod
+/rf_clip
+/fsk2_mod
