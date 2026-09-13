@@ -775,7 +775,19 @@ def main(argv: list[str] | None = None) -> int:
     if cmd is None:
         print(f"insteon-rf: unknown command {argv[0]!r}", file=sys.stderr)
         return 2
-    return cmd[0](argv[1:])
+    try:
+        return cmd[0](argv[1:])
+    except BrokenPipeError:
+        # Downstream closed the pipe ('... | head'), which is normal for a
+        # pipeline tool. Let the exception unwind first so the radio is
+        # released, then point stdout at /dev/null so interpreter shutdown
+        # does not complain about the failed flush.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:  # pragma: no cover - stdout may already be gone
+            pass
+        return 0
 
 
 if __name__ == "__main__":

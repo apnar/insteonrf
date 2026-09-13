@@ -10,24 +10,184 @@ How the packet CRC was reverse-engineered: [Doc/crc.txt](Doc/crc.txt)
 ([blog post](http://make-it-hack.blogspot.com/2015/08/reverse-engineering-crc.html)).
 DEF CON 23 slides: [Doc/insteon_defcon23.pdf](Doc/insteon_defcon23.pdf).
 
-## Install
+## What's changed since the upstream fork
 
-Python 3.10+ and, for the rfcat radio, the
-[rfcat](https://github.com/atlas0fd00m/rfcat) library plus a CC1111 running the
-rfcat firmware. numpy is the only hard dependency — it carries the software
-modulator/demodulator, so the SDR path works without a compiler.
+This fork starts from [evilpete/insteonrf](https://github.com/evilpete/insteonrf)
+at its 2016 state, which described itself as a proof of concept for encoding
+and decoding Insteon RF — and worked as one. Three releases since then turned
+it into something you can leave running. [CHANGELOG.md](CHANGELOG.md) has the
+detail; the short version:
+
+**2.0.0 — ported and repackaged.** Python 2 → 3, and the loose scripts became
+an installable `insteonrf` package with a single `insteon-rf <command>` entry
+point. The old script names (`rf_reciv.py`, `print_pkt.py`, `send_comm.py`,
+`split_pkt.py`, `rf_send.py`) still work as thin wrappers, and the ASCII
+bit-string pipeline contract is unchanged, so existing pipelines keep running.
+Added a pytest suite built on real captures.
+
+**2.1.0 — radios, logging, reliability.** SDR transmit finally exists:
+`insteon-rf modulate` generates the 2-FSK baseband in numpy, replacing the
+`fsk2_mod` that upstream's Makefile referenced but never shipped (and dropping
+the liquid-dsp dependency with it). The rfcat, rtl-sdr, HackRF and file radios
+now sit behind one backend interface (`--backend`). `insteon-rf monitor` logs
+every packet as JSON lines and/or MQTT, folding the mesh's hop repeats into one
+record. Typed protocol model (`Address`, `Flags`, `MsgType`, `Command`), ruff +
+mypy-strict, and CI across Python 3.10–3.14.
+
+**2.2.0 — the receiver got about 17 dB better.** Sync correlation against the
+known preamble/start-header locks the frame grid instead of guessing bit phase;
+the carrier frequency offset is estimated and removed (real devices sit tens of
+kHz off); every symbol is detected by a matched filter against both FSK tones,
+which also yields a confidence; and `recover.py` decodes the frame layer using
+the redundancy the protocol already carries — Manchester pairs combined by
+their difference, the known frame-index counters as a checksum, and a bounded
+CRC-guided repair search. See [Sensitivity](#sensitivity) for the measurements.
+
+### Bugs fixed that change what you decode
+
+- **Extended-packet frame index.** Upstream emitted 31…1; the wire actually
+  carries 31 then 30…0. Extended packets were mis-framed.
+- **`fsk2_demod` bit polarity.** The phase discriminator called
+  `fxpt_atan2(i, q)` on a function that takes `(y, x)`, which negates the phase
+  and complemented every decoded bit. Packets still decoded — the parser
+  accepts either polarity — but the demodulator's output was the complement of
+  what was on the air, so generated samples came out inverted.
+- **Either polarity, any alignment.** `parse_bits()` finds packets anywhere in
+  a burst in either polarity, rather than requiring a clean aligned capture.
+- **The dongle "wedging" on USB.** rflib never releases the USB interface, so
+  the next run hit `Resource busy` and then an endless `Error in resetup()`
+  loop. Fixed, with a self-healing watchdog — see [Doc/usb-notes.md](Doc/usb-notes.md).
+- **Phantom packets.** A frame sequence whose index counters are impossible is
+  now rejected even when its 8-bit CRC happens to match, which removed bogus
+  decodes seen on live air.
+
+### Removed
+
+`fsk2_mod` (never existed — use `insteon-rf modulate`), `Makefile.kali`, the
+WAV-header readers and assorted one-off analysis scripts, and
+`Doc/pkt_format.txt` (superseded by the corrected `pkt_format.md`). In the
+library, `parse_addr()`/`addr_to_wire()`/`wire_to_addr()` were replaced by
+`Address`, which compares and hashes like the strings it replaces.
+
+## Getting started
+
+### 1. What you need
+
+Python **3.10 or newer** (tested through 3.14). numpy is the only hard
+dependency. Then, depending on what you want to do:
+
+| Goal | Hardware | Extra software |
+|---|---|---|
+| Decode captures, build packets, run the tests | none | — |
+| Receive and transmit live | rfcat dongle: a CC1111 running rfcat firmware (e.g. a Yard Stick One) | `rflib`, from git |
+| Receive with an SDR | rtl-sdr dongle, or a HackRF | `rtl_sdr` or `hackrf_transfer` on `PATH` |
+| Transmit with an SDR | HackRF | `hackrf_transfer` |
+
+Insteon RF is **915 MHz**, so this is US-band hardware. Nothing here needs a C
+compiler: the numpy demodulator is the default and is the more sensitive one.
+
+### 2. Install
 
 ```bash
+git clone https://github.com/apnar/insteonrf && cd insteonrf
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev,mqtt]"
-pip install "git+https://github.com/atlas0fd00m/rfcat"   # only for --backend rfcat
-make                                                     # optional: the faster C demodulator
-pytest                                                   # ~100 tests, no hardware needed
+pip install -e ".[radio,mqtt,dev]"
+
+# the rfcat library is not usable from PyPI, so install it from git
+pip install "git+https://github.com/atlas0fd00m/rfcat"
 ```
 
-Everything is available as `insteon-rf <command>` and, for old habits, as the
-original script names (`rf_reciv.py`, `rf_send.py`, `print_pkt.py`,
-`send_comm.py`, `split_pkt.py`, `mod_pkt.py`).
+Pick fewer extras if you want less: `pip install -e .` is the core (numpy
+only), `radio` adds pyusb/pyserial for the rfcat dongle, `mqtt` adds paho-mqtt
+for `monitor --mqtt`, and `dev` adds pytest/ruff/mypy. `make` builds the legacy
+C demodulator, which is optional — it is faster but much less sensitive than
+the numpy default.
+
+### 3. Check it works, with no radio at all
+
+```bash
+pytest                                              # ~130 tests, no hardware
+insteon-rf demod -U Dat/41802513110D2711018C00.dat | insteon-rf print
+```
+
+That last line demodulates the sample capture and must print exactly:
+
+```
+41 : 80 25 13 : 11 0D 27 : 11 01 8C 00           crc 8C
+```
+
+You can also replay a recorded bit-string capture as if it were live, which is
+a good way to see the decoder work before trusting your antenna:
+
+```bash
+insteon-rf recv --backend file --replay tests/data/rfcat-get-engine.txt -D -v
+```
+
+### 4. USB permissions for the rfcat dongle
+
+`rflib` talks to the dongle over raw USB, so it needs access to
+`/dev/bus/usb`. Either run as root, or install a udev rule — rfcat ships one,
+and this is the minimal equivalent for the common dongle ids:
+
+```bash
+sudo tee /etc/udev/rules.d/20-rfcat.rules >/dev/null <<'RULE'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="6047", MODE="0664", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="6048", MODE="0664", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="605b", MODE="0664", GROUP="plugdev"
+RULE
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Add yourself to `plugdev` (`sudo usermod -aG plugdev $USER`) and re-login, then
+replug the dongle. If your distribution has no `plugdev` group, use one you are
+in, or drop the `GROUP=` clause and widen `MODE` to `0666`.
+
+### 5. Receive
+
+```bash
+insteon-rf recv -D -t -v          # decode inline, timestamped, with detail
+insteon-rf recv | insteon-rf print -v
+insteon-rf recv --backend rtlsdr -D        # or --backend hackrf
+```
+
+Trigger some traffic (press a switch, or have your hub poll a device) and
+packets should appear within a second or two, usually several copies of each as
+the mesh repeats them. If nothing appears at all: check the dongle is running
+rfcat firmware (`insteon-rf recv -v` prints the radio config), check you have a
+915 MHz antenna connected, and try `--carrier`, which captures on energy alone
+instead of waiting for a valid start header.
+
+### 6. Transmit
+
+Transmitting needs a source address the target device has in its link
+database — in practice your PLM's address, which is what the devices already
+trust. An unlinked address gets ignored by i2cs devices.
+
+```bash
+# Ping 29.4E.52 as if from PLM 2B.93.07, then listen 1.5 s for the ACK
+insteon-rf pkt -s 2B.93.07 -d 29.4E.52 0F 00 | insteon-rf send -v -L 1500
+insteon-rf pkt -n -s 2B.93.07 -d 29.4E.52 0F 00   # -n: describe it, send nothing
+```
+
+Only transmit to devices you own, and prefer harmless commands — `0F` Ping,
+`0D` Get Engine Version, `19` Status Request — when you are exploring. A
+spoofed command's ACK also reaches the real PLM, so your hub will see the
+traffic too.
+
+### 7. Log everything
+
+```bash
+export INSTEONRF_MQTT_USER=... INSTEONRF_MQTT_PASS=...
+insteon-rf monitor -o insteon-rf.jsonl --mqtt 192.168.1.10:1883 --topic insteon-rf
+```
+
+One JSON object per packet, mesh repeats folded together, to a rotating file
+and/or MQTT. [deploy/insteonrf.yaml](deploy/insteonrf.yaml) runs exactly this
+as a receive-only Kubernetes Pod.
+
+Every command takes `-h`, and `insteon-rf` on its own lists them. All of it is
+also available under the original script names (`rf_reciv.py`, `rf_send.py`,
+`print_pkt.py`, `send_comm.py`, `split_pkt.py`, `mod_pkt.py`).
 
 ## Architecture
 
@@ -149,18 +309,17 @@ python tools/dsp_bench.py --hard-bits          # dongle-style hard-bit repair
 python tools/dsp_bench.py --false-accepts      # noise wrongly accepted
 ```
 
-## Examples
+## Reading the output, and more examples
 
-Regression check with the sample capture in `Dat/`:
+A decoded line is `flags : to : from : cmd1 cmd2 crc pad...` in wire order, so
+addresses read low byte first — the sample capture decodes to
 
 ```
-./fsk2_demod -U < Dat/41802513110D2711018C00.dat | insteon-rf print
 41 : 80 25 13 : 11 0D 27 : 11 01 8C 00           crc 8C
 ```
 
-The line is `flags : to : from : cmd1 cmd2 crc pad...` in wire order (addresses
-low byte first). A lower-case `crc` means the CRC matched; `CRC` flags a mismatch.
-`-v` adds a decoded line:
+which is a Group Cleanup Direct from `27.0D.11` to `13.25.80`. A lower-case
+`crc` means the CRC matched; `CRC` flags a mismatch. `-v` adds a decoded line:
 
 ```
 $ insteon-rf recv -D -v -t
@@ -170,18 +329,19 @@ $ insteon-rf recv -D -v -t
     ACK of Direct: 29.4E.52 -> 2B.93.07  Get Insteon Engine Version (0x0D 0x02)  hops 2/3
 ```
 
-Receive:
+Receiving, beyond the basics in [Getting started](#5-receive):
 
 ```
-insteon-rf recv | insteon-rf print -v           # rfcat
-insteon-rf recv -D -t                           # same, decoded inline with timestamps
-insteon-rf recv --backend rtlsdr | insteon-rf print
-insteon-rf recv --backend hackrf --demod numpy -D
-insteon-rf demod -U capture.iq | insteon-rf print    # from a recorded file
+insteon-rf recv --carrier -D                    # capture on energy, not on a valid header
+insteon-rf recv -D -j | jq .                    # JSON per packet
+insteon-rf demod -U capture.iq -D -v            # a recorded I/Q file, with SNR and repairs
+insteon-rf demod -U capture.iq -m discriminator # the old detector, for comparison
+insteon-rf clip -U capture.iq -o burst          # split I/Q into one file per burst
+insteon-rf dump < bits.txt                      # frame-by-frame, for demodulator debugging
 ```
 
-Transmit (the source address must be linked to the target for i2cs devices —
-typically your PLM's address):
+Transmitting (the source address must be linked to the target for i2cs devices
+— typically your PLM's address):
 
 ```
 insteon-rf pkt -s 13.25.80 -d 16.3F.E5 13 00 | insteon-rf send          # Off

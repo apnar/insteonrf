@@ -274,3 +274,42 @@ def test_mqtt_credentials_come_from_the_environment(monkeypatch, tmp_path):
     assert rc == 0
     assert seen == {"host": "broker", "port": 1884, "user": "from-env",
                     "password": "secret-from-env"}
+
+
+def test_broken_pipe_exits_quietly():
+    """'insteon-rf recv | head' must not dump a traceback."""
+
+    class ClosedPipe(io.StringIO):
+        def write(self, s):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    data = str(pathlib.Path(__file__).parent / "data" / "rfcat-get-engine.txt")
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = ClosedPipe(), io.StringIO()
+    try:
+        rc = cli.main(["recv", "--backend", "file", "--replay", data, "-D"])
+        err = sys.stderr.getvalue()
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+    assert rc == 0 and "Traceback" not in err
+
+
+def test_broken_pipe_still_releases_the_radio():
+    """The exception has to unwind through the context manager first."""
+    from insteonrf.radio import FileRadio
+
+    class ClosedPipe(io.StringIO):
+        def write(self, s):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    radio = FileRadio(lines=["0" * 600])
+    import insteonrf.cli as climod
+
+    old_open, old_out = climod._open_radio, sys.stdout
+    climod._open_radio = lambda *a, **k: radio
+    sys.stdout = ClosedPipe()
+    try:
+        assert cli.main(["recv", "-D", "-a"]) == 0
+    finally:
+        climod._open_radio, sys.stdout = old_open, old_out
+    assert radio.closed
