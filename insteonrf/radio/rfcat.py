@@ -42,6 +42,9 @@ SYNC_PREAMBLE = 0x6666
 #: On-air (inverted) start header, ``START_HEADER_INV`` as a 16-bit word.
 SYNC_START_HEADER = int(START_HEADER_INV, 2)
 
+#: CC1101/CC1111 RSSI register offset for this configuration (datasheet).
+RSSI_OFFSET_DB = 74.0
+
 #: How long to wait for the dongle to come back before giving up on it.
 OPEN_TIMEOUT = 5.0
 RESETUP_TIMEOUT = 8.0
@@ -330,6 +333,44 @@ class RfcatRadio:
 
     def print_config(self) -> None:
         self.dev.printRadioConfig()
+
+    # ---- signal strength ------------------------------------------------
+
+    def read_rssi(self) -> float | None:
+        """Current RSSI in dBm, or None if the dongle will not answer.
+
+        This is the CC1111's RSSI register read *after* a block arrived, not a
+        per-packet measurement latched with it — the radio is still in RX, so
+        it reflects the channel a moment later. Good enough to watch a link
+        degrade over days; do not read it as a calibrated packet RSSI.
+
+        The register is a signed half-dB value with a fixed offset (74 dB for
+        this configuration, per the CC1101/CC1111 datasheet).
+        """
+        dev = self.dev
+        if dev is None:
+            return None
+        try:
+            raw = int(dev.getRSSI()[0] if isinstance(dev.getRSSI(), (bytes, bytearray))
+                      else dev.getRSSI())
+        except Exception as err:  # a wedged dongle, or an older rflib
+            log.debug("getRSSI failed: %r", err)
+            return None
+        if raw > 127:
+            raw -= 256
+        return raw / 2.0 - RSSI_OFFSET_DB
+
+    def read_lqi(self) -> int | None:
+        """Link-quality indicator (lower is better), or None if unavailable."""
+        dev = self.dev
+        if dev is None:
+            return None
+        try:
+            raw = dev.getLQI()
+            return int(raw[0] if isinstance(raw, (bytes, bytearray)) else raw) & 0x7F
+        except Exception as err:
+            log.debug("getLQI failed: %r", err)
+            return None
 
     # ---- health ----------------------------------------------------------
 

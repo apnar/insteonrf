@@ -27,6 +27,12 @@ from .rfcat import DEFAULT_DRATE, DEFAULT_FREQ
 
 log = logging.getLogger(__name__)
 
+
+def _hard_soft(bits: str) -> np.ndarray:
+    """±1 confidences for a hard bit string (all a hardware demodulator gives)."""
+    a = np.frombuffer(bits.encode("ascii"), dtype=np.uint8)
+    return np.where(a == ord("1"), 1.0, -1.0).astype(np.float32)
+
 #: I/Q sample rate the demodulator and the captures in ``Dat/`` use.
 DEFAULT_SAMPLE_RATE = dsp.DEFAULT_SAMPLE_RATE
 #: How much I/Q to read from the capture tool at a time.
@@ -57,11 +63,13 @@ class SdrReceiver:
                  sample_rate: int = DEFAULT_SAMPLE_RATE, baud: float = DEFAULT_DRATE,
                  demod: str = "auto", demod_path: str | None = None,
                  signed: bool | None = None, gain: str | None = None,
-                 squelch: float = 12.0, stdin: bool = False):
+                 squelch: float = 12.0, stdin: bool = False, method: str = "ml"):
         self.freq = freq
         self.sample_rate = sample_rate
         self.baud = baud
         self.squelch = squelch
+        #: numpy detector to use: matched-filter ``"ml"`` or ``"discriminator"``.
+        self.method = method
         self.tool = [tool] if isinstance(tool, str) else list(tool)
         self.kind = Path(self.tool[0]).name if self.tool else "stdin"
         # rtl_sdr writes unsigned 8-bit I/Q, hackrf_transfer signed.
@@ -136,11 +144,33 @@ class SdrReceiver:
 
     def iter_bits(self, timeout_ms: int = 0) -> Iterator[tuple[float, str]]:
         """Yield ``(timestamp, bits)`` per demodulated burst."""
+        for burst in self.iter_bursts(timeout_ms):
+            yield burst.timestamp or time.time(), burst.bits
+
+    def iter_bursts(self, timeout_ms: int = 0) -> Iterator[dsp.Burst]:
+        """Yield :class:`~insteonrf.dsp.Burst` objects, soft decisions included.
+
+        The numpy detector produces real confidences; the C binary only hands
+        back hard bits, so those bursts carry ±1 and still benefit from the
+        Manchester legality check in :mod:`insteonrf.recover`.
+        """
         self._start()
         if self._use_c:
-            yield from self._iter_c()
+            for ts, bits in self._iter_c():
+                yield dsp.Burst(bits=bits, soft=_hard_soft(bits), sps=self.sample_rate / self.baud,
+                                timestamp=ts)
         else:
             yield from self._iter_numpy()
+
+    def receive_burst(self, timeout_ms: int = 2000) -> dsp.Burst | None:
+        """One burst at a time, for callers driving their own loop."""
+        it = getattr(self, "_bit", None)
+        if it is None:
+            it = self._bursts = self.iter_bursts()
+        got = next(self._bursts, None)
+        if got is None:
+            self.exhausted = True
+        return got
 
     def _iter_c(self) -> Iterator[tuple[float, str]]:
         argv = [str(self.demod_path), "-s", str(self.sample_rate), "-b", str(int(self.baud)),
@@ -154,7 +184,7 @@ class SdrReceiver:
             if line and line[0] in "01":
                 yield time.time(), line
 
-    def _iter_numpy(self) -> Iterator[tuple[float, str]]:
+    def _iter_numpy(self) -> Iterator[dsp.Burst]:
         """Demodulate in numpy, one burst at a time.
 
         A packet is ~56 ms long — about 270 kB of I/Q at 2.4 Msps, several
@@ -179,13 +209,12 @@ class SdrReceiver:
             # Keep a little context so a burst split by the size cap continues.
             pending = pending[-lead_bytes:] if busy else b""
 
-    def _flush(self, buf: bytes) -> Iterator[tuple[float, str]]:
+    def _flush(self, buf: bytes) -> Iterator[dsp.Burst]:
         if not buf:
             return
-        ts = time.time()
-        for bits in dsp.demodulate_fsk2(buf, sample_rate=self.sample_rate, baud=self.baud,
-                                        signed=self.signed, squelch=self.squelch):
-            yield ts, bits
+        yield from dsp.demodulate_bursts(buf, sample_rate=self.sample_rate, baud=self.baud,
+                                         signed=self.signed, squelch=self.squelch,
+                                         method=self.method, timestamp=time.time())
 
     def _tail_is_busy(self, tail: bytes) -> bool:
         """True when the end of a read still carries signal above the squelch."""
@@ -197,13 +226,10 @@ class SdrReceiver:
         return bool(np.abs(a[0::2] + 1j * a[1::2]).mean() > self.squelch)
 
     def receive_bits(self, timeout_ms: int = 2000) -> tuple[float, str] | None:
-        it = getattr(self, "_it", None)
-        if it is None:
-            it = self._it = self.iter_bits()
-        got = next(it, None)
-        if got is None:
-            self.exhausted = True
-        return got
+        burst = self.receive_burst(timeout_ms)
+        if burst is None:
+            return None
+        return burst.timestamp or time.time(), burst.bits
 
 
 class SdrTransmitter:

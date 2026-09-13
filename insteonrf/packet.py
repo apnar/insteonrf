@@ -258,6 +258,16 @@ class Packet:
     bits: str = field(default="", repr=False, compare=False)
     timestamp: float | None = field(default=None, repr=False, compare=False)
     complete: bool = field(default=True, compare=False)  # frame index counted down to 0
+    #: How many bits :mod:`insteonrf.recover` had to flip to make the CRCs pass.
+    corrected: int = field(default=0, repr=False, compare=False)
+    #: Estimated SNR of the burst this came from, when a soft demodulator saw it.
+    snr_db: float | None = field(default=None, repr=False, compare=False)
+    #: Receiver signal strength in dBm, when the radio reports it.
+    rssi_dbm: float | None = field(default=None, repr=False, compare=False)
+    #: Whether the frame-index counters ran as the protocol requires. ``False``
+    #: means these bytes are not a packet however well the CRC happened to
+    #: match — an 8-bit CRC matches one random candidate in 256.
+    index_ok: bool | None = field(default=None, repr=False, compare=False)
 
     # ---- construction ----------------------------------------------------
 
@@ -502,6 +512,9 @@ class Packet:
             "crc_ok": self.crc_ok,
             "ext_crc_ok": self.ext_crc_ok,
             "complete": self.complete,
+            "corrected": self.corrected,
+            "snr_db": round(self.snr_db, 1) if self.snr_db is not None else None,
+            "rssi_dbm": round(self.rssi_dbm, 1) if self.rssi_dbm is not None else None,
             "raw": bytes(self.data).hex().upper(),
         }
         return d
@@ -622,6 +635,24 @@ def find_headers(bits: str) -> tuple[str, list[int]]:
     return bits, offsets
 
 
+def expected_indexes(extended: bool) -> list[int]:
+    """The frame-index sequence a packet of this kind must carry.
+
+    The counter is 31 for the flags byte, then counts down from 11 (standard)
+    or 30 (extended) to 0. It carries no information, so it is free error
+    detection — 65 bits of it on a standard packet.
+    """
+    return [31] + list(range(30 if extended else 11, -1, -1))
+
+
+def indexes_ok(data: Sequence[int], idx: Sequence[int]) -> bool:
+    """True when a decoded frame-index sequence is the one the protocol mandates."""
+    if not idx or not data:
+        return False
+    want = expected_indexes(bool(data[0] & FLAG_EXT))
+    return list(idx) == want[: len(idx)]
+
+
 def parse_bits(line: str, timestamp: float | None = None, *, min_bytes: int = 4) -> list[Packet]:
     """Extract every packet from one ASCII bit string (any polarity, any alignment).
 
@@ -635,7 +666,9 @@ def parse_bits(line: str, timestamp: float | None = None, *, min_bytes: int = 4)
         if len(data) < min_bytes:
             continue
         end = pos + MARKER_OFFSET + FRAME_BITS * len(data)
-        packets.append(Packet(data, bits[pos:end], timestamp, complete=bool(idx) and idx[-1] == 0))
+        pkt = Packet(data, bits[pos:end], timestamp, complete=bool(idx) and idx[-1] == 0)
+        pkt.index_ok = indexes_ok(data, idx)
+        packets.append(pkt)
     return packets
 
 

@@ -100,6 +100,9 @@ def _radio_args(p: argparse.ArgumentParser, *, transmit: bool = False) -> None:
     else:
         p.add_argument("--demod", choices=("auto", "c", "numpy"), default="auto",
                        help="SDR backends: demodulator to use (default %(default)s)")
+        p.add_argument("-m", "--method", choices=("ml", "discriminator"), default="ml",
+                       help="SDR backends, numpy demodulator: matched-filter ML (default, more "
+                            "sensitive and gives soft decisions) or phase discriminator")
         p.add_argument("--gain", help="SDR backends: receiver gain setting")
 
 
@@ -113,6 +116,8 @@ def _open_radio(a: argparse.Namespace, *, transmit: bool = False) -> Any:
             kw.update(tx_gain=a.tx_gain)
         else:
             kw.update(demod=a.demod, gain=a.gain)
+            if getattr(a, "method", None):
+                kw["method"] = a.method
     elif a.backend == "file":
         kw.update(paths=a.replay or [])
     return open_backend(a.backend, freq=a.freq, baud=a.baud, transmit=transmit, **kw)
@@ -158,6 +163,61 @@ def _keep(packets: list[Packet], show_all: bool) -> list[Packet]:
     return packets if show_all else [q for q in packets if q.calc_crc is not None]
 
 
+def _receive(radio: Any, timeout_ms: int) -> tuple[float, str, Any, int | None] | None:
+    """One burst from any backend, keeping soft decisions where they exist.
+
+    A hardware demodulator (the rfcat dongle) can only give hard bits; the
+    numpy SDR path also returns per-symbol confidence and the located frame
+    grid, which :func:`_decode` puts to work.
+    """
+    if hasattr(radio, "receive_burst"):
+        burst = radio.receive_burst(timeout_ms)
+        if burst is None:
+            return None
+        return (burst.timestamp or time.time(), burst.bits, burst.soft, burst.header_index)
+    got = radio.receive_bits(timeout_ms)
+    if got is None:
+        return None
+    return got[0], got[1], None, None
+
+
+def _decode(bits: str, ts: float | None, *, repair: bool = True, show_all: bool = False,
+            soft: Any = None, header_index: int | None = None) -> list[Packet]:
+    """Decode a burst, recovering marginal packets when ``repair`` is set.
+
+    :func:`~insteonrf.packet.parse_bits` is the fast path. With ``repair`` on,
+    :mod:`insteonrf.recover` also runs: it soft-combines Manchester pairs (or,
+    on hard bits from the dongle, treats illegal pairs as the suspect
+    positions), checks the known frame-index counters, and flips the least
+    confident bits looking for a CRC match. Anything it recovers that
+    ``parse_bits`` did not is added to the result.
+    """
+    found = parse_bits(bits, ts)
+    if not repair:
+        return _keep(found, show_all)
+    from .recover import recover_packets
+
+    def key(pkt: Packet) -> tuple[int, ...]:
+        # Everything up to and including the CRC. A truncated second sighting
+        # of the same message differs only in how much pad survived, so this
+        # keeps one copy of it rather than two.
+        return tuple(pkt.data[: pkt.crc_index + 1])
+
+    out: list[Packet] = []
+    seen: set[tuple[int, ...]] = set()
+    for rec in recover_packets(bits, soft, ts, header_index=header_index):
+        out.append(rec.packet)
+        seen.add(key(rec.packet))
+    for pkt in _keep(found, show_all):
+        # A packet whose frame counters are wrong is CRC luck, not a packet.
+        if pkt.index_ok is False and not show_all:
+            continue
+        if key(pkt) not in seen:
+            out.append(pkt)
+            seen.add(key(pkt))
+    return out
+
+
 def _ts_line(ts: float, nbits: int) -> str:
     t = _dt.datetime.fromtimestamp(ts).isoformat(timespec="milliseconds")
     return f"# {t} len={nbits // 8}"
@@ -182,6 +242,8 @@ def recv_main(argv: list[str] | None = None) -> int:
                         "(noisier, but shows bursts the sync word misses)")
     p.add_argument("--timeout", type=int, default=2000, help="USB receive timeout in ms (default "
                                                              "%(default)s)")
+    p.add_argument("--no-repair", action="store_true",
+                   help="with -D: do not try to recover packets whose CRC failed")
     _log_args(p)
     a = p.parse_args(argv)
     _setup_logging(a.verbose)
@@ -193,14 +255,15 @@ def recv_main(argv: list[str] | None = None) -> int:
             radio.print_config()
         try:
             while not STOP.is_set():
-                got = radio.receive_bits(a.timeout)
+                got = _receive(radio, a.timeout)
                 if got is None:
                     if getattr(radio, "exhausted", False):
                         break
                     continue  # nothing on the air within the timeout
-                ts, bits = got
+                ts, bits, soft, header_index = got
                 if a.decode:
-                    pkts = _keep(parse_bits(bits, ts), a.all)
+                    pkts = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
+                                   soft=soft, header_index=header_index)
                     _print_packets(pkts, sys.stdout, verbose=a.verbose > 0,
                                    show_time=a.time, as_json=a.json)
                 else:
@@ -253,7 +316,7 @@ def send_main(argv: list[str] | None = None) -> int:
                 while (left := end - time.monotonic()) > 0 and not STOP.is_set():
                     r = radio.receive_bits(max(1, int(left * 1000)))
                     if r is not None:
-                        _print_packets(_keep(parse_bits(r[1], r[0]), False), sys.stdout, show_time=True)
+                        _print_packets(_decode(r[1], r[0]), sys.stdout, show_time=True)
     log.info("sent %d packet(s)", sent)
     return 0
 
@@ -271,6 +334,8 @@ def print_main(argv: list[str] | None = None) -> int:
                                                              "decoded")
     p.add_argument("-a", "--all", action="store_true", help="also show fragments too short to have a CRC")
     p.add_argument("-l", "--log", metavar="FILE", help="append the hex line of every packet to FILE")
+    p.add_argument("--no-repair", action="store_true",
+                   help="do not try to recover packets whose CRC failed")
     p.add_argument("files", nargs="*", help="input files (default: stdin)")
     a = p.parse_args(argv)
 
@@ -284,8 +349,9 @@ def print_main(argv: list[str] | None = None) -> int:
             if kind == "junk":
                 print(f"skipping non-bit line: {line[:40]!r}", file=sys.stderr)
                 continue
-            _print_packets(_keep(parse_bits(line), a.all), sys.stdout, verbose=a.verbose > 0,
-                           show_time=a.time, log_fh=log_fh, as_json=a.json)
+            _print_packets(_decode(line, None, repair=not a.no_repair, show_all=a.all),
+                           sys.stdout, verbose=a.verbose > 0, show_time=a.time,
+                           log_fh=log_fh, as_json=a.json)
     except KeyboardInterrupt:
         pass
     finally:
@@ -479,6 +545,14 @@ def demod_main(argv: list[str] | None = None) -> int:
     _iq_args(p)
     p.add_argument("--demod", choices=("auto", "c", "numpy"), default="numpy",
                    help="numpy (default) or the compiled fsk2_demod binary")
+    p.add_argument("-m", "--method", choices=("ml", "discriminator"), default="ml",
+                   help="numpy detector: matched-filter ML (default) or phase discriminator")
+    p.add_argument("-D", "--decode", action="store_true",
+                   help="decode packets here, keeping soft decisions (better sensitivity "
+                        "than piping bits to 'print', which discards them)")
+    p.add_argument("-j", "--json", action="store_true", help="with -D: one JSON object per packet")
+    p.add_argument("--no-repair", action="store_true",
+                   help="with -D: do not attempt CRC-guided bit repair")
     p.add_argument("-t", "--time", action="store_true",
                    help="emit a '# <timestamp> len=N' line per burst (numpy demodulator only)")
     p.add_argument("-q", "--squelch", type=float, default=12.0,
@@ -505,11 +579,23 @@ def demod_main(argv: list[str] | None = None) -> int:
 
     for fh in _open_iq(a.files):
         raw = fh.read()
-        for bits in dsp.demodulate_fsk2(raw, sample_rate=a.sample_rate, baud=a.baud,
-                                        signed=a.signed, squelch=a.squelch):
+        bursts = dsp.demodulate_bursts(raw, sample_rate=a.sample_rate, baud=a.baud,
+                                       signed=a.signed, squelch=a.squelch, method=a.method,
+                                       timestamp=time.time())
+        for burst in bursts:
+            if a.decode:
+                from .recover import recover_from_burst
+
+                for rec in recover_from_burst(burst, repair=not a.no_repair):
+                    if a.verbose:
+                        log.info("burst: %d bits, snr %.1f dB, cfo %+.0f Hz, %d bit(s) repaired",
+                                 len(burst.bits), burst.snr_db, burst.cfo_hz, rec.corrected)
+                    _print_packets([rec.packet], sys.stdout, verbose=a.verbose > 0,
+                                   show_time=a.time, as_json=a.json)
+                continue
             if a.time:
-                print(_ts_line(time.time(), len(bits)))
-            print(bits)
+                print(_ts_line(burst.timestamp or time.time(), len(burst.bits)))
+            print(burst.bits)
     sys.stdout.flush()
     return 0
 
@@ -568,6 +654,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
     p.add_argument("-a", "--all", action="store_true", help="also log fragments with no CRC")
     p.add_argument("--quiet", action="store_true", help="do not echo records to stdout")
     p.add_argument("--carrier", action="store_true", help="capture on carrier detect alone")
+    p.add_argument("--no-rssi", action="store_true",
+                   help="do not sample the dongle's RSSI register after each block")
+    p.add_argument("--no-repair", action="store_true",
+                   help="do not try to recover packets whose CRC failed")
     p.add_argument("--timeout", type=int, default=2000, help="USB receive timeout in ms")
     _log_args(p)
     a = p.parse_args(argv)
@@ -599,10 +689,15 @@ def monitor_main(argv: list[str] | None = None) -> int:
             radio.configure_rx(sync_header=not a.carrier)
             log.info("monitoring on %s", getattr(radio, "name", a.backend))
             while not STOP.is_set():
-                got = radio.receive_bits(a.timeout)
+                got = _receive(radio, a.timeout)
                 if got is not None:
-                    bits, ts = got[1], got[0]
-                    for pkt in _keep(parse_bits(bits, ts), a.all):
+                    ts, bits, soft, header_index = got
+                    rssi = None
+                    if not a.no_rssi and hasattr(radio, "read_rssi"):
+                        rssi = radio.read_rssi()
+                    for pkt in _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
+                                       soft=soft, header_index=header_index):
+                        pkt.rssi_dbm = rssi
                         if dd is None:
                             emit([pkt.to_dict()])
                         else:

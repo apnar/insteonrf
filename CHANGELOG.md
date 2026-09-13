@@ -4,6 +4,84 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.2.0 — 2026-09-13
+
+Receiver rework: the detector now runs near the theoretical limit for uncoded
+noncoherent 2-FSK, and the framing layer uses the redundancy Insteon already
+carries. Measured with `tools/dsp_bench.py` (paired trials — every detector
+sees the same noise), sweeping signal amplitude against a fixed noise floor:
+
+| symbol SNR | `fsk2_demod` | numpy discriminator | ML | ML + soft frames | + repair |
+|---|---|---|---|---|---|
+| 31.6 dB | 0% | 100% | 100% | 100% | 100% |
+| 25.6 dB | 0% | 72% | 95% | 98% | 98% |
+| 23.7 dB | 0% | 0% | 100% | 100% | 100% |
+| 15.7 dB | 0% | 0% | 100% | 100% | 100% |
+| 11.6 dB | 0% | 0% | 88% | 100% | 100% |
+| 10.7 dB | 0% | 0% | 38% | 95% | 98% |
+| 8.5 dB | 0% | 0% | 0% | 78% | 85% |
+
+The 50% point moves from ~26 dB to ~7.5 dB: **about 18 dB more sensitivity**
+than 2.1.0's numpy path, and the C binary needs more than 30 dB. False accepts
+stayed at zero across 150 noise-only bursts and 2000 random bit strings.
+
+### Added
+
+- **Sync correlation** (`dsp.find_sync`). The known preamble + start-header
+  pattern is cross-correlated against mean-removed discriminator output, which
+  locates the frame grid, the polarity and the carrier offset instead of
+  guessing bit phase from "the first zero crossing after the squelch opened".
+  Candidates are filtered by absolute score, by a minimum spacing of one whole
+  packet, and by a relative floor — payload contains plenty of preamble-like
+  runs, and a true sync scores 0.9-1.0 where the best false alarm sits near 0.7.
+- **Carrier frequency offset estimation and removal** (`dsp.estimate_cfo`),
+  measured over the balanced preamble only. The capture in `Dat/` is ~24 kHz
+  off (about 26 ppm at 915 MHz); uncorrected, that offset biases every symbol
+  decision toward one tone.
+- **Noncoherent matched-filter detection** (`method="ml"`, now the default):
+  each symbol is correlated against both tones and the larger magnitude wins,
+  which is the optimal detector for this waveform and yields a per-symbol
+  *confidence*, not just a bit. `method="discriminator"` keeps the old chain.
+- **Symbol-rate search**: a small grid around nominal, keeping the most
+  confident result, so a few hundred ppm of transmitter clock error no longer
+  walks the bit clock off over a 1000-symbol extended packet.
+- **`insteonrf.recover`** — soft-decision framing. Manchester is a rate-1/2
+  code, so a logical bit is decided from the *difference* of its pair (worth
+  ~3 dB, and free); the 5-bit frame-index counters are known from position and
+  become a checksum the protocol hands us; and the least-confident data bits
+  are flipped in a bounded Chase search looking for a CRC match. Every repair
+  must also satisfy the index check, which is what keeps an 8-bit CRC from
+  accepting garbage.
+- **Hard-bit repair too.** Given only hard bits — all the CC1111 can provide —
+  illegal Manchester pairs mark the suspect positions. On the dongle's output:
+  one symbol error 26% → 94% recovered, two 4% → 85%, three 0% → 75%.
+  `recv`, `print`, `send -L` and `monitor` do this by default (`--no-repair`).
+- **The frame-index invariant is enforced.** `Packet.index_ok` records whether
+  the counters ran as the protocol requires, and `recover` refuses a packet
+  whose counters are impossible however well its CRC matched — the CRC covers
+  the data bytes only, so it cannot see a broken counter. `recv`/`print`/
+  `monitor` drop those unless `--all` is given, which removes a class of
+  phantom decode seen on live air.
+- **Signal strength in the log**: `RfcatRadio.read_rssi()`/`read_lqi()` and
+  `snr_db`/`rssi_dbm`/`corrected` fields in the JSON, so a day of `monitor`
+  output shows which links are marginal. (A first run here found a loft
+  KeypadLinc answering at -102.5 dBm against a -105 dBm noise floor.)
+- `dsp.Burst` carries bits, per-symbol soft values, sample offset, symbol rate,
+  CFO, SNR and the located header index; `SdrReceiver.iter_bursts()` and
+  `receive_burst()` hand them to the CLI, so the live SDR path keeps its soft
+  information instead of flattening to a string. `insteon-rf demod -D` decodes
+  with soft decisions; `--method ml|discriminator` selects the detector.
+- `tools/dsp_bench.py`: sensitivity sweeps, false-accept measurement and
+  hard-bit repair measurement, so changes here are justified by numbers.
+
+### Changed
+
+- `demodulate_fsk2()` keeps its signature and string contract but now runs the
+  ML chain; it is a thin wrapper over `demodulate_bursts()`, which is what you
+  want if you care about sensitivity.
+- `Packet` gained `corrected`, `snr_db` and `rssi_dbm` (all excluded from
+  equality), and `to_dict()` reports them.
+
 ## 2.1.0 — 2026-09-13
 
 ### Added

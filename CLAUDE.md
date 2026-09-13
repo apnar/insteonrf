@@ -42,7 +42,8 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/packet.py` | `Address`, `Flags`, `MsgType`, `Packet` (wire bytes + properties, `to_dict()`/`from_dict()`), `pkt_crc`/`ext_crc`, `parse_bits()` (find start header in either polarity, decode 28-bit frames), `Packet.to_bits()` (frame + Manchester + invert) |
 | `insteonrf/manchester.py` | Manchester encode/decode, `invert_bits` |
 | `insteonrf/cmds.py` | `Command` enum, cmd1/cmd2 → name tables, `lookup()` |
-| `insteonrf/dsp.py` | numpy `modulate_fsk2()` / `demodulate_fsk2()` / `iq_bursts()` — the SDR path without a compiler |
+| `insteonrf/dsp.py` | numpy `modulate_fsk2()`; receive chain `find_sync()` → `estimate_cfo()` → `_ml_soft()` exposed as `demodulate_bursts()` (returns `Burst`: bits + per-symbol soft + sps + cfo + snr + header_index); `demodulate_fsk2()` is the string-contract wrapper; `iq_bursts()` splits bursts |
+| `insteonrf/recover.py` | soft-decision framing: Manchester pairs combined by difference, known frame-index counters as a checksum, bounded CRC-guided bit repair (`recover_packets`, `recover_from_burst`) |
 | `insteonrf/radio/` | `rfcat.py` (`RfcatRadio`, aliased `Radio`: 2FSK, 914.95 MHz, 9124 baud, 200 kHz BW, 75 kHz dev; `configure_rx()` syncs on the inverted start header `0x3155`, `sync_header=False` = carrier detect; `configure_tx()` sync word `0x6666`), `sdr.py` (`SdrReceiver`/`SdrTransmitter`), `file.py` (`FileRadio`), `__init__.py` (`RadioBackend` protocol, `open_backend()`) |
 | `insteonrf/monitor.py` | JSON-lines writer with rotation, mesh-repeat `Deduper`, `MqttPublisher` |
 | `insteonrf/debug.py` | `dump_frames()` — frame-by-frame breakdown |
@@ -85,8 +86,32 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   bounded to 10 s. After that fix, 200 open/receive/close cycles, 50 kill-mid-receive cycles
   and 20 two-process races run clean (`tools/usb_stress.py`); the dongle firmware
   (`DONSDONGLE r5535`, Feb 2015) was left alone.
-- The numpy demodulator integrates over each bit, so it decodes packets the C one loses in
-  noise (~7x more tolerance); the C one is the fast path for live streams.
+- **Receive chain (2.2.0)**: envelope squelch → `find_sync()` correlates the known
+  preamble+start-header against mean-removed discriminator output (CFO-immune) to lock the
+  frame grid, polarity and offset → `estimate_cfo()` over the *balanced preamble only* (using
+  the whole template biases it ~2.8 kHz, since the header has 14 ones of 27 bits) →
+  noncoherent matched-filter detection of each symbol against both tones, repeated over a
+  small symbol-rate grid, keeping the most confident result. A true sync scores 0.9-1.0; the
+  best payload false alarm is ~0.7, so the threshold plus a one-packet minimum spacing and a
+  relative floor keep payload from looking like a header.
+- **Soft decisions are the point.** `Burst.soft` is signed per-symbol confidence, and
+  `recover.py` uses it: Manchester is rate-1/2, so a logical bit is `sign(s1 - s0)` — worth
+  ~3 dB over hard-deciding each symbol. The 5-bit frame-index counters are known from
+  position (31, then 11..0 or 30..0) and are the guard that makes CRC-guided repair safe; an
+  8-bit CRC alone would accept ~1 in 256 random attempts. `Packet.index_ok` carries the
+  verdict, and `recover` refuses a packet whose counters are impossible even when its CRC
+  matches (the CRC does not cover the index bits) — that is what killed a phantom
+  `29.41.E0 -> 5D.99.3C cmd 0x69` decode seen on live air. Measured: 0 false accepts over
+  150 noise bursts and 2000 random bit strings.
+- **Numbers** (`tools/dsp_bench.py`, paired trials): 50% recovery at ~25 dB symbol SNR for
+  the old discriminator path, ~10.5 dB for ML, ~7.5 dB with soft framing — ~18 dB gained,
+  and near the ~13 dB theoretical limit for uncoded noncoherent 2-FSK. The C `fsk2_demod`
+  fails even at 31 dB. On *hard* bits (what the dongle gives), repair takes one-symbol-error
+  recovery from 26% to 94%, two from 4% to 85%, three from 0% to 75%.
+- `read_rssi()` reads the CC1111 RSSI register (offset 74 dB) *after* a block, while the
+  radio is still in RX — a channel snapshot, not a latched per-packet measurement. Idle
+  floor here is about -105 dBm; the loft KPL `2B.A0.AB` answers at about -102 dBm, i.e. it is
+  a marginal link. `read_lqi()` is only meaningful right after a sync.
 - Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
   Assistant `mqtt.publish` service (no `mosquitto_pub` on the host or in the pod), e.g.
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.

@@ -34,28 +34,37 @@ original script names (`rf_reciv.py`, `rf_send.py`, `print_pkt.py`,
 Three layers, each usable on its own:
 
 ```
-  radio backends            signal processing        protocol
-  ───────────────           ─────────────────        ────────
-  RfcatRadio   (TX/RX) ───┐                       ┌─ Packet / Address / Flags
-  SdrReceiver  (RX)    ───┼── bit strings ────────┤   parse_bits() / to_bits()
-  SdrTransmitter (TX)  ───┤   "0110100…"          └─ CRCs, Manchester framing
-  FileRadio    (tests) ───┘        ▲
-                                   │
-                  dsp.modulate_fsk2 / demodulate_fsk2  (numpy)
-                  Src/fsk2_demod                       (C, same output)
+  radio backends            signal processing            protocol
+  ───────────────           ─────────────────            ────────
+  RfcatRadio   (TX/RX) ───┐                           ┌─ Packet / Address / Flags
+  SdrReceiver  (RX)    ───┼── bits, or Burst ─────────┤   parse_bits() / to_bits()
+  SdrTransmitter (TX)  ───┤   (bits + confidence)     ├─ CRCs, Manchester framing
+  FileRadio    (tests) ───┘            ▲              └─ recover: soft framing,
+                                       │                 index check, CRC repair
+              dsp: modulate_fsk2 / find_sync → CFO → ML detection
+              Src/fsk2_demod  (C, legacy: same bits on clean signal)
 ```
+
+Receive chain, in order: envelope squelch finds candidate bursts → the known
+preamble/start-header pattern is correlated to lock the frame grid, polarity
+and carrier offset → every symbol is detected by correlating against both FSK
+tones, which yields a *confidence* as well as a bit → `recover` combines
+Manchester pairs by their difference, checks the known frame-index counters,
+and flips the least-confident bits looking for a CRC match.
 
     insteonrf/packet.py     Address, Flags, MsgType, Packet, CRCs, parse_bits()/to_bits()
     insteonrf/cmds.py       Command enum + command number -> name tables
     insteonrf/manchester.py Manchester coding helpers
-    insteonrf/dsp.py        numpy FSK2 modulator / demodulator, burst splitter
+    insteonrf/dsp.py        numpy modulator, sync correlation, CFO, ML detector, Burst
+    insteonrf/recover.py    soft-decision framing and CRC-guided repair
     insteonrf/radio/        rfcat, SDR and file backends behind one protocol
     insteonrf/monitor.py    JSON-lines logging, mesh-repeat dedupe, MQTT
     insteonrf/debug.py      frame-by-frame dump for demodulator debugging
     insteonrf/cli.py        the commands below
-    Src/                    C demodulator / burst splitter (the fast path)
+    Src/                    C demodulator / burst splitter (legacy fast path)
     deploy/insteonrf.yaml   k8s Pod that logs all house RF to MQTT
     tools/usb_stress.py     USB robustness harness (not shipped)
+    tools/dsp_bench.py      sensitivity / false-accept benchmarks (not shipped)
     tests/                  pytest suite with real captures as fixtures
 
 ## Data format
@@ -77,7 +86,7 @@ for the start header, so leading garbage and either bit polarity are fine.
 | `insteon-rf send` | `rf_send.py` | Transmit bit strings (`-L MS` listens for replies, `-n` dry run) |
 | `insteon-rf monitor` | | Long-running logger: JSON lines to a rotating file and/or MQTT, mesh repeats deduped |
 | `insteon-rf modulate` | `mod_pkt.py` | Bit strings → raw I/Q for an SDR transmitter |
-| `insteon-rf demod` | | Raw I/Q → bit strings (`--demod numpy|c`) |
+| `insteon-rf demod` | | Raw I/Q → bit strings, or packets with `-D` (`--demod numpy|c`, `--method ml|discriminator`) |
 | `insteon-rf clip` | | Split an I/Q stream into one file per burst |
 | `insteon-rf dump` | `split_pkt.py` | Frame-by-frame breakdown for debugging a demodulator |
 | `insteon-rf reset` | | Bounded USB reset of a wedged rfcat dongle |
@@ -87,6 +96,47 @@ for the start header, so leading garbage and either bit polarity are fine.
 
 Backends: `--backend rfcat` (default, TX and RX), `rtlsdr` (RX), `hackrf`
 (RX, and TX via the numpy modulator), `file` (replays bit-string files).
+
+## Sensitivity
+
+Measured by `tools/dsp_bench.py`, adding noise to modulated packets and
+counting exact recoveries (paired trials — every detector sees the same noise):
+
+| symbol SNR | `fsk2_demod` (C) | numpy discriminator | ML | ML + soft frames | + repair |
+|---|---|---|---|---|---|
+| 31.6 dB | 0% | 100% | 100% | 100% | 100% |
+| 25.6 dB | 0% | 72% | 95% | 98% | 98% |
+| 23.7 dB | 0% | 0% | 100% | 100% | 100% |
+| 15.7 dB | 0% | 0% | 100% | 100% | 100% |
+| 11.6 dB | 0% | 0% | 88% | 100% | 100% |
+| 10.7 dB | 0% | 0% | 38% | 95% | 98% |
+| 8.5 dB | 0% | 0% | 0% | 78% | 85% |
+
+The default chain works about 18 dB below where the previous numpy path gave
+up, and sits near the theoretical limit for uncoded noncoherent 2-FSK (~13 dB
+per symbol) because the Manchester coding and frame-index counters are decoded
+rather than discarded. No noise-only burst was ever accepted as a packet
+(150 noise bursts, plus 2000 random bit strings), and a well-formed frame
+sequence whose counters are impossible is rejected even when its CRC matches.
+
+**On hard bits** — all a hardware demodulator like the CC1111 can give — the
+repair path still helps, because a flipped symbol leaves an illegal Manchester
+pair that marks where to look:
+
+| symbol errors in the burst | `parse_bits` | with repair |
+|---|---|---|
+| 1 | 26% | 94% |
+| 2 | 4% | 85% |
+| 3 | 0% | 75% |
+| 4 | 0% | 66% |
+
+Run the benchmarks yourself:
+
+```
+python tools/dsp_bench.py                      # sensitivity sweep
+python tools/dsp_bench.py --hard-bits          # dongle-style hard-bit repair
+python tools/dsp_bench.py --false-accepts      # noise wrongly accepted
+```
 
 ## Examples
 
@@ -170,6 +220,9 @@ for q in parse_bits(bits):
 | `cmd1`, `cmd2`, `command` | command bytes and the looked-up name |
 | `ext_data` | the 13 extended-data bytes, or `null` |
 | `crc`, `crc_ok`, `ext_crc_ok` | received CRC and whether it verified |
+| `corrected` | how many bits the repair search had to flip (0 for a clean decode) |
+| `snr_db` | estimated burst SNR — soft demodulators only, `null` from the dongle |
+| `rssi_dbm` | receiver signal strength when the radio reports it (see the caveat below) |
 | `complete` | the frame index counted down to 0 (not a truncated burst) |
 | `raw` | every wire byte as hex — `Packet.from_dict()` rebuilds the packet from it |
 | `repeats`, `hops_seen` | `monitor` only: how many mesh copies were folded in, and their hop counts |
@@ -195,5 +248,13 @@ copy of the message; `--no-dedupe` writes each repeat as it arrives instead.
 - **No packets but bursts arrive**: polarity is not the issue (the parser tries
   both). Run `insteon-rf dump` on a captured line to see where the Manchester
   decode breaks.
-- **Weak SDR reception**: the numpy demodulator integrates over each bit and
-  copes with far more noise than the C one; try `--demod numpy`.
+- **Weak reception**: the numpy chain is far more sensitive than the C binary
+  (see the table above), so prefer `--demod numpy`. `insteon-rf demod -D`
+  decodes with soft decisions, which is better than piping bits into `print`
+  because the pipeline's string contract discards confidence. Add `-v` to see
+  per-burst SNR, carrier offset and how many bits were repaired.
+- **`rssi_dbm` is a snapshot, not a latched measurement.** It reads the
+  CC1111's RSSI register just after a block arrives, while the radio is still
+  in RX, so it reflects the channel a moment later rather than that packet
+  exactly. It is good for ranking links and watching a device degrade over
+  weeks — not for calibrated per-packet numbers. `--no-rssi` skips it.
