@@ -6,9 +6,9 @@ checked against the repo as of 2026-09-13, right after the Python 3 port
 (`alpha`, the Yard Stick-class CC1111 "DONSDONGLE" is on USB `1d50:6048`), in
 `/root/insteon/insteonrf`, venv `.venv`.
 
-Do not commit or push without Josh asking. Keep every RF transmission benign
-(Ping `0F`, Get Engine Version `0D`, Status Request `19`) and spoof only the
-PLM address `2B.93.07`; the real PLM hears every ACK.
+Keep every RF transmission benign (Ping `0F`, Get Engine Version `0D`, Status
+Request `19`) and spoof only the PLM address `2B.93.07`; the real PLM hears
+every ACK.
 
 ## 0. Current state (what you inherit)
 
