@@ -4,6 +4,78 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.5.0 — 2026-09-15
+
+More ears for the PLM. A PLM hears only what reaches its single antenna, and
+passes up only the group broadcasts it holds an ALDB link for. 26 devices on
+this network (3 mini-remotes, 21 water sensors, 2 door sensors) have no
+powerline path at all and cannot be polled afterwards, so a message the modem
+misses is lost for good. This release adds the path for extra receivers to
+hand it what it missed. Plan and findings: `Doc/MESH-PLAN.md`.
+
+Nothing here transmits. There is exactly one transmitter on an Insteon network
+and it is the PLM.
+
+- **`insteonrf/plm.py`** converts between RF packets and the `02 50`/`02 51`
+  frames a modem hands its host. Group broadcasts **swap the two address
+  slots** rather than encoding "group 00 00": the destination is a real
+  `to_addr` whose low byte is the group, and an ALL-Link Cleanup Status Report
+  (`cmd1 0x06`) carries the reported command in the high byte — `11.01.01` is
+  "On, group 1". 27 of 223 live captures were such reports, and the first
+  implementation zeroed those bytes. Found by replaying real captures through
+  insteon-mqtt's own parser, which is how `tests/test_plm.py` checks it: 223 of
+  223 captures round-trip, the one refusal being a packet truncated before its
+  CRC.
+- **`deploy/insteon-mqtt/`** patches insteon-mqtt with two topics, both off by
+  default: `insteon/raw/rx` mirrors every inbound message *before* its
+  duplicate check, and `insteon/raw/inject` feeds `Protocol.inject()`.
+  Injection never touches the shared read buffer (it is filled by the serial
+  link and may hold a partial frame), refuses anything that is not an inbound
+  `0x50`/`0x51`, and reuses upstream's own duplicate check.
+  `tests/test_inject.py` applies the series to a pristine tree and exercises
+  the result, so a version bump fails there rather than on the running house.
+- **`insteonrf/fusion.py`** folds hop repeats and multi-receiver copies into
+  one event while keeping genuine retransmissions separate, attributes the
+  copy closest to the source by hops-left (no clock synchronisation needed —
+  the packet carries how far it travelled), and recovers packets no single
+  receiver got by majority-voting across receivers. Combining votes over the
+  whole capture, not `Packet.bits`: `decode_frames` stops at the first damaged
+  Manchester pair, so a damaged copy's `bits` is truncated at exactly the
+  region the others could have voted on.
+- **`insteonrf/inject.py`** decides what may be handed over, and is built to
+  say no: shadow mode by default, nothing allowed until a tier is enabled,
+  never a reply (an ACK answers a command insteon-mqtt is waiting on), never
+  the PLM's own transmission, never unverified bytes, and per-device plus
+  global rate limits because inbound messages delay the modem's next transmit.
+  Suppression keeps its own fixed window rather than trusting upstream's,
+  which is `hops_left * 0.087` s and therefore **zero** at no hops left —
+  measured live, the modem processed two copies of one ACK 87 ms apart.
+- **`insteonrf/mesh.py`** and **`insteon-rf mesh`** run the service and
+  produce the miss table that decides whether injection is worth enabling at
+  all. The comparison works with injection off, which is the point. The modem
+  is excluded from its own table: its transmissions are heard on RF but come
+  back as `0x62` echoes, so they looked like the misses of a device that
+  misses everything.
+- **`monitor --mesh-capture NAME`** makes the rfcat dongle a mesh receiver, so
+  the measurement needs no new hardware. It is also the only receiver that can
+  produce soft decisions, so it stays useful once boards arrive.
+- **`esphome/components/insteon_rf/`** is the listener firmware: a hand-rolled
+  SX126x driver (no external library, builds under esp-idf) using GFSK packet
+  mode as a raw bit recorder, because SX126x dropped the continuous mode the
+  SX127x family has. Preamble detector off — Insteon's preamble is a repeating
+  `0110` cell, not the `0x55` alternation the detector expects — with a
+  Manchester-validity gate in its place, since 26 of every 28 on-air bits are
+  Manchester pairs and noise fails within a handful. Compiles clean for
+  esp32-s3; **never run on hardware**.
+- **`tools/gen_sync_word.py`** derives the sync word from `Packet.to_bits()`
+  instead of by hand, and `tests/test_sync_word.py` pins it. It comes out as
+  `0x33333155`, whose low half is the `0x3155` the CC1111 dongle already syncs
+  on — an independent check that the polarity and phase are right. A wrong
+  sync word is the worst kind of firmware bug: the radio never matches and
+  reports nothing, which looks exactly like a quiet house.
+- **`deploy/insteonrf-mesh.yaml`** runs the service as a second pod with no
+  USB, so it restarts freely while the dongle pod keeps its privileged access.
+
 ## 2.4.2 — 2026-09-13
 
 - **`monitor --mqtt-alerts-only`** publishes only all-on triggers, to

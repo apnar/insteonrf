@@ -1,0 +1,21 @@
+--- a/insteon_mqtt/data/config-schema.yaml
++++ b/insteon_mqtt/data/config-schema.yaml
+@@ -305,6 +305,18 @@
+     discovery_topic_base: *mqtt_topic
+     discovery_ha_status: *mqtt_topic
+     device_info_template: *discovery_device
++    # Raw inbound message topics.  Unknown keys under mqtt: are validated as
++    # user-defined discovery classes, so this has to be declared or the
++    # config is rejected outright.
++    raw:
++      type: dict
++      schema:
++        enable_publish:
++          type: boolean
++        enable_inject:
++          type: boolean
++        publish_topic: *mqtt_topic
++        inject_topic: *mqtt_topic
+     modem:
+       type: dict
+       allow_unknown: True

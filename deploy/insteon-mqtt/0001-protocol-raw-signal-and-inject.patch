@@ -1,0 +1,99 @@
+--- a/insteon_mqtt/Protocol.py
++++ b/insteon_mqtt/Protocol.py
+@@ -94,6 +94,12 @@
+         # been removed from the _write_queue
+         self.signal_msg_finished = Signal()  # (Message)
+ 
++        # Emitted for every inbound Insteon message read from the modem, with
++        # the raw frame bytes and whether it was judged a duplicate.  This is
++        # the ground truth for "what did the modem actually hear", which an
++        # external receiver needs in order to know what it should inject.
++        self.signal_raw_read = Signal()  # (bytes, bool)
++
+         # Inbound message buffer.
+         self._buf = bytearray()
+ 
+@@ -272,6 +278,68 @@
+         return False
+ 
+     #-----------------------------------------------------------------------
++    def inject(self, raw):
++        """Process an inbound Insteon message that did not come from the modem.
++
++        A PLM hears only what reaches its single antenna, and passes up only
++        the group broadcasts it holds an ALDB link for.  Additional receivers
++        placed elsewhere can hear messages the modem missed; handing them over
++        here makes the modem effectively more sensitive without introducing a
++        second transmitter.
++
++        The bytes must be a complete inbound message frame exactly as the
++        modem would have produced it (0x02 0x50 for standard, 0x02 0x51 for
++        extended).  Nothing else is accepted: an injected frame is not allowed
++        to reconfigure the modem or fake a reply to an outbound command at the
++        link level.
++
++        This deliberately does **not** feed self._buf.  That buffer is filled
++        by the serial link and may hold a partially received frame; appending
++        to it would interleave the two streams and corrupt both.  Instead the
++        frame is parsed on its own and handed to the same duplicate check and
++        handler dispatch that _data_read() uses, so an injected copy of a
++        message the modem also heard is dropped exactly like a mesh repeat.
++
++        Args:
++          raw (bytes):  A complete 0x50 or 0x51 modem frame.
++
++        Returns:
++          bool:  True if the message was processed, False if it was rejected
++          as malformed or dropped as a duplicate.
++        """
++        buf = bytes(raw)
++        if len(buf) < 2 or buf[0] != 0x02:
++            LOG.warning("Injected frame does not start with 0x02: %s", buf.hex())
++            return False
++
++        msg_type = buf[1]
++        if msg_type not in (Msg.InpStandard.msg_code, Msg.InpExtended.msg_code):
++            LOG.warning("Injected message code %#04x is not an inbound Insteon "
++                        "message", msg_type)
++            return False
++
++        msg_class = Msg.types[msg_type]
++        if len(buf) < msg_class.fixed_msg_size:
++            LOG.warning("Injected %#04x frame is %d bytes, needs %d", msg_type,
++                        len(buf), msg_class.fixed_msg_size)
++            return False
++
++        try:
++            msg = msg_class.from_bytes(buf)
++        except Exception:
++            LOG.exception("Cannot parse injected message bytes %s", buf.hex())
++            return False
++
++        LOG.info("Injected %#04x: %s", msg_type, msg)
++
++        if self._is_duplicate(msg):
++            LOG.info("Ignored duplicate injected %s", msg)
++            return False
++
++        self._process_msg(msg)
++        return True
++
++    #-----------------------------------------------------------------------
+     def _poll(self, t):
+         """Periodic polling function.
+ 
+@@ -375,10 +443,13 @@
+                 self._buf = self._buf[1:]
+                 continue
+ 
++            raw = bytes(self._buf[:msg_size])
+             self._buf = self._buf[msg_size:]
+             LOG.info("Read %#04x: %s", msg_type, msg)
+ 
+-            if self._is_duplicate(msg):
++            duplicate = self._is_duplicate(msg)
++            self.signal_raw_read.emit(raw, duplicate)
++            if duplicate:
+                 LOG.info("Ignored duplicate %s", msg)
+             else:
+                 # And try to process the message using the handlers.

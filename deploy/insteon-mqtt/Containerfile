@@ -1,0 +1,106 @@
+# insteon-mqtt with the raw inbound-message topics (Doc/MESH-PLAN.md §4).
+#
+# Two additions, both inert until enabled in config.yaml:
+#   insteon/raw/rx      every message read from the modem, published as JSON
+#   insteon/raw/inject  messages from other receivers, fed to Protocol.inject()
+#
+# Why this image exists at all: the PLM hears only what reaches its single
+# antenna, and passes up only the group broadcasts it holds an ALDB link for.
+# Extra RF receivers can hear what it missed; this is the seam they hand it
+# through. There is still exactly one transmitter — the PLM owns the air.
+#
+# The base is pinned **by digest, not by tag**. That is load-bearing: the
+# upstream tag is :latest, and an unpinned pull would silently replace the
+# patched image with a stock one, turning injection off without any error.
+# To move to a newer upstream, change the digest here and run
+# `pytest tests/test_inject.py` — the patch series is verified against the
+# tree it will be applied to, so a conflict fails there rather than on the
+# running house.
+#
+# TWO COPIES OF THE PACKAGE.  The image pip-installs insteon-mqtt into
+# site-packages and *also* keeps the source checkout at /opt/insteon-mqtt.
+# The running process imports from site-packages; /opt is what the hassio web
+# CLI and the docs live in. Patching only /opt produces an image that looks
+# patched, passes a naive check, and behaves exactly like stock — which is
+# what happened on the first attempt here. So the code patches are applied to
+# both trees (their relative paths are identical, only the parent differs),
+# and the verification below imports insteon_mqtt with **no sys.path
+# manipulation** so it exercises whichever copy actually wins.
+#
+# Build and load into microk8s (same pattern as nfhs-relay and insteonrf):
+#
+#   cd /nvme/k8s/insteon-config/build
+#   buildah bud -t insteon-mqtt-raw:local .
+#   TAR=/var/tmp/imqtt-raw-$(date +%s).tar   # docker-archive cannot overwrite
+#   buildah push localhost/insteon-mqtt-raw:local \
+#     docker-archive:$TAR:localhost/insteon-mqtt-raw:local
+#   microk8s ctr image import $TAR
+#   microk8s kubectl delete pod homeassistant
+#   microk8s kubectl apply -f /k8s/yaml/homeassistant.yaml
+#
+# The manifest must use `image: localhost/insteon-mqtt-raw:local` with
+# `imagePullPolicy: Never`.
+
+FROM docker.io/td22057/amd64-insteon-mqtt@sha256:e98ceedc6b16c06b67bf66fed56dceccbddf0c1e5e476c48f3e0eb4bb5cf70e7
+
+# 0001-0004 are code and schema, applied to both trees.
+# 0005 documents the config and applies to the source checkout only.
+COPY 0001-protocol-raw-signal-and-inject.patch \
+     0002-mqtt-raw-topics.patch \
+     0003-wire-raw-topics.patch \
+     0004-config-schema-raw-section.patch \
+     0005-document-raw-in-config-example.patch \
+     /tmp/patches/
+
+# The base is Alpine and ships no patch(1); install it for the build and drop
+# it again in the same layer so the shipped image is unchanged in size.
+# --forward makes an already-applied patch an error rather than a
+# reverse-apply, so a half-patched image can never be built quietly.
+RUN set -eu; \
+    apk add --no-cache patch; \
+    SITE="$(python3 -c 'import insteon_mqtt, os; print(os.path.dirname(os.path.dirname(insteon_mqtt.__file__)))')"; \
+    echo "installed package lives in $SITE"; \
+    for dir in /opt/insteon-mqtt "$SITE"; do \
+        echo "== patching $dir"; \
+        for p in /tmp/patches/000[1-4]*.patch; do \
+            echo "   $(basename "$p")"; \
+            patch -d "$dir" -p1 --forward --no-backup-if-mismatch -i "$p"; \
+        done; \
+    done; \
+    patch -d /opt/insteon-mqtt -p1 --forward --no-backup-if-mismatch \
+        -i /tmp/patches/0005-document-raw-in-config-example.patch; \
+    rm -r /tmp/patches; \
+    apk del patch
+
+# Verify the copy that actually runs. No sys.path games: import insteon_mqtt
+# the way the service does, assert the patched surface is present, and hand
+# its own validator a config carrying the raw section. Without this, the
+# failure mode is a crash-looping sidecar and an Insteon network that is down
+# until someone reverts the config.
+RUN set -eu; \
+    printf '%s\n' \
+      'insteon:' \
+      "  port: '/dev/null'" \
+      "  storage: '/tmp'" \
+      'mqtt:' \
+      "  broker: '127.0.0.1'" \
+      '  port: 1883' \
+      '  raw:' \
+      '    enable_publish: True' \
+      "    publish_topic: 'insteon/raw/rx'" \
+      '    enable_inject: True' \
+      "    inject_topic: 'insteon/raw/inject'" \
+      > /tmp/raw-check.yaml; \
+    python3 -c "\
+import insteon_mqtt, os;\
+from insteon_mqtt import config;\
+from insteon_mqtt.Protocol import Protocol;\
+from insteon_mqtt.mqtt import Raw;\
+pkg = os.path.dirname(insteon_mqtt.__file__);\
+print('checking', pkg);\
+assert hasattr(Protocol, 'inject'), 'Protocol.inject is missing';\
+assert 'signal_raw_read' in open(pkg + '/Protocol.py').read(), 'signal missing';\
+assert 'self.raw.subscribe' in open(pkg + '/mqtt/Mqtt.py').read(), 'not wired';\
+config.validate('/tmp/raw-check.yaml');\
+print('raw topics present in the installed package, schema accepts them')"; \
+    rm /tmp/raw-check.yaml

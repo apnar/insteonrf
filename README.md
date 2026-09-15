@@ -247,7 +247,8 @@ for the start header, so leading garbage and either bit polarity are fine.
 | `insteon-rf pkt` | `send_comm.py` | Build a packet as a bit string (`-n` to just describe it, `-j` for JSON) |
 | `insteon-rf send` | `rf_send.py` | Transmit bit strings (`-L MS` listens for replies, `-n` dry run) |
 | `insteon-rf allon` | | Hunt phantom "all on" events; see [below](#hunting-phantom-all-on-events) |
-| `insteon-rf monitor` | | Long-running logger: JSON lines to a rotating file and/or MQTT, mesh repeats deduped |
+| `insteon-rf monitor` | | Long-running logger: JSON lines to a rotating file and/or MQTT, mesh repeats deduped (`--mesh-capture NAME` makes this receiver a mesh member) |
+| `insteon-rf mesh` | | Fuse listener captures, compare against the PLM, optionally inject; see [above](#more-ears-for-the-plm-the-listener-mesh) |
 | `insteon-rf modulate` | `mod_pkt.py` | Bit strings → raw I/Q for an SDR transmitter |
 | `insteon-rf demod` | | Raw I/Q → bit strings, or packets with `-D` (`--demod numpy|c`, `--method ml|discriminator`) |
 | `insteon-rf clip` | | Split an I/Q stream into one file per burst |
@@ -258,7 +259,8 @@ for the start header, so leading garbage and either bit polarity are fine.
 | `rtl_reciv.sh`, `hackrf_reciv.sh`, `hackrf_xmit.sh` | | Thin wrappers over the backends above |
 
 Backends: `--backend rfcat` (default, TX and RX), `rtlsdr` (RX), `hackrf`
-(RX, and TX via the numpy modulator), `file` (replays bit-string files).
+(RX, and TX via the numpy modulator), `file` (replays bit-string files),
+`mqtt` (RX, captures from the ESPHome listener boards).
 
 ## Hunting phantom "all on" events
 
@@ -338,6 +340,125 @@ up. And
 because attribution leans on RSSI, **several receivers are much better than
 one**: compare the RSSI of the hop-intact copy across nodes in different parts
 of the house and the origin localises.
+
+## More ears for the PLM: the listener mesh
+
+A PLM hears only what reaches its single antenna, and passes up only the group
+broadcasts it holds an ALDB link for. On this network that leaves a real gap:
+**26 devices have no powerline path at all** — 3 mini-remotes, 21 water
+sensors, 2 door sensors — and a battery device cannot be polled after the
+fact. If its message did not reach the modem, it is gone. A missed leak alert
+costs a floor.
+
+So additional receivers decode what the modem missed and hand it over, which
+makes insteon-mqtt effectively more sensitive without adding a second
+transmitter. There is still exactly one transmitter and it is the PLM; none of
+this can transmit, deliberately.
+
+The full plan, the staged rollout and the findings are in
+[`Doc/MESH-PLAN.md`](Doc/MESH-PLAN.md). In outline:
+
+```
+boards / dongle ──MQTT──> insteon-rf mesh ──MQTT──> insteon-mqtt
+                               ^                         │
+       insteon/raw/rx ─────────┘   (what the PLM heard)   │
+                                                          v
+                        miss table + insteon-rf-mesh.jsonl
+```
+
+### It starts with no new hardware
+
+The rfcat dongle is a valid mesh receiver — and the only one that can produce
+soft decisions, so it stays useful afterwards:
+
+```bash
+# Dongle publishes raw captures as a mesh member
+insteon-rf monitor --mqtt=192.168.88.5 --mesh-capture=dongle ...
+
+# Fuse them and compare against what the modem heard
+insteon-rf mesh --mqtt=192.168.88.5 --plm-addr=2B.93.07 --report-every=900
+```
+
+That produces the number the whole project turns on:
+
+```
+# miss table over 6.0h, 14 devices heard on RF
+device          rf   plm  missed   rate   rssi  receivers
+44.12.AB        23     4      19  82.6%    -97  dongle,up
+2B.A0.AB       104    98       6   5.8%   -102  dongle
+```
+
+If it turns out the modem misses almost nothing, that is a real answer and the
+right move is to stop — you are left with a useful diagnostic topic and no
+risk taken.
+
+### Handing messages back requires patching insteon-mqtt
+
+`deploy/insteon-mqtt/` carries a five-patch series and a Containerfile adding
+two topics, **both off by default**:
+
+| Topic | Direction | Purpose |
+|---|---|---|
+| `insteon/raw/rx` | out | every inbound message, before the duplicate check — the ground truth for what the modem heard |
+| `insteon/raw/inject` | in | messages to feed into the protocol stack |
+
+Enable in `config.yaml` under `mqtt:`:
+
+```yaml
+  raw:
+    enable_publish: True
+    publish_topic: 'insteon/raw/rx'
+    enable_inject: False        # leave off until the miss rate says otherwise
+    inject_topic: 'insteon/raw/inject'
+```
+
+The base image is pinned **by digest**: the upstream tag is `:latest`, and an
+unpinned pull would silently replace the patched image with a stock one,
+turning injection off with no error. `pytest tests/test_inject.py` applies the
+series to a pristine tree and exercises the result, so a version bump fails
+there rather than on a running house.
+
+### Injection is built to refuse
+
+`insteon-rf mesh` injects nothing unless `--inject` names a tier, and even
+then runs in shadow mode until `--live`. In order of how badly each would go
+wrong:
+
+- **Replies are never injected.** An ACK answers a command insteon-mqtt is
+  actively waiting on, with its own handler state machine and timeouts.
+- **The PLM's own transmissions are never injected.** The listeners hear the
+  modem too, and its transmissions never come back as inbound messages, so
+  they *look* like the misses of a device that misses everything.
+- **Anything the modem already heard is suppressed** — with a fixed window,
+  not upstream's. insteon-mqtt's duplicate window is `hops_left × 0.087`
+  seconds, which is **zero** at no hops left; measured live, it processed two
+  copies of one ACK 87 ms apart.
+- **Unverified bytes are never injected.** CRC and the frame-index counters
+  both have to hold, and a packet recovered by voting across receivers needs
+  at least three of them to have voted.
+- **Rate limits**, because every inbound message delays the modem's next
+  transmit, so a flood would stall outbound commands.
+
+Tiers are enabled one at a time: `battery` (the 26 unpollable devices — safest
+and highest value), then `group`, then `state`.
+
+### The ESPHome listener boards
+
+`esphome/components/insteon_rf/` is an external component for the Heltec LoRa
+32 V3 (ESP32-S3 + SX1262), receive only, no external library, building under
+esp-idf. The SX1262 has no continuous-bitstream mode — the SX127x family
+exposes DATA and DCLK pins for that and SX126x dropped it — so GFSK packet
+mode is used as a raw bit recorder: sync word set to the invariant start of
+every Insteon packet, preamble detector off, CRC off, whitening off, fixed
+128-byte payload. On-board, each capture must pass a **Manchester-validity
+gate**: 26 of every 28 on-air bits are Manchester pairs, and a valid pair is
+only `01` or `10`, so noise fails within a handful of bits. That is what makes
+running with the preamble detector off viable in a crowded 915 MHz band.
+
+> **Status:** the firmware compiles clean for esp32-s3 but has **never run on
+> hardware**, and whether an SX1262 can sync on Insteon at all is still
+> unproven. If it cannot, the fallback is a CC1101 module (~$3, same family as
+> the CC1111 dongle, with a true raw-bitstream mode) on the same ESP32.
 
 ## Command coverage
 

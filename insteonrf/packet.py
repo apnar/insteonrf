@@ -36,6 +36,15 @@ from .manchester import ManchesterError, invert_bits, manchester_decode, manches
 START_HEADER = "1100111010101010"
 START_HEADER_INV = invert_bits(START_HEADER)
 MARKER_OFFSET = 5  # position of the first ``11`` frame marker within START_HEADER
+
+#: 32-bit on-air sync word for a receiver that has a sync-word detector: four
+#: preamble cells followed by ``START_HEADER`` inverted. Ends in ``0x3155``,
+#: which is exactly what the CC1111 dongle syncs on — an independent check
+#: that the polarity and phase are right. Generate with
+#: ``tools/gen_sync_word.py``; ``tests/test_sync_word.py`` pins it, so the
+#: ESPHome firmware and this package cannot drift apart.
+ON_AIR_SYNC_32 = 0x33333155
+ON_AIR_SYNC_32_BITS = 32
 FRAME_BITS = 28  # '11' + 26 Manchester bits
 PREAMBLE = "0101010101"
 TRAILER = "01" * 24

@@ -1,0 +1,36 @@
+--- a/config-example.yaml
++++ b/config-example.yaml
+@@ -213,4 +213,33 @@
+   # TO ENABLE THE DISCOVERY PLATFORM: Set the following to true
+   enable_discovery: false
+ 
++  #==================================================================
++  # Raw inbound message topics
++  #==================================================================
++  # The modem hears only what reaches its single antenna, and passes up only
++  # the group broadcasts it holds an ALDB link for -- an unlinked group
++  # broadcast never reaches the host at all.  These two topics let additional
++  # receivers (for example RF listeners elsewhere in the house) see what the
++  # modem heard and hand over what it missed, which makes the modem
++  # effectively more sensitive without adding a second transmitter.
++  #
++  # Both halves are off by default.  Injection in particular lets another
++  # process feed the protocol stack, so turn it on deliberately.
++  #
++  # raw:
++  #   # Publish every inbound Insteon message as JSON, before the duplicate
++  #   # check:  {"ts": ..., "code": 80, "raw": "0250...", "dup": false}
++  #   enable_publish: True
++  #   publish_topic: 'insteon/raw/rx'
++  #
++  #   # Accept messages to feed into the protocol stack.  The payload needs a
++  #   # "raw" field holding a complete 0x50 or 0x51 modem frame in hex; "src"
++  #   # and "rssi" are optional and are logged so a message can be traced
++  #   # back to the receiver that heard it:
++  #   #   {"raw": "0250...", "src": "insteon-rf-up", "rssi": -87.5}
++  #   # Injected copies of messages the modem also heard are dropped by the
++  #   # normal duplicate check.
++  #   enable_inject: False
++  #   inject_topic: 'insteon/raw/inject'
++
+ #----------------------------------------------------------------

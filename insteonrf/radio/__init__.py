@@ -10,6 +10,8 @@ dongle, an SDR, or a file:
 ``hackrf``   :class:`~insteonrf.radio.sdr.SdrReceiver` /
              :class:`~insteonrf.radio.sdr.SdrTransmitter`
 ``file``     :class:`~insteonrf.radio.file.FileRadio` — for tests
+``mqtt``     :class:`~insteonrf.radio.mqtt.MqttReceiver` — captures from the
+             ESPHome listener boards, RX only
 ===========  ==========================================================
 """
 
@@ -19,6 +21,7 @@ from collections.abc import Iterator
 from typing import Any, Protocol, runtime_checkable
 
 from .file import FileRadio
+from .mqtt import DEFAULT_PREFIX, Capture, MqttReceiver, bits_from_bytes, bytes_from_bits
 from .rfcat import (
     CHANNEL_BW,
     DEFAULT_DRATE,
@@ -35,11 +38,11 @@ from .rfcat import (
 )
 from .sdr import DEFAULT_SAMPLE_RATE, SdrReceiver, SdrTransmitter, find_demod
 
-BACKENDS = ("rfcat", "rtlsdr", "hackrf", "file")
+BACKENDS = ("rfcat", "rtlsdr", "hackrf", "file", "mqtt")
 
 #: Every concrete backend. ``open_backend`` returns one of these; they all
 #: satisfy :class:`RadioBackend` at runtime.
-AnyRadio = RfcatRadio | SdrReceiver | SdrTransmitter | FileRadio
+AnyRadio = RfcatRadio | SdrReceiver | SdrTransmitter | FileRadio | MqttReceiver
 
 
 @runtime_checkable
@@ -82,6 +85,13 @@ def open_backend(name: str = "rfcat", *, freq: int = DEFAULT_FREQ, baud: float =
         return SdrReceiver(tool, freq=freq, baud=baud, **kwargs)
     if name == "file":
         return FileRadio(**kwargs)
+    if name == "mqtt":
+        if transmit:
+            raise SystemExit("the mesh is receive-only; the PLM owns the air")
+        host = kwargs.pop("host", None)
+        if not host:
+            raise SystemExit("the mqtt backend needs host=<broker>")
+        return MqttReceiver(host, **kwargs)
     raise SystemExit(f"unknown backend {name!r}; choose from {', '.join(BACKENDS)}")
 
 
@@ -89,12 +99,15 @@ __all__ = [
     "BACKENDS",
     "AnyRadio",
     "CHANNEL_BW",
+    "DEFAULT_PREFIX",
+    "Capture",
     "DEFAULT_DRATE",
     "DEFAULT_FREQ",
     "DEFAULT_SAMPLE_RATE",
     "DEVIATION",
     "DongleError",
     "FileRadio",
+    "MqttReceiver",
     "Radio",
     "RadioBackend",
     "RfcatRadio",
@@ -104,6 +117,8 @@ __all__ = [
     "SdrTransmitter",
     "USB_PID",
     "USB_VID",
+    "bits_from_bytes",
+    "bytes_from_bits",
     "find_demod",
     "open_backend",
     "usb_reset",

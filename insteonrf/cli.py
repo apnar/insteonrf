@@ -675,6 +675,11 @@ def monitor_main(argv: list[str] | None = None) -> int:
     p.add_argument("--mqtt-pass", default=os.environ.get("INSTEONRF_MQTT_PASS"),
                    help="MQTT password (default: $INSTEONRF_MQTT_PASS — prefer this to a "
                         "command line, which is visible in ps)")
+    p.add_argument("--mesh-capture", metavar="NAME",
+                   help="also publish every raw burst to <topic>/rx/NAME in the listener-board "
+                        "capture format, so this receiver joins the mesh that 'insteon-rf mesh' "
+                        "fuses — the dongle is a valid mesh member, and the only one that can "
+                        "produce soft decisions")
     p.add_argument("--no-dedupe", action="store_true", help="log every mesh repeat separately")
     p.add_argument("-U", "--unknown-commands", action="store_true",
                    help="report commands the tables do not name — the first time each is seen "
@@ -751,6 +756,12 @@ def monitor_main(argv: list[str] | None = None) -> int:
             if not a.quiet:
                 print(json.dumps(rec, separators=(",", ":")), flush=True)
 
+    capture_seq = 0
+    if a.mesh_capture:
+        if mqtt is None:
+            p.error("--mesh-capture needs --mqtt")
+        log.info("publishing raw captures as mesh receiver %r", a.mesh_capture)
+
     try:
         with _open_radio(a) as radio:
             radio.configure_rx(sync_header=not a.carrier)
@@ -762,6 +773,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
                     rssi = None
                     if not a.no_rssi and hasattr(radio, "read_rssi"):
                         rssi = radio.read_rssi()
+                    if a.mesh_capture and mqtt is not None:
+                        capture_seq += 1
+                        mqtt.publish_capture(bits, receiver=a.mesh_capture, timestamp=ts,
+                                             rssi_dbm=rssi, seq=capture_seq)
                     for pkt in _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
                                        soft=soft, header_index=header_index, tracker=tracker):
                         pkt.rssi_dbm = rssi
@@ -828,6 +843,154 @@ def allon_main(argv: list[str] | None = None) -> int:
 # --------------------------------------------------------------------------- reset
 
 
+def mesh_main(argv: list[str] | None = None) -> int:
+    """Run the listener mesh: captures in, miss table out, injection optional."""
+    from .fusion import Fusion
+    from .inject import Injector, Tier, load_battery_addrs
+    from .mesh import PLM_INJECT_TOPIC, PLM_RX_TOPIC, MeshService, PlmLink
+    from .monitor import JsonlWriter
+    from .radio.mqtt import DEFAULT_PREFIX, MqttReceiver
+
+    p = argparse.ArgumentParser(
+        prog="insteon-rf mesh",
+        description="Fuse captures from the ESPHome listener boards, compare them against what "
+                    "the PLM heard, and optionally hand the difference to insteon-mqtt.",
+        epilog="Injection is OFF unless --inject names at least one tier, and even then runs in "
+               "shadow mode until --live. Nothing here transmits: the PLM owns the air.")
+    p.add_argument("--mqtt", metavar="HOST[:PORT]", required=True,
+                   help="MQTT broker carrying both the board captures and insteon/raw/*")
+    p.add_argument("--prefix", default=DEFAULT_PREFIX,
+                   help="board capture topic prefix, subscribed as <prefix>/rx/+ "
+                        "(default %(default)s)")
+    p.add_argument("--mqtt-user", default=os.environ.get("INSTEONRF_MQTT_USER"),
+                   help="MQTT username (default: $INSTEONRF_MQTT_USER)")
+    p.add_argument("--mqtt-pass", default=os.environ.get("INSTEONRF_MQTT_PASS"),
+                   help="MQTT password (default: $INSTEONRF_MQTT_PASS — prefer this to a "
+                        "command line, which is visible in ps)")
+    p.add_argument("-o", "--out", metavar="FILE", help="append fused events as JSON lines")
+    p.add_argument("--max-bytes", type=int, default=32 << 20, help="rotate FILE at this size")
+    p.add_argument("--backups", type=int, default=5, help="how many rotated files to keep")
+
+    p.add_argument("--plm-topic", default=PLM_RX_TOPIC,
+                   help="topic where the patched insteon-mqtt mirrors what the modem read "
+                        "(default %(default)s); this is how suppression knows what the PLM "
+                        "already heard")
+    p.add_argument("--inject-topic", default=PLM_INJECT_TOPIC,
+                   help="topic insteon-mqtt accepts injections on (default %(default)s)")
+    p.add_argument("--no-plm", action="store_true",
+                   help="do not watch the PLM mirror at all (disables injection: without it "
+                        "there is no way to know what the modem already heard)")
+
+    p.add_argument("--inject", metavar="TIER", action="append", default=[],
+                   choices=[t.name.lower() for t in Tier],
+                   help="enable an injection tier; repeatable. battery = broadcasts from "
+                        "RF-only battery devices (safest, and they cannot be polled), "
+                        "group = group broadcasts and cleanup reports, state = unsolicited "
+                        "direct messages. ACKs and NAKs are never injected.")
+    p.add_argument("--live", action="store_true",
+                   help="actually publish injections (default is shadow mode: decide and log, "
+                        "publish nothing)")
+    p.add_argument("--plm-addr", default="2B.93.07",
+                   help="the modem's address, so its own transmissions are never injected back "
+                        "at it (default %(default)s)")
+    p.add_argument("--battery-addrs", metavar="FILE",
+                   help="one address per line: devices with no powerline path, which cannot be "
+                        "polled and so can only be helped by injection")
+    p.add_argument("--per-device-interval", type=float, default=30.0,
+                   help="seconds between injections naming one device (default %(default)s)")
+    p.add_argument("--global-per-minute", type=int, default=6,
+                   help="ceiling on injections per minute; inbound messages delay the modem's "
+                        "next transmit, so a flood would stall outbound commands "
+                        "(default %(default)s)")
+    p.add_argument("--no-combine", action="store_true",
+                   help="do not try to recover a packet by voting across receivers")
+
+    p.add_argument("--window", type=float, default=0.6,
+                   help="seconds to hold a message open for further copies (default %(default)s)")
+    p.add_argument("--report-every", type=float, default=900.0,
+                   help="seconds between miss-table reports, 0 to disable (default %(default)s)")
+    p.add_argument("--report-file", metavar="FILE",
+                   help="also write the miss table here as JSON on each report")
+    p.add_argument("--quiet", action="store_true", help="do not echo events to stdout")
+    _log_args(p)
+    a = p.parse_args(argv)
+    _setup_logging(a.verbose or 1)
+    _install_signal_handlers()
+
+    host, _, port = a.mqtt.partition(":")
+    port_n = int(port or 1883)
+
+    tiers = [Tier[t.upper()] for t in a.inject]
+    if tiers and a.no_plm:
+        p.error("--inject needs the PLM mirror; drop --no-plm")
+
+    receiver = MqttReceiver(host, port_n, prefix=a.prefix,
+                            username=a.mqtt_user, password=a.mqtt_pass)
+    plm = None if a.no_plm else PlmLink(host, port_n, username=a.mqtt_user,
+                                        password=a.mqtt_pass, rx_topic=a.plm_topic,
+                                        inject_topic=a.inject_topic)
+    battery = load_battery_addrs(a.battery_addrs) if a.battery_addrs else set()
+    injector = None
+    if tiers:
+        injector = Injector(
+            publish=plm.publish_inject if plm is not None else None,
+            plm_addr=a.plm_addr, battery_addrs=battery, allow=tiers,
+            shadow=not a.live, per_device_interval_s=a.per_device_interval,
+            global_per_minute=a.global_per_minute)
+        log.info("injection tiers %s, %s", [t.name for t in tiers],
+                 "LIVE" if a.live else "shadow mode")
+    elif a.live:
+        log.warning("--live has no effect without --inject")
+
+    writer = JsonlWriter(a.out, max_bytes=a.max_bytes, backups=a.backups) if a.out else None
+    fusion = Fusion(a.window, allow_combine=not a.no_combine)
+
+    def echo(event: Any) -> None:
+        if a.quiet:
+            return
+        who = event.closest or "?"
+        flag = "" if event.plm_saw_it is not False else "  PLM MISSED"
+        print(f"{_ts_line(event.first_seen, 0).split()[0]} {event.packet.summary()}  "
+              f"[{event.heard_by} rx, closest {who}]{flag}", flush=True)
+
+    service = MeshService(receiver, injector=injector, plm=plm, fusion=fusion,
+                          writer=writer, require_plm_link=not a.no_plm,
+                          on_event=echo)
+
+    if battery:
+        log.info("%d battery devices treated as unpollable", len(battery))
+    log.info("mesh listening; ctrl-c to stop")
+
+    next_report = time.time() + a.report_every if a.report_every else None
+    try:
+        while not STOP.is_set():
+            cap = receiver.next_capture(500)
+            if cap is not None:
+                service.handle_capture(cap)
+            service.drain()
+            if next_report is not None and time.time() >= next_report:
+                next_report = time.time() + a.report_every
+                print(service.misses.report(), flush=True)
+                log.info("stats %s", json.dumps(service.stats(), separators=(",", ":")))
+                if a.report_file:
+                    with open(a.report_file, "w", encoding="utf-8") as fh:
+                        json.dump({"misses": service.misses.to_dict(),
+                                   "stats": service.stats()}, fh, indent=2)
+    finally:
+        for event in fusion.flush():
+            service.misses.note(event)
+            if writer is not None:
+                writer.write(event.to_dict())
+        print(service.misses.report(), flush=True)
+        log.info("final stats %s", json.dumps(service.stats(), separators=(",", ":")))
+        if writer is not None:
+            writer.close()
+        receiver.close()
+        if plm is not None:
+            plm.close()
+    return 0
+
+
 def reset_main(argv: list[str] | None = None) -> int:
     from .radio import USB_PID, USB_VID, usb_reset
 
@@ -859,6 +1022,7 @@ COMMANDS = {
     "demod": (demod_main, "raw I/Q -> bit strings"),
     "clip": (clip_main, "split raw I/Q into one file per burst"),
     "allon": (allon_main, "hunt phantom 'all on' events and pin them on a device"),
+    "mesh": (mesh_main, "fuse listener-board captures and feed insteon-mqtt"),
     "reset": (reset_main, "USB-reset a wedged rfcat dongle"),
 }
 

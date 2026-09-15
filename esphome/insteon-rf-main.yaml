@@ -1,0 +1,96 @@
+# Insteon RF listener node. Receive only — see Doc/MESH-PLAN.md.
+#
+# Board: Heltec LoRa 32 V3 (ESP32-S3 + SX1262). Verify these pins against the
+# V3 schematic before first flash; V2 and V3 differ, and a wrong BUSY or CS
+# gives a radio that never responds.
+#
+# Deliberately NOT including common/ble-proxy.yaml. WiFi + BLE + continuous
+# SPI FIFO service on one ESP32-S3 risks the interrupt latency that drops
+# captures; revisit only once the receive path has been stable for weeks.
+
+substitutions:
+  name: insteon-rf-main
+  friendly_name: Insteon RF Main
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: heltec_wifi_lora_32_V3
+  framework:
+    type: esp-idf
+
+packages:
+  wifi: !include common/wifi.yaml
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  platform: esphome
+  password: !secret ota_pass
+
+# The mesh service consumes MQTT directly, not the HA API, so this node needs
+# both. Topic prefix is insteon-rf/ so it cannot collide with insteon-mqtt's
+# insteon/ prefix.
+mqtt:
+  broker: 192.168.88.5
+  username: !secret mqtt_user
+  password: !secret mqtt_pass
+  discovery: false
+  topic_prefix: insteon-rf/${name}
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [insteon_rf]
+
+spi:
+  clk_pin: GPIO9
+  mosi_pin: GPIO10
+  miso_pin: GPIO11
+
+insteon_rf:
+  id: rf
+  cs_pin: GPIO8
+  reset_pin: GPIO12
+  busy_pin: GPIO13
+  dio1_pin: GPIO14
+  tcxo_voltage: 1.8V
+  frequency: 914.95MHz
+  capture_bytes: 128
+  rssi_floor: -110
+  manchester_gate: 4
+  mqtt_topic: insteon-rf/rx/${name}
+
+sensor:
+  - platform: insteon_rf
+    insteon_rf_id: rf
+    last_rssi:
+      name: ${friendly_name} Last RSSI
+    captures_per_minute:
+      name: ${friendly_name} Captures
+    accepted_per_minute:
+      name: ${friendly_name} Accepted
+  - platform: uptime
+    name: ${friendly_name} Uptime
+    update_interval: 60s
+
+text_sensor:
+  - platform: version
+    name: ${friendly_name} ESPHome Version
+
+button:
+  - platform: restart
+    name: ${friendly_name} Restart
+    entity_category: diagnostic

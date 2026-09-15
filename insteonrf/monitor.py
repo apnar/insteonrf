@@ -148,6 +148,7 @@ class MqttPublisher:
         self.alert_retain = alert_retain
         self.published = 0
         self.alerts = 0
+        self.captures = 0
         # paho 2.x deprecates the v1 callback API; ask for v2 where it exists.
         api = getattr(mqtt, "CallbackAPIVersion", None)
         self.client = (mqtt.Client(api.VERSION2, client_id=client_id) if api is not None
@@ -169,6 +170,33 @@ class MqttPublisher:
             who = record.get("from") or record.get("to")
             if who:
                 self.client.publish(f"{self.topic}/{who}", payload, qos=self.qos)
+
+    def publish_capture(self, bits: str, *, receiver: str, timestamp: float,
+                        rssi_dbm: float | None = None, seq: int = 0,
+                        topic: str | None = None) -> None:
+        """Publish a raw burst in the listener-board capture format.
+
+        This is what lets the rfcat dongle act as a member of the listener
+        mesh: ``insteon-rf mesh`` consumes ``<prefix>/rx/<node>`` and does not
+        care whether the bytes came from an ESP32 or from USB. It is also the
+        only receiver that can produce soft decisions, so it stays useful
+        after the boards arrive.
+        """
+        import base64
+
+        from .radio.mqtt import bytes_from_bits
+
+        payload = {
+            "n": receiver,
+            "seq": seq,
+            "t": int(timestamp * 1000),
+            "rssi": rssi_dbm,
+            "len": (len(bits) + 7) // 8,
+            "b": base64.b64encode(bytes_from_bits(bits)).decode("ascii"),
+        }
+        self.client.publish(topic or f"{self.topic}/rx/{receiver}",
+                            json.dumps(payload, separators=(",", ":")), qos=0)
+        self.captures += 1
 
     def publish_alert(self, alert: dict[str, Any]) -> None:
         """Publish a trigger to ``<topic>/alert``, at a higher QoS than packets."""

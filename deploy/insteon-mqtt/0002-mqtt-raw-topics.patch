@@ -1,0 +1,180 @@
+--- a/insteon_mqtt/mqtt/Raw.py
++++ b/insteon_mqtt/mqtt/Raw.py
+@@ -0,0 +1,177 @@
++#===========================================================================
++#
++# Raw inbound Insteon message topics
++#
++#===========================================================================
++"""Publish every inbound Insteon message, and accept injected ones.
++
++A PLM hears only what reaches its single antenna, and passes up only the
++group broadcasts it holds an ALDB link for -- an unlinked group broadcast
++never reaches the host at all.  Additional RF receivers placed around the
++house can hear messages the modem missed and hand them over, which makes the
++modem effectively more sensitive without introducing a second transmitter.
++
++Two topics, both disabled unless configured:
++
++  publish_topic  Every message read from the modem is published here as JSON,
++                 *before* the duplicate check, with a "dup" flag.  This is the
++                 ground truth an external receiver needs in order to know what
++                 the modem already heard and therefore what it should not
++                 inject.
++
++  inject_topic   JSON messages here are parsed and handed to
++                 Protocol.inject().  Injection is off by default because it
++                 lets another process feed the protocol stack.
++
++Config, under the mqtt section:
++
++    mqtt:
++      raw:
++        enable_publish: True
++        enable_inject: False
++        publish_topic: 'insteon/raw/rx'
++        inject_topic: 'insteon/raw/inject'
++
++Payloads.  Published:
++
++    {"ts": 1789412345.678, "code": 80, "raw": "0250...", "dup": false}
++
++Accepted for injection ("raw" is required, the rest is carried into the log
++so a message can be traced back to the receiver that heard it):
++
++    {"raw": "0250...", "src": "insteon-rf-up", "rssi": -87.5}
++"""
++#===========================================================================
++import json
++import time
++
++from .. import log
++
++LOG = log.get_logger()
++
++
++class Raw:
++    """Raw inbound message publishing and injection."""
++
++    def __init__(self, mqtt, protocol):
++        """Constructor
++
++        Args:
++          mqtt (mqtt.Mqtt):  The main MQTT handler, used to publish.
++          protocol (Protocol):  The Insteon protocol stack to inject into and
++                   to listen to for inbound messages.
++        """
++        self.mqtt = mqtt
++        self.protocol = protocol
++
++        self.enable_publish = False
++        self.enable_inject = False
++        self.publish_topic = None
++        self.inject_topic = None
++
++        # Counters, handy for answering "is this doing anything" from the log.
++        self.published = 0
++        self.injected = 0
++        self.rejected = 0
++
++        protocol.signal_raw_read.connect(self.handle_raw_read)
++
++    #-----------------------------------------------------------------------
++    def load_config(self, config):
++        """Load the 'raw' section of the mqtt config.
++
++        Args:
++          config (dict):  The mqtt configuration dictionary.
++        """
++        data = config.get('raw', None)
++        if not data:
++            return
++
++        self.publish_topic = data.get('publish_topic', 'insteon/raw/rx')
++        self.inject_topic = data.get('inject_topic', 'insteon/raw/inject')
++        self.enable_publish = bool(data.get('enable_publish', False))
++        self.enable_inject = bool(data.get('enable_inject', False))
++
++        LOG.info("Raw topics: publish=%s (%s), inject=%s (%s)",
++                 self.publish_topic,
++                 "on" if self.enable_publish else "off",
++                 self.inject_topic,
++                 "on" if self.enable_inject else "off")
++
++    #-----------------------------------------------------------------------
++    def subscribe(self, link, qos):
++        """Subscribe to the injection topic, if injection is enabled.
++
++        Args:
++          link (network.Mqtt):  The MQTT network client.
++          qos (int):  The quality of service to use.
++        """
++        if self.enable_inject and self.inject_topic:
++            link.subscribe(self.inject_topic, qos, self.handle_inject)
++
++    #-----------------------------------------------------------------------
++    def unsubscribe(self, link):
++        """Unsubscribe from the injection topic.
++
++        Args:
++          link (network.Mqtt):  The MQTT network client.
++        """
++        if self.enable_inject and self.inject_topic:
++            link.unsubscribe(self.inject_topic)
++
++    #-----------------------------------------------------------------------
++    def handle_raw_read(self, raw, duplicate):
++        """Protocol.signal_raw_read callback: publish an inbound message.
++
++        Args:
++          raw (bytes):  The complete modem frame that was read.
++          duplicate (bool):  Whether the protocol judged it a duplicate.
++        """
++        if not self.enable_publish or not self.publish_topic:
++            return
++
++        payload = json.dumps({
++            'ts': round(time.time(), 3),
++            'code': raw[1],
++            'raw': raw.hex().upper(),
++            'dup': bool(duplicate),
++            })
++
++        # retain must be False: these are events, and a retained frame would
++        # be redelivered to every new subscriber as though it had just
++        # arrived.  The class default for retain is True.
++        self.mqtt.publish(self.publish_topic, payload, retain=False)
++        self.published += 1
++
++    #-----------------------------------------------------------------------
++    def handle_inject(self, client, userdata, message):
++        """Inject topic callback.
++
++        Args:
++          client (paho.Client):  The paho mqtt client.
++          userdata:  Unused.
++          message:  The incoming MQTT message.
++        """
++        if not self.enable_inject:
++            return
++
++        try:
++            data = json.loads(message.payload.decode("utf-8"))
++            raw = bytes.fromhex(data['raw'])
++        except Exception:
++            LOG.exception("Bad injected payload on %s: %s", message.topic,
++                          message.payload)
++            self.rejected += 1
++            return
++
++        src = data.get('src', 'unknown')
++        if self.protocol.inject(raw):
++            self.injected += 1
++            LOG.info("Injected a message heard by %s (rssi %s)", src,
++                     data.get('rssi'))
++        else:
++            self.rejected += 1
++
++    #-----------------------------------------------------------------------
++
++#===========================================================================

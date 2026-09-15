@@ -1,0 +1,59 @@
+--- a/insteon_mqtt/mqtt/Mqtt.py
++++ b/insteon_mqtt/mqtt/Mqtt.py
+@@ -9,6 +9,7 @@
+ from .. import log
+ from . import config
+ from .MsgTemplate import MsgTemplate
++from .Raw import Raw
+ from .Reply import Reply
+ 
+ LOG = log.get_logger()
+@@ -90,6 +91,10 @@
+         # Loaded config object.
+         self._config = None
+ 
++        # Raw inbound message publishing / injection.  Inert until the 'raw'
++        # section of the config enables it.
++        self.raw = Raw(self, modem.protocol)
++
+     #-----------------------------------------------------------------------
+     def load_config(self, data):
+         """Load a configuration dictionary.
+@@ -148,6 +153,9 @@
+         # Save the config for later passing to devices when they are created.
+         self._config = data
+ 
++        # Raw inbound message topics.
++        self.raw.load_config(data)
++
+         # Subscribe to the new topics.
+         if self.link.connected:
+             self._startup()
+@@ -427,6 +435,8 @@
+             self.link.subscribe(self._ha_status_topic, self.qos,
+                                 self.handle_ha_status)
+ 
++        self.raw.subscribe(self.link, self.qos)
++
+         for device in self.devices.values():
+             device.subscribe(self.link, self.qos)
+             self._publish_device_discovery(device)
+@@ -440,6 +450,8 @@
+         if self._cmd_topic:
+             self.link.unsubscribe(self._cmd_topic + "/+")
+ 
++        self.raw.unsubscribe(self.link)
++
+         for device in self.devices.values():
+             device.unsubscribe(self.link)
+ 
+--- a/insteon_mqtt/mqtt/__init__.py
++++ b/insteon_mqtt/mqtt/__init__.py
+@@ -32,6 +32,7 @@
+ from .Mqtt import Mqtt
+ from .MsgTemplate import MsgTemplate
+ from .Outlet import Outlet
++from .Raw import Raw
+ from .Remote import Remote
+ from .Reply import Reply
+ from .SmokeBridge import SmokeBridge

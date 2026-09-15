@@ -17,10 +17,10 @@ both CRC algorithms). `Doc/crc.txt` is the CRC reverse-engineering write-up.
 
 ```bash
 . .venv/bin/activate        # venv with rfcat (rflib), pyusb, numpy, pytest, ruff, mypy, this package (-e)
-pytest                      # ~100 tests, no hardware; real captures live in tests/data/
+pytest                      # ~390 tests, no hardware; real captures live in tests/data/
 make                        # fsk2_demod + rf_clip (C, -Wall -Wextra -Werror); objects in Obj/
 make check                  # ruff + mypy (strict) + pytest
-insteon-rf                  # lists commands: recv send print pkt dump monitor modulate demod clip reset
+insteon-rf                  # lists commands: recv send print pkt dump monitor modulate demod clip allon mesh reset
 
 # Regression fixture (expected line is asserted by tests/test_packet.py):
 ./fsk2_demod -U < Dat/41802513110D2711018C00.dat | insteon-rf print
@@ -30,6 +30,17 @@ insteon-rf recv -D -t -v                                 # live decode from the 
 insteon-rf pkt -s 2B.93.07 -d 29.4E.52 0F 00 | insteon-rf send -L 1500   # Ping, show the ACK
 insteon-rf pkt -s 2B.93.07 -d 29.4E.52 0F 00 | insteon-rf modulate -o /tmp/ping.iq  # SDR TX
 python tools/usb_stress.py all                           # USB robustness harness (hardware)
+python tools/gen_sync_word.py                            # SX1262 sync word, from the TX path
+
+# The listener mesh (Doc/MESH-PLAN.md). Phases 1-3 need no new hardware: the
+# rfcat dongle is the first receiver.
+insteon-rf monitor --mqtt=host --mesh-capture=dongle     # dongle joins the mesh
+insteon-rf mesh --mqtt=host --report-every=900           # fuse + miss table, no injection
+
+# Tests that use insteon-mqtt as an oracle, and verify the patch series:
+kubectl exec homeassistant -c insteon -- tar cf - -C /opt/insteon-mqtt \
+    insteon_mqtt config-example.yaml | tar xf - -C /tmp/imqtt
+INSTEONRF_IMQTT=/tmp/imqtt pytest              # ~390 tests instead of ~350
 ```
 
 Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb pyserial
@@ -52,7 +63,15 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/cli.py` | `recv send print pkt dump monitor modulate demod clip reset`; `rf_reciv.py` etc. call these |
 | `Src/fsk2_demod.c` | FSK2 demod + squelch + framing for raw 8-bit I/Q (`-U` signed/HackRF) |
 | `Src/rf_clip.c` | split an I/Q stream into per-burst files |
+| `insteonrf/plm.py` | RF packet <-> PLM `02 50`/`02 51` frames; `message_key()` is the hop-insensitive identity both paths share |
+| `insteonrf/fusion.py` | multi-receiver fusion: hop/receiver folding, retransmission numbering, hops-left attribution, cross-receiver bit combining |
+| `insteonrf/inject.py` | what may be handed to insteon-mqtt: tiers, shadow mode, PLM-heard suppression, rate limits |
+| `insteonrf/mesh.py` | the mesh service and the miss table (`insteon-rf mesh`) |
+| `insteonrf/radio/mqtt.py` | listener-board captures over MQTT, also a `RadioBackend` |
+| `esphome/components/insteon_rf/` | ESPHome listener firmware (SX1262, receive only) |
 | `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/k8s/yaml/AGENTS.md` conventions) |
+| `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
+| `deploy/insteon-mqtt/` | patch series + Containerfile adding `insteon/raw/rx` and `insteon/raw/inject` to insteon-mqtt |
 
 Pipeline contract: one burst per line of `0`/`1` characters; blank lines ignored; `#` lines are
 metadata passed through. Packets inside a line may be in either polarity and at any offset.
@@ -161,3 +180,29 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.
 - `Makefile.kali`, the WAV-header readers, `Doc/pkt_format.txt` and the never-committed
   `fsk2_mod.c` (liquid-dsp) are gone; `insteon-rf modulate` replaced the last of these.
+- **Group broadcasts swap the two RF address slots**; they do not encode "group 00 00".
+  Both slots are always a full three-byte address in wire order — a group broadcast leads
+  with the sender, everything else leads with the destination. The destination's *low* byte
+  is the group, and the upper bytes carry meaning: an ALL-Link Cleanup Status Report
+  (`cmd1 0x06`) puts the reported command there, so `11.01.01` is "On, group 1". 27 of 223
+  live captures were such reports.
+- **insteon-mqtt runs from site-packages**, not `/opt/insteon-mqtt` (which is only the
+  source checkout the hassio web CLI and docs live in). Patch both, and verify by importing
+  `insteon_mqtt` with no `sys.path` manipulation — otherwise the image looks patched and
+  behaves like stock. It also validates its config against a cerberus schema that rejects
+  unknown keys under `mqtt:`, so a new config section needs a schema patch or the sidecar
+  crash-loops and Insteon goes down.
+- **insteon-mqtt's own duplicate window is `hops_left * 0.087` s** (`* 0.183` extended),
+  which is *zero* at no hops left. Measured live: it processed two copies of one ACK, at
+  hops 1 and 0, 87 ms apart. Anything feeding it messages must do its own suppression.
+  Its `InpStandard.__eq__` ignores hops and max-hops — independently the same key as
+  `monitor.Deduper` and `plm.message_key`.
+- **The PLM's own transmissions are audible on RF** but never come back as inbound
+  messages (they return as `0x62` echoes), so they look like the misses of a device that
+  misses everything. Exclude the modem's address from any miss accounting, and never
+  inject them.
+- `Packet.bits` is truncated at the first damaged Manchester pair, so it is useless as a
+  substrate for combining copies across receivers — vote over the whole capture
+  (`fusion.sightings_from_capture`) instead.
+- Upstream insteon-mqtt's `Signal.connect` stores **weak references**: a lambda slot is
+  collected as soon as `connect()` returns and the signal silently does nothing.

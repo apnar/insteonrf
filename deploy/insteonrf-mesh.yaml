@@ -1,0 +1,101 @@
+# insteon-rf mesh — fuse captures from the ESPHome listener boards and,
+# optionally, hand insteon-mqtt the messages its PLM missed.
+#
+# Why this exists: a PLM hears only what reaches its single antenna, and
+# passes up only the group broadcasts it holds an ALDB link for. 26 devices on
+# this network (3 mini-remotes, 21 water sensors, 2 door sensors) have no
+# powerline path at all and cannot be polled after the fact, so a message the
+# modem misses is lost permanently. Extra receivers fix that; this pod is
+# where their captures are decoded, deduped and decided on.
+#
+# NEVER add a transmit path. There is exactly one transmitter on an Insteon
+# network and it is the PLM.
+#
+# Separate from the `insteonrf` pod on purpose: that one owns the USB dongle
+# and needs privileged access to it, while this one is a plain network
+# consumer that can be restarted freely. The dongle pod is also still useful
+# as a receiver in its own right — it is the only one that can produce soft
+# decisions, so it keeps the sensitivity advantage the SX1262 cannot match.
+#
+# Injection is OFF here. The rollout is:
+#   1. this manifest as written    — measure the miss rate for a week
+#   2. add --inject=battery        — still shadowed, another week
+#   3. add --live                  — battery devices only
+#   4. widen with --inject=group, then --inject=state, each shadowed first
+# Requires the patched insteon-mqtt image with mqtt.raw.enable_publish, and
+# for step 3 onwards also mqtt.raw.enable_inject.
+#
+# Deploy:
+#   mkdir -p /nvme/churn/insteonrf-mesh/{log,report}
+#   grep -hoE '^- [0-9a-fA-F]{2}\.[0-9a-fA-F]{2}\.[0-9a-fA-F]{2}' \
+#     /k8s/insteon-config/{remotes,water_sensors,door_sensors}.yaml \
+#     | cut -d' ' -f2 > /nvme/churn/insteonrf-mesh/battery.txt
+#   cp deploy/insteonrf-mesh.yaml /k8s/yaml/
+#   microk8s kubectl apply -f /k8s/yaml/insteonrf-mesh.yaml
+#
+# Uses the same locally built image as the insteonrf pod, so
+# imagePullPolicy MUST stay Never.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insteonrf-mesh
+  labels:
+    app: insteonrf-mesh
+spec:
+  restartPolicy: Always
+  containers:
+    - name: mesh
+      image: localhost/insteonrf:local
+      imagePullPolicy: Never
+      env:
+        - name: TZ
+          value: "America/New_York"
+        - name: INSTEONRF_MQTT_USER
+          valueFrom:
+            secretKeyRef:
+              name: mosquitto
+              key: username
+        - name: INSTEONRF_MQTT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: mosquitto
+              key: password
+      args:
+        - mesh
+        - --mqtt=192.168.88.5:1883
+        # Board captures arrive on insteon-rf/rx/+; the PLM mirror is on
+        # insteon/raw/rx, which is how suppression knows what the modem
+        # already heard. Without that link injection refuses to run.
+        - --prefix=insteon-rf
+        - --plm-topic=insteon/raw/rx
+        - --inject-topic=insteon/raw/inject
+        - --battery-addrs=/config/battery.txt
+        # Keeps the modem out of its own miss table: its transmissions are
+        # heard on RF but never come back as inbound messages, so without
+        # this it leads every report at a 100% miss rate.
+        - --plm-addr=2B.93.07
+        # No --inject yet: measure first. See the rollout note above.
+        - --out=/config/log/insteon-rf-mesh.jsonl
+        - --report-every=3600
+        - --report-file=/config/report/miss-table.json
+        - --quiet
+        - -v
+      resources:
+        requests:
+          memory: "64Mi"
+          ephemeral-storage: "10Mi"
+        limits:
+          memory: "256Mi"
+          ephemeral-storage: "100Mi"
+      volumeMounts:
+        - mountPath: /config
+          name: config
+  volumes:
+    - name: config
+      hostPath:
+        # On nvme/churn from the start: this writes a rotating JSON-lines log
+        # and rewrites a report file hourly, which is exactly the churn that
+        # made nvme/k8s snapshots expensive.
+        path: /nvme/churn/insteonrf-mesh
+        type: Directory
