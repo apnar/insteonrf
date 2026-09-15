@@ -7,9 +7,10 @@ are consumed.
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
+from esphome.const import CONF_FREQUENCY, CONF_ID, CONF_RESET_PIN
+
 from esphome import pins
 from esphome.components import spi
-from esphome.const import CONF_FREQUENCY, CONF_ID, CONF_RESET_PIN
 
 CODEOWNERS = ["@apnar"]
 DEPENDENCIES = ["spi"]

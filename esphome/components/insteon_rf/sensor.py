@@ -8,16 +8,16 @@ quiet or goes noisy.
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import sensor
 from esphome.const import (
-    CONF_ID,
     DEVICE_CLASS_SIGNAL_STRENGTH,
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
     UNIT_DECIBEL_MILLIWATT,
 )
 
-from . import InsteonRF, insteon_rf_ns  # noqa: F401
+from esphome.components import sensor
+
+from . import InsteonRF
 
 DEPENDENCIES = ["insteon_rf"]
 
