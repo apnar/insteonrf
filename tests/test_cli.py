@@ -255,6 +255,7 @@ def test_mqtt_credentials_come_from_the_environment(monkeypatch, tmp_path):
     class FakePublisher:
         published = 0
         alerts = 0
+        captures = 0
 
         def __init__(self, host, port=1883, topic="insteon-rf", *, username=None,
                      password=None, **kw):
@@ -335,3 +336,43 @@ def test_dongle_error_exits_cleanly_for_a_supervisor(monkeypatch, caplog):
         rc = cli.main(["recv", "-D"])
     assert rc == 1
     assert any("not responding" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- silence watchdog
+
+
+class TestSilenceAction:
+    """A radio that has fallen out of RX goes quiet without erroring, and
+    silence reads downstream as "there was no traffic" rather than as a
+    fault -- which in the miss table means "the PLM misses nothing".
+
+    rflib's own recovery needs USB errors as well as timeouts, so it does not
+    cover this. The thresholds are long because this network carries only
+    about six RF messages an hour, making a quiet house indistinguishable
+    from a broken radio over any short window."""
+
+    def test_quiet_below_the_threshold_does_nothing(self):
+        from insteonrf.cli import _silence_action
+
+        assert _silence_action(0.0, 1800.0) == "none"
+        assert _silence_action(1799.0, 1800.0) == "none"
+
+    def test_past_the_threshold_re_arms_first(self):
+        """Cheap fix first: a radio that fell out of RX costs one register write."""
+        from insteonrf.cli import _silence_action
+
+        assert _silence_action(1801.0, 1800.0) == "rearm"
+        assert _silence_action(3599.0, 1800.0) == "rearm"
+
+    def test_escalates_to_a_reset_only_after_twice_as_long(self):
+        from insteonrf.cli import _silence_action
+
+        assert _silence_action(3601.0, 1800.0) == "heal"
+        assert _silence_action(86400.0, 1800.0) == "heal"
+
+    def test_zero_disables_it(self):
+        """A quiet house looks exactly like a deaf radio, so it must be optional."""
+        from insteonrf.cli import _silence_action
+
+        assert _silence_action(86400.0, 0.0) == "none"
+        assert _silence_action(86400.0, -1.0) == "none"

@@ -233,6 +233,35 @@ def _decode(bits: str, ts: float | None, *, repair: bool = True, show_all: bool 
     return out
 
 
+
+def _silence_action(quiet_s: float, max_silence: float) -> str:
+    """What to do about ``quiet_s`` seconds with no received block.
+
+    A receiver that has gone deaf is worse than one that has crashed: it
+    reports nothing, logs nothing, and every downstream measurement reads as
+    "there was no traffic" rather than as a fault. That matters most for the
+    miss table, where a deaf radio produces exactly the wrong conclusion --
+    "the PLM misses nothing" -- with no indication anything is wrong.
+
+    rflib's own recovery does not cover this case: it triggers on receive
+    timeouts *plus* USB errors, so a radio that has fallen out of RX while the
+    USB path still answers looks healthy and simply returns nothing.
+
+    Silence is genuinely ambiguous -- this network carries only about six RF
+    messages an hour, so a quiet house is indistinguishable from a broken
+    radio over any short window. Hence the long default and the cheap first
+    step: re-arm receive (one register write, fixes a radio that left RX)
+    before reaching for a USB reset.
+    """
+    if max_silence <= 0:
+        return "none"
+    if quiet_s > max_silence * 2:
+        return "heal"
+    if quiet_s > max_silence:
+        return "rearm"
+    return "none"
+
+
 def _ts_line(ts: float, nbits: int) -> str:
     t = _dt.datetime.fromtimestamp(ts).isoformat(timespec="milliseconds")
     return f"# {t} len={nbits // 8}"
@@ -705,6 +734,11 @@ def monitor_main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-repair", action="store_true",
                    help="do not try to recover packets whose CRC failed")
     p.add_argument("--timeout", type=int, default=2000, help="USB receive timeout in ms")
+    p.add_argument("--max-silence", type=float, default=1800.0, metavar="SECONDS",
+                   help="if nothing is received for this long, re-arm the receiver, and after "
+                        "twice as long USB-reset it (0 disables). A dongle that wedges goes "
+                        "quiet without erroring, which reads downstream as 'there was no "
+                        "traffic' rather than as a fault (default %(default)s)")
     _log_args(p)
     a = p.parse_args(argv)
     _setup_logging(a.verbose or 1)
@@ -757,6 +791,8 @@ def monitor_main(argv: list[str] | None = None) -> int:
                 print(json.dumps(rec, separators=(",", ":")), flush=True)
 
     capture_seq = 0
+    last_block = last_action = time.time()
+    rearms = heals = 0
     if a.mesh_capture:
         if mqtt is None:
             p.error("--mesh-capture needs --mqtt")
@@ -768,6 +804,25 @@ def monitor_main(argv: list[str] | None = None) -> int:
             log.info("monitoring on %s", getattr(radio, "name", a.backend))
             while not STOP.is_set():
                 got = _receive(radio, a.timeout)
+                if got is None:
+                    now = time.time()
+                    want = _silence_action(now - last_block, a.max_silence)
+                    if want != "none" and now - last_action > a.max_silence:
+                        last_action = now
+                        quiet_min = (now - last_block) / 60.0
+                        if want == "heal" and hasattr(radio, "heal"):
+                            log.warning("nothing received for %.0f min; healing the radio",
+                                        quiet_min)
+                            radio.heal()
+                            heals += 1
+                            last_block = now
+                        else:
+                            log.warning("nothing received for %.0f min; re-arming receive",
+                                        quiet_min)
+                            radio.configure_rx(sync_header=not a.carrier)
+                            rearms += 1
+                else:
+                    last_block = time.time()
                 if got is not None:
                     ts, bits, soft, header_index = got
                     rssi = None
@@ -811,8 +866,12 @@ def monitor_main(argv: list[str] | None = None) -> int:
         if writer is not None:
             writer.close()
         if mqtt is not None:
-            log.info("mqtt: %d packet(s), %d alert(s) published", mqtt.published, mqtt.alerts)
+            log.info("mqtt: %d packet(s), %d alert(s), %d capture(s) published",
+                     mqtt.published, mqtt.alerts, mqtt.captures)
             mqtt.close()
+        if rearms or heals:
+            log.warning("silence watchdog: %d re-arm(s), %d heal(s) — the radio went quiet "
+                        "without erroring", rearms, heals)
         if watcher is not None:
             log.warning("all-on watch: %s", watcher.summary())
         if unknown:

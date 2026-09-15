@@ -4,6 +4,29 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.5.1 — 2026-09-15
+
+- **`Doc/MESH-TRANSMIT.md`** — measured investigation of whether the listener
+  boards could repeat for the PLM. They should not: Insteon repeating is
+  synchronous simulcast on a **456-bit / 49.98 ms slot grid** (six half-cycles
+  of 60 Hz), measured over 14 captures, with one transmission per slot and a
+  pitch that does not vary with packet length. Joining a slot needs frequency
+  agreement far tighter than the 75 kHz deviation, so an unlocked transmitter
+  degrades exactly the marginal links it was meant to help. The failures on
+  this network are inbound anyway (device ACKs at −103 to −110 dBm against the
+  PLM's −51 to −68 dBm), and injection already handles that direction with no
+  transmitter at all. Cheaper first moves: force `max_hops = 3`, and buy real
+  dual-band range extenders, which simulcast correctly and bridge to
+  powerline.
+- **`monitor --max-silence`** re-arms the receiver after a long silence and
+  USB-resets it after twice as long. rflib's own recovery needs receive
+  timeouts *plus* USB errors, so a radio that has fallen out of RX while USB
+  still answers looks healthy and just returns nothing — which the miss table
+  would read as "the PLM misses nothing". Thresholds are long because this
+  network carries about six RF messages an hour, so a quiet house and a broken
+  radio are indistinguishable over any short window.
+- The monitor exit summary reports published captures, re-arms and heals.
+
 ## 2.5.0 — 2026-09-15
 
 More ears for the PLM. A PLM hears only what reaches its single antenna, and

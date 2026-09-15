@@ -180,6 +180,18 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.
 - `Makefile.kali`, the WAV-header readers, `Doc/pkt_format.txt` and the never-committed
   `fsk2_mod.c` (liquid-dsp) are gone; `insteon-rf modulate` replaced the last of these.
+- **Insteon RF repeating is synchronous simulcast on a slot grid.** Measured 2026-09-15
+  over 14 captures: consecutive copies of a message start exactly **456 bits = 49.98 ms**
+  apart (25 of 31 intervals; the rest are whole multiples), which is six half-cycles of
+  60 Hz. The pitch does not vary with packet length, and no slot ever holds two
+  overlapping copies — every repeater in earshot transmits the same hop simultaneously
+  and the receiver decodes one clean packet. A packet occupies 364 of the 456 bits.
+  Consequence: you cannot add a repeater without frequency-locking to the devices already
+  in the slot (deviation is 75 kHz; a 20 kHz offset beats badly enough to wreck it). See
+  `Doc/MESH-TRANSMIT.md`.
+- `max_hops` is adaptive: insteon-mqtt logs `MsgHistory: Average hops N, using N` and
+  lowers the budget for good links. Observed `mh:1`, `mh:2` and `mh:3` on different
+  devices. Forcing 3 is the free first move for a device that misses commands.
 - **Group broadcasts swap the two RF address slots**; they do not encode "group 00 00".
   Both slots are always a full three-byte address in wire order — a group broadcast leads
   with the sender, everything else leads with the destination. The destination's *low* byte
