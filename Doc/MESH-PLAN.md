@@ -37,6 +37,21 @@ that needs more than one receiver — cross-receiver combining and RSSI
 localisation are implemented and unit-tested against synthetic copies, but
 have never run on two real radios.
 
+**Pre-flash review (2026-09-19, board in hand).** Pins verified against
+Meshtastic's `heltec_v3` variant — all seven match, TCXO 1.8 V on DIO3,
+DIO2 as RF switch, DC-DC. Re-reading the driver found one blocker that would
+have made a correctly wired board look dead: `SetPacketParams` for GFSK takes
+**nine** bytes and the code sent eight, leaving *whitening* undefined (and the
+register it then poked, `0x06B8`, is the whitening seed, not an enable).
+Also fixed: a presence check that a floating MISO would pass, the TCXO delay
+arithmetic, reading the RX buffer from offset 0 in continuous mode instead of
+`GetRxBufferStatus`, and IRQ polling every loop iteration (now gated on DIO1).
+Added for bring-up: RX gain boost, `sync_word:` and `preamble_detector_bits:`
+in YAML so the two unproven assumptions can be flipped over OTA, a
+polarity-agnostic Manchester gate so a flipped sync word needs no other
+change, and the first ten captures logged at INFO with their leading bytes.
+Compiles clean; still never run on hardware.
+
 ### Findings that changed the design
 
 * **Group broadcasts swap the address slots; they do not encode "group 00 00".**

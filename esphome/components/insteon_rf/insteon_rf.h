@@ -15,6 +15,10 @@
 //
 // Insteon parameters: 914.95 MHz, 9124 baud, 75 kHz deviation, and 234.3 kHz
 // receive bandwidth (the nearest step above 2*75 + 9.1 kHz).
+//
+// Pins verified 2026-09-19 against Meshtastic's heltec_v3 variant: SCK 9,
+// MISO 11, MOSI 10, CS 8, RESET 12, BUSY 13, DIO1 14; TCXO on DIO3 at 1.8 V;
+// DIO2 drives the RF switch; DC-DC regulator.
 
 #pragma once
 
@@ -33,6 +37,11 @@ namespace insteon_rf {
 // validated against real devices, and pinned by tests/test_sync_word.py.
 // Four preamble cells then the inverted START_HEADER; the low 16 bits are
 // 0x3155, which is exactly what the CC1111 dongle syncs on.
+//
+// This is the default; the YAML `sync_word:` option overrides it. If the
+// SX1262's bit sense turns out opposite to the CC1111's, the complement
+// 0xCCCCCEAA is the word to try -- a wrong polarity looks exactly like a
+// wiring fault (no captures, no errors), so it must be flippable over OTA.
 static const uint32_t INSTEON_SYNC_WORD = 0x33333155;
 static const uint8_t INSTEON_SYNC_BITS = 32;
 
@@ -52,6 +61,7 @@ enum : uint8_t {
   SX_SET_BUFFER_BASE = 0x8F,
   SX_SET_DIO_IRQ_PARAMS = 0x08,
   SX_GET_IRQ_STATUS = 0x12,
+  SX_GET_RX_BUFFER_STATUS = 0x13,
   SX_CLEAR_IRQ_STATUS = 0x02,
   SX_READ_BUFFER = 0x1E,
   SX_WRITE_REGISTER = 0x0D,
@@ -68,6 +78,9 @@ enum : uint8_t {
 
 // Sync word register block, 8 bytes.
 static const uint16_t SX_REG_SYNC_WORD_0 = 0x06C0;
+// RX gain: 0x94 power-saving (default), 0x96 boosted. A mains-powered
+// listener wants the boost.
+static const uint16_t SX_REG_RX_GAIN = 0x08AC;
 
 // GFSK receive bandwidth codes. 0x0A is 234.3 kHz.
 static const uint8_t SX_GFSK_BW_234_3 = 0x0A;
@@ -90,6 +103,8 @@ class InsteonRF : public Component,
   void set_busy_pin(GPIOPin *pin) { this->busy_pin_ = pin; }
   void set_dio1_pin(GPIOPin *pin) { this->dio1_pin_ = pin; }
   void set_frequency(uint32_t hz) { this->frequency_hz_ = hz; }
+  void set_sync_word(uint32_t word) { this->sync_word_ = word; }
+  void set_preamble_detector(uint8_t code) { this->preamble_detector_ = code; }
   void set_capture_bytes(uint8_t n) { this->capture_bytes_ = n; }
   void set_rssi_floor(float dbm) { this->rssi_floor_ = dbm; }
   void set_manchester_gate(uint8_t frames) { this->manchester_gate_ = frames; }
@@ -109,6 +124,7 @@ class InsteonRF : public Component,
   void cmd_(uint8_t opcode, const uint8_t *data, size_t len);
   void read_cmd_(uint8_t opcode, uint8_t *out, size_t len);
   void write_register_(uint16_t addr, const uint8_t *data, size_t len);
+  void read_register_(uint16_t addr, uint8_t *out, size_t len);
   void read_buffer_(uint8_t offset, uint8_t *out, size_t len);
   bool configure_radio_();
   void start_rx_();
@@ -124,6 +140,8 @@ class InsteonRF : public Component,
   GPIOPin *dio1_pin_{nullptr};
 
   uint32_t frequency_hz_{914950000};
+  uint32_t sync_word_{INSTEON_SYNC_WORD};
+  uint8_t preamble_detector_{0x00};  // off; see __init__.py for the codes
   uint8_t capture_bytes_{128};
   float rssi_floor_{-110.0f};
   uint8_t manchester_gate_{4};
@@ -138,6 +156,10 @@ class InsteonRF : public Component,
   uint32_t last_minute_mark_{0};
   uint32_t captures_at_mark_{0};
   uint32_t accepted_at_mark_{0};
+  //: The first few captures are logged at INFO with their leading bytes, so
+  //: bring-up can be judged from the log alone: are captures arriving, does
+  //: the gate pass them, does the polarity look right.
+  uint8_t bringup_logged_{0};
   uint8_t buffer_[256]{};
 
 #ifdef USE_SENSOR

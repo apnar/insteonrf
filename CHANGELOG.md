@@ -4,6 +4,34 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.5.2 — 2026-09-19
+
+Pre-flash review of the ESPHome listener, with the Heltec LoRa 32 V3 in hand.
+
+- **Fixed a blocker**: SX126x GFSK `SetPacketParams` takes nine bytes and the
+  driver sent eight, leaving whitening undefined. Enabled whitening XORs every
+  captured byte with PN9, so the Manchester gate rejects everything and a
+  correctly wired board looks dead. The register the driver then poked to
+  "disable whitening" (`0x06B8`) is the whitening seed, not an enable. Both
+  corrected.
+- The presence check now writes the sync word and reads it back. A status
+  byte proves nothing: with no chip on the bus MISO floats high and reads
+  0xFF. The readback also catches CS on the wrong pin, the likeliest wiring
+  mistake, with a clear boot-time error instead of silence.
+- Read the RX buffer from `GetRxBufferStatus`'s start pointer rather than
+  offset 0; in continuous RX the chip advances the pointer between packets.
+- IRQ polling is gated on the DIO1 level, so the idle loop no longer runs a
+  4-byte SPI transaction at ~1 kHz against WiFi and MQTT.
+- TCXO start-up delay arithmetic corrected (it was right for 5 ms by luck).
+- RX gain boost register set; about 2 dB for about 2 mA on a mains listener.
+- Bring-up hedges for the two unproven assumptions: `sync_word:` and
+  `preamble_detector_bits:` are YAML options, the Manchester gate is now
+  polarity-agnostic so a flipped sync word needs no other change, and the
+  first ten captures after boot log at INFO with their leading bytes and the
+  gate verdict.
+- Pins verified against Meshtastic's `heltec_v3` variant: all seven match.
+  Compiles clean for esp32-s3 under esp-idf. **Still never run on hardware.**
+
 ## 2.5.1 — 2026-09-15
 
 - **`Doc/MESH-TRANSMIT.md`** — measured investigation of whether the listener

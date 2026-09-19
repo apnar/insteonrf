@@ -216,5 +216,16 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
 - `Packet.bits` is truncated at the first damaged Manchester pair, so it is useless as a
   substrate for combining copies across receivers — vote over the whole capture
   (`fusion.sightings_from_capture`) instead.
+- **SX126x GFSK `SetPacketParams` is nine bytes**, and the ninth is whitening. Sending
+  eight leaves whitening undefined; enabled, it XORs every captured byte with PN9 and the
+  Manchester gate rejects everything — a correctly wired board that looks dead. Register
+  `0x06B8` is the whitening *seed*, not an enable. Found in the 2026-09-19 pre-flash review.
+- A status byte is not a presence check for an SPI radio: with nothing on the bus MISO
+  floats high and reads 0xFF. Write a register and read it back; that also catches CS on
+  the wrong pin, the likeliest wiring mistake.
+- Heltec LoRa 32 V3 pins, verified against Meshtastic `heltec_v3`: SCK 9, MISO 11, MOSI
+  10, CS 8, RESET 12, BUSY 13, DIO1 14, TCXO 1.8 V on DIO3, DIO2 drives the RF switch,
+  DC-DC. Board enumerates over USB as Espressif `303a:1001` (native USB-serial-JTAG);
+  `303a:4001` on this host is the Nabu Casa Z-Wave stick, not a Heltec.
 - Upstream insteon-mqtt's `Signal.connect` stores **weak references**: a lambda slot is
   collected as soon as `connect()` returns and the signal silently does nothing.

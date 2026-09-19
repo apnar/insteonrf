@@ -1,8 +1,18 @@
 # Insteon RF listener node. Receive only — see Doc/MESH-PLAN.md.
 #
-# Board: Heltec LoRa 32 V3 (ESP32-S3 + SX1262). Verify these pins against the
-# V3 schematic before first flash; V2 and V3 differ, and a wrong BUSY or CS
-# gives a radio that never responds.
+# Board: Heltec LoRa 32 V3 (ESP32-S3 + SX1262). Pins verified 2026-09-19
+# against Meshtastic's heltec_v3 variant (SCK 9, MISO 11, MOSI 10, CS 8,
+# RESET 12, BUSY 13, DIO1 14; TCXO 1.8 V on DIO3; DIO2 as RF switch).
+#
+# Bring-up: the first ten captures after boot are logged at INFO with their
+# leading bytes and the gate verdict, so `esphome logs` tells the story:
+#   - "sync word readback mismatch" at boot -> CS/MISO/MOSI wiring
+#   - no captures at all while the rfcat dongle hears traffic
+#       -> flip sync_word to the complement, 0xCCCCCEAA (bit sense inverted)
+#       -> if still nothing, try preamble_detector_bits: 8
+#   - captures arriving but "gate fail" on all of them -> framing/polarity;
+#     send me the logged bytes
+#   - captures with "gate PASS" -> it works; watch insteon-rf/rx/<name>
 #
 # Deliberately NOT including common/ble-proxy.yaml. WiFi + BLE + continuous
 # SPI FIFO service on one ESP32-S3 risks the interrupt latency that drops
@@ -68,6 +78,9 @@ insteon_rf:
   dio1_pin: GPIO14
   tcxo_voltage: 1.8V
   frequency: 914.95MHz
+  # From tools/gen_sync_word.py; complement is 0xCCCCCEAA (see bring-up above).
+  sync_word: 0x33333155
+  preamble_detector_bits: 0
   capture_bytes: 128
   rssi_floor: -110
   manchester_gate: 4

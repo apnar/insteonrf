@@ -22,12 +22,20 @@ InsteonRF = insteon_rf_ns.class_("InsteonRF", cg.Component, spi.SPIDevice)
 
 CONF_BUSY_PIN = "busy_pin"
 CONF_DIO1_PIN = "dio1_pin"
+CONF_SYNC_WORD = "sync_word"
+CONF_PREAMBLE_DETECTOR = "preamble_detector_bits"
 CONF_CAPTURE_BYTES = "capture_bytes"
 CONF_RSSI_FLOOR = "rssi_floor"
 CONF_MANCHESTER_GATE = "manchester_gate"
 CONF_TCXO_VOLTAGE = "tcxo_voltage"
 CONF_TCXO_DELAY = "tcxo_delay"
 CONF_MQTT_TOPIC = "mqtt_topic"
+
+# From tools/gen_sync_word.py, pinned by tests/test_sync_word.py. The
+# complement (0xCCCCCEAA) is the one to try if the radio's bit sense turns
+# out opposite to the CC1111's: a wrong polarity produces no captures and no
+# errors, exactly like a wiring fault, so it has to be flippable over OTA.
+DEFAULT_SYNC_WORD = 0x33333155
 
 # SX126x SetDIO3AsTcxoCtrl voltage codes.
 TCXO_VOLTAGES = {
@@ -39,6 +47,17 @@ TCXO_VOLTAGES = {
     "2.7V": 0x05,
     "3.0V": 0x06,
     "3.3V": 0x07,
+}
+
+# SX126x GFSK PreambleDetectorLength codes. Off by default: Insteon's preamble
+# is a repeating 0110 cell rather than the 0x55/0xAA alternation the detector
+# expects, so it may never fire. Exposed so it can be tried on hardware.
+PREAMBLE_DETECTOR = {
+    0: 0x00,
+    8: 0x04,
+    16: 0x05,
+    24: 0x06,
+    32: 0x07,
 }
 
 CONFIG_SCHEMA = (
@@ -54,6 +73,8 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_FREQUENCY, default="914.95MHz"): cv.All(
                 cv.frequency, cv.Range(min=902e6, max=928e6)
             ),
+            cv.Optional(CONF_SYNC_WORD, default=DEFAULT_SYNC_WORD): cv.hex_uint32_t,
+            cv.Optional(CONF_PREAMBLE_DETECTOR, default=0): cv.enum(PREAMBLE_DETECTOR),
             # 128 bytes is 112 ms of air: longer than a standard packet
             # (40 ms) or an extended one (98 ms), so a capture usually holds
             # a packet plus the start of the next hop repeat. The host finds
@@ -96,6 +117,8 @@ async def to_code(config):
         cg.add(var.set_dio1_pin(dio1))
 
     cg.add(var.set_frequency(int(config[CONF_FREQUENCY])))
+    cg.add(var.set_sync_word(config[CONF_SYNC_WORD]))
+    cg.add(var.set_preamble_detector(config[CONF_PREAMBLE_DETECTOR]))
     cg.add(var.set_capture_bytes(config[CONF_CAPTURE_BYTES]))
     cg.add(var.set_rssi_floor(config[CONF_RSSI_FLOOR]))
     cg.add(var.set_manchester_gate(config[CONF_MANCHESTER_GATE]))
