@@ -242,9 +242,15 @@ void InsteonRF::start_rx_() {
 }
 
 float InsteonRF::read_rssi_() {
-  uint8_t v = 0;
-  this->read_cmd_(SX_GET_RSSI_INST, &v, 1);
-  return -((float) v) / 2.0f;
+  // GetPacketStatus for GFSK returns RxStatus, RssiSync, RssiAvg; RssiAvg is
+  // averaged over the packet just received. GetRssiInst is instantaneous,
+  // and read after a capture it mostly measured whatever was on air *next* --
+  // a few feet from the PLM that was its hop repeat, which is how a distant
+  // device's ACK came to report -46 dBm on the first bring-up. RSSI is the
+  // whole point of the placement survey, so it has to be the packet's own.
+  uint8_t ps[3] = {0, 0, 0};
+  this->read_cmd_(SX_GET_PACKET_STATUS, ps, 3);
+  return -((float) ps[2]) / 2.0f;
 }
 
 // --------------------------------------------------------------------- the gate
@@ -413,13 +419,17 @@ void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi) {
   // Epoch milliseconds when the clock is set, so the host can window
   // captures from different boards together; it falls back to arrival time
   // if this looks implausible, so an unsynced board is harmless.
-  char head[160];
+  // "sw" is the sync word this capture was matched on. The FIFO holds only
+  // what follows it, so the host has to put the start header back before
+  // parsing, and it needs to know which polarity to put back.
+  char head[192];
   const uint32_t us = micros();
   snprintf(head, sizeof(head),
-           "{\"n\":\"%s\",\"seq\":%u,\"t\":%llu,\"us\":%u,\"rssi\":%.1f,\"len\":%u,\"b\":\"",
+           "{\"n\":\"%s\",\"seq\":%u,\"t\":%llu,\"us\":%u,\"rssi\":%.1f,\"len\":%u,"
+           "\"sw\":\"%08X\",\"b\":\"",
            App.get_name().c_str(), (unsigned) this->seq_,
            (unsigned long long) ((uint64_t) time(nullptr) * 1000ULL), (unsigned) us, rssi,
-           (unsigned) len);
+           (unsigned) len, (unsigned) this->sync_word_);
 
   std::string payload(head);
   payload += blob;

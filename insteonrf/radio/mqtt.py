@@ -14,6 +14,16 @@ payload is the bulk of the traffic. The bytes expand to an ASCII bit string
 MSB first — the order the radio shifts bits into the FIFO — which is the
 pipeline contract the rest of the package already speaks.
 
+**``b`` is the FIFO content, which starts *after* the sync word.** A radio
+consumes the pattern it synchronised on, so the first packet in every capture
+arrives without its start header, and the parser would skip it — measured on
+the first Heltec: three of four captures decoded truncated or not at all
+because only the *next* packet in the buffer still had a header. The host
+puts the header back (:func:`with_sync_header`), exactly as the rfcat path
+does for the CC1111 in ``RfcatRadio.receive_bits``. ``sw`` names the sync
+word the board matched on, so a board running the inverted word gets the
+matching header prepended; without it the default on-air header is used.
+
 Only ``b`` is required. ``n`` falls back to the last topic segment, which is
 where the node name really lives; the rest is metadata.
 
@@ -37,6 +47,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from ..packet import START_HEADER, START_HEADER_INV
+
 log = logging.getLogger(__name__)
 
 #: Default topic prefix. Deliberately not ``insteon/``, which insteon-mqtt owns.
@@ -57,6 +69,26 @@ def bytes_from_bits(bits: str) -> bytes:
     return bytes(int(padded[i : i + 8], 2) for i in range(0, len(padded), 8))
 
 
+def with_sync_header(bits: str, sync_word: int | None = None) -> str:
+    """Put back the start header the radio consumed while synchronising.
+
+    The low 16 bits of the sync word *are* the on-air start header (the
+    upper bits are preamble), so prepending them restores a stream the
+    parser can find the first packet in. Prepending the header in the same
+    polarity the board matched on keeps the whole stream self-consistent, so
+    a board flipped to the inverted sync word needs nothing else changed.
+
+    A stream that already begins with a header is left alone: that is how an
+    older publisher (the dongle path before it stripped its own prefix)
+    presents captures, and a second header would put a junk packet in front
+    of the real one.
+    """
+    if bits.startswith(START_HEADER) or bits.startswith(START_HEADER_INV):
+        return bits
+    header = f"{sync_word & 0xFFFF:016b}" if sync_word is not None else START_HEADER_INV
+    return header + bits
+
+
 @dataclass
 class Capture:
     """One board's recording of one burst."""
@@ -69,6 +101,8 @@ class Capture:
     #: Microseconds since that board booted, at sync detect. High resolution
     #: *within* a board, meaningless between boards.
     micros: int | None = None
+    #: The sync word the board matched on, when it said.
+    sync_word: int | None = None
 
     @classmethod
     def from_payload(cls, topic: str, payload: bytes) -> Capture | None:
@@ -116,13 +150,25 @@ class Capture:
         rssi = rec.get("rssi")
         seq = rec.get("seq")
         micros = rec.get("us")
+
+        sw = rec.get("sw")
+        sync_word: int | None = None
+        if isinstance(sw, int):
+            sync_word = sw
+        elif isinstance(sw, str):
+            try:
+                sync_word = int(sw, 16)
+            except ValueError:
+                log.warning("capture on %s has an unparsable sw %r", topic, sw)
+
         return cls(
             receiver=name,
-            bits=bits_from_bytes(raw),
+            bits=with_sync_header(bits_from_bytes(raw), sync_word),
             timestamp=when,
             rssi_dbm=float(rssi) if isinstance(rssi, (int, float)) else None,
             seq=int(seq) if isinstance(seq, int) else None,
             micros=int(micros) if isinstance(micros, int) else None,
+            sync_word=sync_word,
         )
 
 
@@ -253,4 +299,5 @@ __all__ = [
     "MqttReceiver",
     "bits_from_bytes",
     "bytes_from_bits",
+    "with_sync_header",
 ]

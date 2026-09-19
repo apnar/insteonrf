@@ -17,13 +17,14 @@ import pytest
 
 from insteonrf.inject import Injector, Tier
 from insteonrf.mesh import MeshService, MissTable
-from insteonrf.packet import Packet
+from insteonrf.packet import START_HEADER, START_HEADER_INV, Packet
 from insteonrf.plm import to_plm_bytes
 from insteonrf.radio.mqtt import (
     MAX_CAPTURE_BYTES,
     Capture,
     bits_from_bytes,
     bytes_from_bits,
+    with_sync_header,
 )
 
 PLM = "2B.93.07"
@@ -31,11 +32,24 @@ DEV = "29.4E.52"
 LEAK = "44.12.AB"
 
 
+def fifo_bits(p: Packet) -> str:
+    """What a radio's FIFO holds: the on-air stream *after* the sync word.
+
+    A radio consumes the pattern it synchronised on, so the start header is
+    never in the buffer. Fixtures that include it are not what hardware
+    delivers, and hid the bug this models.
+    """
+    b = p.to_bits()
+    i = b.find(START_HEADER_INV)
+    assert i >= 0
+    return b[i + len(START_HEADER_INV):]
+
+
 def capture_bytes(src=DEV, group=1, **kw) -> bytes:
     kw.setdefault("cmd1", 0x11)
     kw.setdefault("cmd2", 0xFF)
     p = Packet.build(src, group=group, bcast=True, **kw)
-    return bytes_from_bits(p.to_bits())
+    return bytes_from_bits(fifo_bits(p))
 
 
 def payload(raw: bytes, **over) -> bytes:
@@ -74,13 +88,77 @@ def test_bytes_from_bits_pads_the_last_byte():
 def test_a_capture_survives_the_whole_transport():
     """Bytes on the board -> base64 -> bits -> a decoded packet."""
     original = Packet.build(DEV, group=4, bcast=True, cmd1=0x11, cmd2=0xFF)
-    cap = Capture.from_payload("insteon-rf/rx/up", payload(bytes_from_bits(original.to_bits())))
+    cap = Capture.from_payload("insteon-rf/rx/up", payload(bytes_from_bits(fifo_bits(original))))
     assert cap is not None
     from insteonrf.fusion import sightings_from_capture
 
     got = sightings_from_capture(cap.bits, cap.receiver)
     assert got and got[0].packet.crc_ok is True
     assert got[0].packet.group == 4
+
+
+# --------------------------------------------------------------------------- the consumed header
+
+
+def test_first_packet_in_a_capture_is_decoded():
+    """Measured on the first Heltec: 3 of 4 captures decoded truncated or not
+    at all, because the radio had consumed the start header and only a *later*
+    packet in the buffer still had one. The first packet -- the one the radio
+    actually synchronised on -- was being thrown away."""
+    from insteonrf.fusion import sightings_from_capture
+
+    # Models the real first capture: the PLM's Get Engine Version to a KPL.
+    original = Packet.build(PLM, DEV, cmd1=0x0D, cmd2=0x00)
+    raw = bytes_from_bits(fifo_bits(original))          # exactly the FIFO
+    assert START_HEADER_INV not in bits_from_bytes(raw)  # header really is gone
+    cap = Capture.from_payload("insteon-rf/rx/up", payload(raw))
+    got = sightings_from_capture(cap.bits, cap.receiver)
+    assert len(got) >= 1
+    assert got[0].packet.crc_ok is True
+    assert str(got[0].packet.from_addr) == PLM
+    assert str(got[0].packet.to_addr) == DEV
+    assert got[0].packet.cmd1 == 0x0D
+
+
+def test_default_header_is_the_on_air_start_header():
+    assert with_sync_header("0101") == START_HEADER_INV + "0101"
+
+
+def test_header_follows_the_boards_sync_word_polarity():
+    """A board flipped to the inverted sync word delivers inverted bits; the
+    header put back must match, and then the parser normalises the lot."""
+    from insteonrf.fusion import sightings_from_capture
+
+    original = Packet.build(DEV, PLM, cmd1=0x0D, cmd2=0x00)
+    inverted = "".join("1" if c == "0" else "0" for c in fifo_bits(original))
+    cap = Capture.from_payload("insteon-rf/rx/up",
+                               payload(bytes_from_bits(inverted), sw="CCCCCEAA"))
+    assert cap is not None and cap.sync_word == 0xCCCCCEAA
+    assert cap.bits.startswith(START_HEADER)
+    got = sightings_from_capture(cap.bits, cap.receiver)
+    assert got and got[0].packet.crc_ok is True and got[0].packet.cmd1 == 0x0D
+
+
+def test_sw_accepts_int_or_hex_string_and_ignores_junk():
+    raw = capture_bytes()
+    assert Capture.from_payload("t/rx/a", payload(raw, sw=0x33333155)).sync_word == 0x33333155
+    assert Capture.from_payload("t/rx/a", payload(raw, sw="33333155")).sync_word == 0x33333155
+    cap = Capture.from_payload("t/rx/a", payload(raw, sw="not hex"))
+    assert cap is not None and cap.sync_word is None
+    assert cap.bits.startswith(START_HEADER_INV), "falls back to the default header"
+
+
+def test_a_capture_that_already_has_a_header_is_not_doubled():
+    """An older publisher that shipped the header itself must not end up with
+    a junk packet in front of the real one."""
+    from insteonrf.fusion import sightings_from_capture
+
+    original = Packet.build(DEV, PLM, cmd1=0x0D, cmd2=0x00)
+    with_hdr = START_HEADER_INV + fifo_bits(original)
+    cap = Capture.from_payload("insteon-rf/rx/old", payload(bytes_from_bits(with_hdr)))
+    assert cap.bits.count(START_HEADER_INV) == 1
+    got = sightings_from_capture(cap.bits, cap.receiver)
+    assert got[0].packet.crc_ok is True and got[0].packet.cmd1 == 0x0D
 
 
 # --------------------------------------------------------------------------- payload parsing
@@ -384,7 +462,8 @@ def test_dongle_capture_payload_is_what_the_mesh_consumes():
     from insteonrf.monitor import MqttPublisher
 
     original = Packet.build(DEV, group=4, bcast=True, cmd1=0x11, cmd2=0xFF)
-    bits = original.to_bits()
+    # receive_bits() hands monitor the consumed header put back on the front.
+    bits = START_HEADER_INV + fifo_bits(original)
 
     sent = {}
 
@@ -400,6 +479,11 @@ def test_dongle_capture_payload_is_what_the_mesh_consumes():
 
     pub.publish_capture(bits, receiver="dongle", timestamp=time.time(), rssi_dbm=-93.0, seq=7)
     assert sent["topic"] == "insteon-rf/rx/dongle"
+
+    rec = json.loads(sent["payload"])
+    assert rec["sw"] == "3155", "the dongle names the 16-bit header it synced on"
+    assert not bits_from_bytes(base64.b64decode(rec["b"])).startswith(START_HEADER_INV), \
+        "published bytes are FIFO content: the header is the consumer's job"
 
     cap = Capture.from_payload(sent["topic"], sent["payload"])
     assert cap is not None

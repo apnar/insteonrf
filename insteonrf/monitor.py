@@ -184,14 +184,23 @@ class MqttPublisher:
         """
         import base64
 
+        from .packet import START_HEADER_INV
         from .radio.mqtt import bytes_from_bits
 
+        # The capture contract is FIFO content *after* the sync word, and the
+        # consumer puts the header back. receive_bits() has already prepended
+        # the CC1111's consumed header, so take it off again here rather than
+        # ship a capture in a different shape from the boards'.
+        if bits.startswith(START_HEADER_INV):
+            bits = bits[len(START_HEADER_INV):]
         payload = {
             "n": receiver,
             "seq": seq,
             "t": int(timestamp * 1000),
             "rssi": rssi_dbm,
             "len": (len(bits) + 7) // 8,
+            # What this radio synchronised on: the 16-bit on-air start header.
+            "sw": f"{int(START_HEADER_INV, 2):04X}",
             "b": base64.b64encode(bytes_from_bits(bits)).decode("ascii"),
         }
         self.client.publish(topic or f"{self.topic}/rx/{receiver}",

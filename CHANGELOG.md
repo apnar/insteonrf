@@ -4,6 +4,40 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.5.3 — 2026-09-19
+
+First contact: the Heltec LoRa 32 V3 received Insteon on the first flash.
+
+- **The SX1262 syncs on Insteon in GFSK packet mode with the preamble
+  detector off, at the default polarity.** A CRC-valid `2B.93.07 -> 29.4E.52
+  Get Engine Version` at −92.5 dBm on the first probe. The core assumption
+  the whole ESPHome path rested on is now measured, not argued.
+- **The consumed sync header is put back on the host.** A radio consumes the
+  pattern it synchronised on, so every capture arrives without its start
+  header and the parser skipped the first packet — 3 of 4 first-run captures
+  decoded truncated or not at all, with only the *next* hop repeat in the
+  buffer still carrying a header. `with_sync_header()` prepends the low 16
+  bits of the board's sync word (reported as `sw`, so a board flipped to the
+  inverted word gets the matching header), exactly as `RfcatRadio.receive_bits`
+  already does for the CC1111. The dongle's `--mesh-capture` publisher now
+  strips its own prefix so both receivers ship the same shape: FIFO content,
+  header restored by the consumer. Fixtures that included the header were
+  not what hardware delivers and had hidden this.
+- **Per-packet RSSI in firmware** via `GetPacketStatus` RssiAvg. `GetRssiInst`
+  read after a capture measured whatever was on air next; a few feet from the
+  PLM that was its hop repeat, so a distant device's ACK reported −46 dBm.
+- **The dongle had been deaf for 2.5 days** (last decode 09-16 20:52) on a
+  pod that predated the silence watchdog. Redeployed with it; this is the
+  observed wedge the watchdog's earlier justification wrongly claimed.
+- **Fusion across two real radios works**: one message, two receivers, one
+  event, `closest` by hops-left with RSSI tiebreak, suppression correct.
+- Open: in ~3 of 10 board captures the first packet's Manchester stream
+  breaks 120–170 bits after sync while the dongle decodes the same packet
+  whole. Leading hypothesis is bit-clock tracking of transmitters a few
+  tenths of a percent off nominal baud (the SDR path grid-searches symbol
+  rate for this reason); `preamble_detector_bits: 8` is the one-line A/B.
+  Fusion recovered every such message from another copy in this sample.
+
 ## 2.5.2 — 2026-09-19
 
 Pre-flash review of the ESPHome listener, with the Heltec LoRa 32 V3 in hand.

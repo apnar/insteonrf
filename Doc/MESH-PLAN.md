@@ -54,6 +54,20 @@ the on-board OLED driven at last (RSSI bar, cap/ok per minute, age of the
 last packet, WiFi/MQTT flags) so the placement survey needs no laptop.
 Compiles clean; still never run on hardware.
 
+**First contact (2026-09-19, later the same day).** Flashed a few feet from
+the PLM and the dongle. It received Insteon on the first probe: a CRC-valid
+`2B.93.07 -> 29.4E.52 Get Engine Version` at −92.5 dBm. Packet-mode sync with
+the preamble detector off works, and the default polarity is right — §3.1's
+open question is closed. Two things the first hour taught: the radio
+*consumes* the sync word, so captures arrive headless and the host must put
+the header back (`with_sync_header`, mirroring what the rfcat path already
+did); and `GetRssiInst` read after a capture is not the packet's RSSI (now
+`GetPacketStatus` RssiAvg). With both fixed, the mesh pod fused one message
+from both radios into one event with correct `closest` and `plm_saw_it`.
+Open: ~3 in 10 board captures break their Manchester stream 120–170 bits
+after sync on packets the dongle decodes whole; suspected bit-clock tracking
+of off-nominal transmitters, A/B via `preamble_detector_bits: 8`.
+
 ### Findings that changed the design
 
 * **Group broadcasts swap the address slots; they do not encode "group 00 00".**
