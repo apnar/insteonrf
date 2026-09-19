@@ -268,6 +268,48 @@ Expose `captures_per_minute` and `accepted_per_minute` as separate sensors so
 the rejection ratio is visible. It is the main tuning knob and the first thing
 to check when a node goes quiet or goes noisy.
 
+### 3.4b Next board: ESP32 + CC1101 (researched 2026-09-19)
+
+The SX1262's packet engine imposes a sync word, a fixed length, a consumed
+header and one polarity; the CC1101's **asynchronous serial mode** imposes
+none of them — it streams the demodulated bits on a GDO pin and the host does
+all framing. It is also the same demodulator family as the rfcat dongle,
+which on the first day decoded whole packets the Heltec flipped bits in.
+
+**The only mainstream single board is LILYGO's T-Embed CC1101** (and the
+"Plus", which just adds an nRF24L01). ESP32-S3-WROOM-1, 16 MB / 8 MB PSRAM,
+1.9" ST7789 170×320, rotary encoder, 1300 mAh, IR, NFC, microSD, Qwiic.
+Verified from the vendor repo:
+
+```
+CC1101  CS 12  SCK 11  MOSI 9  MISO 10  GDO0 3  GDO2 38
+Antenna switch  SW1 47  SW0 48   ->  SW1:0 SW0:1 selects the 868/915 path
+Display ST7789  CS 41  DC 16  BL 21    Encoder 4/5/0   Button 6   RGB 14
+```
+
+GDO0/GDO2 both reach ESP32 GPIOs, so the raw bit stream is capturable, and
+915 MHz has its own matching path rather than a wideband compromise. Buy the
+**external-antenna (SMA) version** and fit a 915 antenna.
+
+**Firmware may need no C++ at all.** ESPHome ships an official `cc1101`
+component: `modulation_type: 2-FSK`, `symbol_rate: 9124`,
+`fsk_deviation: 75kHz`, `filter_bandwidth: 203kHz` (the CC1101 step the
+rfcat config uses as "200 kHz"), `frequency: 914.95MHz`, `manchester: false`,
+plus AGC controls (`freeze: On Sync`, `rx_attenuation`) that bear directly on
+the simulcast/AGC question. Its default **async mode** puts the demodulated
+line on GDO2 for `remote_receiver`, i.e. RMT edge capture at ~1 µs against a
+110 µs symbol — timing jitter per symbol is a real, if crude, confidence
+signal. Its packet mode caps at 64 bytes (the chip FIFO), too short for an
+extended packet, so async is the path. Expect to tune `remote_receiver`
+`idle` (~2 ms) and `buffer_size` so a whole burst is one event, and to turn
+edge timings into the capture payload either on-board or on the host.
+
+Compact no-display alternative: hallard's open-hardware **ESP32C3-CC1101**
+(ESP32-C3 + Ebyte E07-900M10S, a 915-band-specific module, u.FL) — a PCB
+design to have made, not a product; GDO0 IO1, GDO2 IO0. Cheapest of all: an
+ESP32-S3 SuperMini plus a bare CC1101 module, seven wires, for permanent
+hidden placement near the water sensors.
+
 ### 3.5 Placement of the first board
 
 One board. Put it **where the PLM is weakest**, which is by definition not near
