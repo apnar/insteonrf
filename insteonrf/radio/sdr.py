@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
@@ -37,6 +39,11 @@ def _hard_soft(bits: str) -> np.ndarray:
 DEFAULT_SAMPLE_RATE = dsp.DEFAULT_SAMPLE_RATE
 #: How much I/Q to read from the capture tool at a time.
 READ_SIZE = 1 << 16
+#: Backlog the reader thread may hold before it starts dropping chunks
+#: (seconds of I/Q). Demodulating one packet takes ~85 ms of CPU; a Linux
+#: pipe holds ~14 ms of samples at 2.4 Msps, so without a reader that keeps
+#: draining the pipe, ``rtl_sdr`` silently loses samples during every burst.
+QUEUE_SECONDS = 4.0
 #: Give up waiting for the squelch to close after this much signal (a packet
 #: is ~56 ms; anything longer is noise or a mis-set squelch).
 MAX_BURST_S = 0.5
@@ -80,9 +87,15 @@ class SdrReceiver:
         self.demod_path = find_demod(demod_path)
         if demod == "c" and self.demod_path is None:
             raise RuntimeError("fsk2_demod is not built — run 'make', or use --demod numpy")
-        self._use_c = demod == "c" or (demod == "auto" and self.demod_path is not None)
+        # Only the explicit choice gets the C demodulator. It is kept for the
+        # regression fixture and for comparison; on live signals it fails where
+        # the numpy path succeeds, so "auto" must never silently select it.
+        self._use_c = demod == "c"
         self._proc: subprocess.Popen[bytes] | None = None
         self._demod_proc: subprocess.Popen[bytes] | None = None
+        self._reader: threading.Thread | None = None
+        #: I/Q chunks discarded because demodulation fell behind (numpy path).
+        self.dropped_chunks = 0
         #: True once the capture stream has ended (a live SDR never exhausts).
         self.exhausted = False
 
@@ -164,10 +177,13 @@ class SdrReceiver:
 
     def receive_burst(self, timeout_ms: int = 2000) -> dsp.Burst | None:
         """One burst at a time, for callers driving their own loop."""
-        it = getattr(self, "_bit", None)
+        # One generator for the life of the receiver: a fresh one per call
+        # would re-run _start() and spawn a second capture process, which
+        # then fails to claim the device and ends the stream after one burst.
+        it = getattr(self, "_bursts", None)
         if it is None:
             it = self._bursts = self.iter_bursts()
-        got = next(self._bursts, None)
+        got = next(it, None)
         if got is None:
             self.exhausted = True
         return got
@@ -195,10 +211,11 @@ class SdrReceiver:
         tail_bytes = 2 * int(4 * self.sample_rate / self.baud)
         lead_bytes = 2 * int(2 * self.sample_rate / self.baud)
         max_bytes = 2 * int(MAX_BURST_S * self.sample_rate)
+        chunks = self._start_reader()
         pending = b""
         while True:
-            chunk = self._iq.read(READ_SIZE)
-            if not chunk:
+            chunk = chunks.get()
+            if chunk is None:
                 yield from self._flush(pending)
                 return
             pending += chunk
@@ -208,6 +225,43 @@ class SdrReceiver:
             yield from self._flush(pending)
             # Keep a little context so a burst split by the size cap continues.
             pending = pending[-lead_bytes:] if busy else b""
+
+    def _start_reader(self) -> queue.Queue[bytes | None]:
+        """Drain the capture pipe on a thread so demodulation never stalls it.
+
+        The main loop demodulates between reads; while it does, the pipe
+        fills and the capture tool drops samples (``rtl_sdr`` says so on
+        stderr, which is discarded). The thread keeps reading regardless and
+        queues chunks; if the demodulator falls behind by more than
+        ``QUEUE_SECONDS`` the *newest* chunks are dropped here instead, where
+        it is counted in ``dropped_chunks``.
+        """
+        chunks: queue.Queue[bytes | None] = queue.Queue(
+            maxsize=max(1, int(QUEUE_SECONDS * 2 * self.sample_rate / READ_SIZE)))
+        self.dropped_chunks = 0
+        src = self._iq
+
+        def pump() -> None:
+            try:
+                while True:
+                    chunk = src.read(READ_SIZE)
+                    if not chunk:
+                        break
+                    try:
+                        chunks.put_nowait(chunk)
+                    except queue.Full:
+                        self.dropped_chunks += 1
+                        if self.dropped_chunks in (1, 10, 100, 1000):
+                            log.warning("demodulator behind by >%.0fs, dropping I/Q (%d chunks so far)",
+                                        QUEUE_SECONDS, self.dropped_chunks)
+            except (OSError, ValueError):
+                pass  # the pipe closed under us (close() ran)
+            finally:
+                chunks.put(None)
+
+        self._reader = threading.Thread(target=pump, name="sdr-reader", daemon=True)
+        self._reader.start()
+        return chunks
 
     def _flush(self, buf: bytes) -> Iterator[dsp.Burst]:
         if not buf:

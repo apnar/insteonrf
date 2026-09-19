@@ -16,18 +16,6 @@
 # NEVER add a transmit command here: the PLM owns the air. Topic prefix is
 # insteon-rf/ so it cannot collide with insteon-mqtt's insteon/ prefix.
 #
-# Deploy (paths as used on the host this was written for):
-#   mkdir -p /nvme/k8s/insteonrf-config/{build,log,dumps}
-#   cp -r <this repo> /nvme/k8s/insteonrf-config/build/src
-#   cp deploy/Containerfile /nvme/k8s/insteonrf-config/build/
-#   # the groups your network legitimately uses, for the unknown-group trigger
-#   grep -oE '^  - modem: [0-9]+' /k8s/insteon-config/scenes.yaml \
-#     | awk '{print $3}' | sort -nu > /nvme/k8s/insteonrf-config/groups.txt
-#   microk8s kubectl create secret generic mosquitto \
-#     --from-literal=username=<user> --from-literal=password=<pass>
-#   cp deploy/insteonrf.yaml /k8s/yaml/insteonrf.yaml
-#   microk8s kubectl apply -f /k8s/yaml/insteonrf.yaml
-#
 # Image is built locally from /nvme/k8s/insteonrf-config/build (buildah bud →
 # ctr image import), so imagePullPolicy MUST stay Never:
 #   cd /nvme/k8s/insteonrf-config/build && buildah bud -t insteonrf:local . \
@@ -73,6 +61,13 @@ spec:
         # stream, and this broker runs log_type debug (a line per publish), so
         # MQTT carries only all-on triggers, on insteon-rf/alert.
         - --mqtt-alerts-only
+        # ...except raw captures, which make this dongle a member of the
+        # listener mesh that the insteonrf-mesh pod fuses.
+        - --mesh-capture=dongle
+        # The dongle goes deaf without erroring (five times on 2026-09-19,
+        # ~5 h of a 7 h day, confirmed against the Heltec's log); a USB reset
+        # cures it. Re-arm after 5 min of silence, USB-reset after 10.
+        - --max-silence=300
         - --out=/config/log/insteon-rf.jsonl
         - --watch-all-on
         - --known-groups=/config/groups.txt

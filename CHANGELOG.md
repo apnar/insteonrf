@@ -4,6 +4,66 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.5.5 — 2026-09-19
+
+The RTL-SDR Blog V4 that was lying around, plugged into the host with a bare
+915 MHz antenna, no filter and no preamp. Getting it to decode *live* found
+two bugs that had made the SDR backends useless on a real signal since 2.2.0;
+file replay never exercised them.
+
+- **`SdrReceiver.receive_burst()` spawned a new capture process per call.**
+  A typo (`getattr(self, "_bit")` guarding `self._bursts`) meant every call
+  created a fresh generator, whose first `next()` ran `_start()` again: a
+  second `rtl_sdr` that could not claim the device, EOF, `exhausted = True`
+  after one burst. `monitor`/`recv --backend rtlsdr` decoded one packet and
+  went quiet. One generator per receiver now.
+- **The numpy loop dropped samples on every packet.** Demodulation ran
+  inline between pipe reads: one 56 ms burst takes ~85 ms to demodulate,
+  and a Linux pipe holds 64 kB = 14 ms of I/Q at 2.4 Msps, so `rtl_sdr`
+  lost the tail of everything (its "lost N bytes" goes to stderr, which is
+  discarded). A reader thread now drains the pipe into a bounded queue
+  (`QUEUE_SECONDS` = 4 s); if the demodulator ever falls that far behind,
+  the drop happens in the queue where it is counted (`dropped_chunks`) and
+  logged. Zero drops in the runs below.
+- **`--demod` defaults to `numpy`; `auto` never picks the C demodulator.**
+  `auto` chose `fsk2_demod` whenever it was built, and that binary fails on
+  live signals (the 2.2.0 bench: no decodes even at 31 dB). It stays
+  available by name for the regression fixture.
+- **First live numbers, 80 s, gain 37.2, four Get Engine Version probes
+  plus one incidental group broadcast (10 distinct messages), three
+  receivers at the same spot:** messages heard — V4 8, dongle 9, Heltec 8;
+  CRC-valid copies counting hop repeats — V4 28, dongle 19, Heltec 14. The
+  V4 missed the two faintest things: a reply the dongle heard at −105.5 dBm
+  and the group broadcast, where the simulcast repeats overlapped and the
+  matched filter produced 10 fragments in one flush while the CC1111 locked
+  on one copy and decoded hops 0, 1 and 2. The dongle missed the PLM's own
+  probe to `29.4E.52` (a −72 dBm block it could not frame); the Heltec
+  missed the `25.09.42` exchange entirely. Offline on 15 s captures the V4
+  decodes 9 CRC-valid packets at symbol SNR 13–22 dB with squelch 12 at
+  gain 37.2; at 49.6 the floor rises to 6.8 and the squelch chatters. So
+  with no front-end filtering and an 8-bit ADC the V4 already matches the
+  dongle on coverage and beats both on copies — and every receiver missed
+  something another caught, which is the mesh's premise. Details in
+  `Doc/MESH-PLAN.md` §3.7.
+- **The dongle pod goes deaf, often, without erroring.** Its log had gaps
+  of 27, 100, 52, 96, 51 and 20 minutes today while the Heltec, a few feet
+  away, recorded 64–198 captures in each of them. The rfcat hears fine
+  from the host during such a gap; the *pod* does not, and a pod restart
+  did not cure it, while a host-side open/close of the dongle did once and
+  `insteon-rf reset` (USB reset) did once, instantly. Not reproducible on
+  demand — not by `rtl_sdr` streaming, by the SDR backends, or by
+  importing rflib — and the gaps started before the V4 was plugged in.
+  `heal()` is exactly that USB reset, so the pod now runs
+  `--max-silence=300` (re-arm after 5 min, reset after 10). The repo's
+  `deploy/insteonrf.yaml` was also behind the live manifest (no
+  `--mesh-capture`); synced.
+- Known, not fixed: `recover_packets()` returns nothing for two of the
+  dongle's 2056-bit blocks that hold two packets each, although
+  `parse_bits()` decodes both with CRC and frame counters intact —
+  `find_headers()` reports a polarity flip and the decoder then reads
+  Manchester garbage. The mesh and the CLI try `parse_bits` first, so no
+  packet is lost today.
+
 ## 2.5.4 — 2026-09-19
 
 - **Correction: no deployed receiver produces soft decisions.** The mesh

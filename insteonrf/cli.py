@@ -107,8 +107,12 @@ def _radio_args(p: argparse.ArgumentParser, *, transmit: bool = False) -> None:
     if transmit:
         p.add_argument("--tx-gain", type=int, default=20, help="hackrf TX VGA gain in dB")
     else:
-        p.add_argument("--demod", choices=("auto", "c", "numpy"), default="auto",
-                       help="SDR backends: demodulator to use (default %(default)s)")
+        p.add_argument("--demod", choices=("auto", "c", "numpy"), default="numpy",
+                       help="SDR backends: demodulator to use (default %(default)s). 'auto' also "
+                            "means numpy; the C fsk2_demod is only used when asked for by name -- "
+                            "it fails on real signals the numpy path decodes (see CLAUDE.md), and "
+                            "an 'auto' that silently picked it whenever 'make' had been run cost a "
+                            "first live RTL-SDR test every packet")
         p.add_argument("-m", "--method", choices=("ml", "discriminator"), default="ml",
                        help="SDR backends, numpy demodulator: matched-filter ML (default, more "
                             "sensitive and gives soft decisions) or phase discriminator")

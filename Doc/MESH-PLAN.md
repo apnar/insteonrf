@@ -339,6 +339,89 @@ their wall boxes), at least 30 cm from ductwork, panels and mirrors.
 
 ---
 
+### 3.7 RTL-SDR V4 on the host: first light (2026-09-19)
+
+An RTL-SDR Blog V4 with a bare 915 MHz antenna — no SAW filter, no LNA — on
+`alpha` next to the rfcat dongle, a few feet from the Heltec and the PLM.
+Driver: RTL-SDR Blog's librtlsdr fork (the V4's R828D needs it), kernel
+`dvb_usb_rtl28xxu` blacklisted. `insteon-rf monitor --backend rtlsdr --gain
+37.2 --demod numpy`, 2.4 Msps (~263 samples per bit), squelch 12.
+
+**Live, 80 s, four Get Engine Version probes plus one incidental group
+broadcast: 10 distinct messages.** Decoded with `parse_bits`, the decoder the
+mesh uses; hop-counter values in brackets are the copies each receiver
+framed with CRC and frame counters intact:
+
+| message | V4 | dongle | Heltec |
+|---|---|---|---|
+| PLM → 29.4E.52 Get Engine | [1, 2] | – | [0, 1] |
+| 29.4E.52 → PLM reply | – | [0] (−105.5 dBm) | [0] (−97) |
+| group broadcast On (29.41.B5) | – (10 fragments) | [0, 1, 2] | [1, 2] |
+| PLM → 29.41.B5 On | [0, 1] | [0, 1] | [0] |
+| PLM → 25.09.42 Get Engine | [0, 1] | [0] | – |
+| 25.09.42 → PLM reply | [0] | [0] | – |
+| PLM → 2B.A0.AB Get Engine | [0, 1, 2] | [0, 1] | [0, 1] |
+| 2B.A0.AB → PLM reply | [1] | [1] | [0, 1] |
+| PLM → 29.4D.F8 Get Engine | [0, 1, 2, 3] | [0, 1, 2] | [0, 1, 2] |
+| 29.4D.F8 → PLM reply | [2] | [0, 1] | [2] |
+| **messages heard** | **8** | **9** | **8** |
+| **CRC-valid copies** | **28** | **19** | **14** |
+| undecodable | 17 fragments | 3 blocks | 2 captures |
+
+What the table says:
+
+- With no front-end filtering and an 8-bit ADC the V4 already matches the
+  dongle on coverage and produces the most copies — which is what
+  cross-receiver combining (§6.6) feeds on.
+- Its two misses are instructive. The `29.4E.52` reply was the faintest
+  thing in the window (the dongle read −105.5 dBm, its idle floor). The
+  group broadcast was heard by everyone *except* the V4, which produced
+  ten fragments in one 0.5 s flush: the simulcast repeats from several
+  dual-band devices overlapped, and the matched filter — which assumes one
+  signal — could not frame any of them, while the CC1111's sync-word
+  correlator locked onto one copy and decoded hops 0, 1 and 2. Handling
+  overlapping copies is a demodulator problem, not a hardware one.
+- The dongle missed the PLM's own probe to `29.4E.52` from a few feet away
+  (a −72 dBm block it could not frame — most likely a collision), and the
+  Heltec missed the whole `25.09.42` exchange. Every receiver missed
+  something another caught. That is the premise of the mesh, now measured
+  with three different front ends.
+- Offline, on 15 s captures: 9 CRC-valid packets at symbol SNR 13–22 dB at
+  gain 37.2; at gain 49.6 the noise floor rises from ~2.7 to 6.8 (|IQ|)
+  and squelch 12 chatters, so 37.2 is the setting here.
+
+**What it cost to get here.** Two bugs made the SDR backends useless live
+since 2.2.0 (file replay never hit them): `receive_burst()` spawned a new
+`rtl_sdr` per call, and the numpy loop demodulated inline between pipe
+reads — one 56 ms burst takes ~85 ms to demodulate and the pipe holds 14 ms,
+so `rtl_sdr` silently dropped the tail of every packet. A reader thread now
+drains the pipe into a 4 s queue (0 drops in these runs). Also `--demod auto`
+picked the C demodulator, which fails on real signals; `numpy` is the
+default. See the 2.5.5 changelog.
+
+**A finding about the dongle, not the V4.** Comparing the three logs showed
+the dongle *pod* deaf for most of the day: gaps of 27, 100, 52, 96, 51 and
+20 minutes in its log while the Heltec recorded 64–198 captures in each
+gap. During a gap the rfcat hears fine from the host; a pod restart did not
+cure it; a host-side open/close of the dongle did once and `insteon-rf
+reset` did once, instantly. Nothing reproduces it on demand — not
+`rtl_sdr` streaming, not the SDR backends, not importing rflib — and the
+gaps began before the V4 was plugged in. `heal()` is that same USB reset,
+so the pod now runs `--max-silence=300`: re-arm after 5 min of silence,
+USB-reset after 10. A spurious reset on a quiet night costs ~3 s of
+listening. Whether the watchdog actually recovers it will show in the pod
+log (`healing the radio` / `dongle back up`) and in the next day's gap
+list; if it does not, the Heltec is the better reference clock for
+"is the air quiet or is the dongle deaf" and the watchdog should ask it.
+
+**If the V4 joins the mesh:** `monitor --backend rtlsdr --mesh-capture v4`
+publishes its bursts like any board (hard bits, since the capture payload
+has no soft field yet — §3.3). It would be the receiver with the most
+copies at this spot, and the first whose soft decisions *could* reach
+fusion once the payload carries them. Adding the Uputronics filter/preamp
+(§3.4b) is the next hardware step; the collision behaviour above will not
+change with it.
+
 ## 4. The insteon-mqtt patch
 
 Runs as the `insteon` native sidecar in the `homeassistant` pod, image

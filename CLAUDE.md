@@ -175,6 +175,19 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   `insteon-rf allon --known-groups <groups.txt>`; build the group list with
   `grep -oE '^  - modem: [0-9]+' /k8s/insteon-config/scenes.yaml | awk '{print $3}' | sort -nu`
   (114 legitimate groups, 0 not among them).
+- **The dongle pod goes deaf without erroring** (2026-09-19: five gaps of 20–100 min in
+  one day while the Heltec a few feet away kept capturing). The rfcat hears fine from the
+  host during a gap; a pod restart did not cure it; `insteon-rf reset` (USB reset) did,
+  instantly. Not reproducible on demand. The pod runs `--max-silence=300` so `heal()` does
+  that reset after 10 min of silence; check `kubectl logs insteonrf` for `healing the
+  radio`. To tell quiet air from a deaf dongle, compare against the Heltec's per-minute
+  `Captures` sensor or `insteon-rf/rx/insteon-rf-main` on MQTT.
+- **SDR backends live**: `--demod numpy` (the C demodulator fails on real signals); the
+  reader thread in `SdrReceiver._iter_numpy` is load-bearing — demodulating one packet
+  takes ~85 ms and a pipe holds 14 ms of I/Q, so without it `rtl_sdr` drops samples
+  silently. RTL-SDR Blog V4 needs the rtlsdrblog librtlsdr fork (installed in
+  `/usr/local`) and `/etc/modprobe.d/blacklist-rtlsdr.conf`; gain 37.2 with squelch 12
+  is right here (49.6 raises the floor to 6.8 and chatters).
 - Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
   Assistant `mqtt.publish` service (no `mosquitto_pub` on the host or in the pod), e.g.
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.
