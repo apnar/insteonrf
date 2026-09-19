@@ -1,8 +1,10 @@
 # Insteon RF listener node. Receive only — see Doc/MESH-PLAN.md.
 #
 # Board: Heltec LoRa 32 V3 (ESP32-S3 + SX1262). Pins verified 2026-09-19
-# against Meshtastic's heltec_v3 variant (SCK 9, MISO 11, MOSI 10, CS 8,
-# RESET 12, BUSY 13, DIO1 14; TCXO 1.8 V on DIO3; DIO2 as RF switch).
+# against Meshtastic's heltec_v3 variant and arduino-esp32's board definition
+# (radio: SCK 9, MISO 11, MOSI 10, CS 8, RESET 12, BUSY 13, DIO1 14; TCXO
+# 1.8 V on DIO3; DIO2 as RF switch. OLED: SDA 17, SCL 18, RST 21, powered via
+# Vext on GPIO36, active low).
 #
 # Bring-up: the first ten captures after boot are logged at INFO with their
 # leading bytes and the gate verdict, so `esphome logs` tells the story:
@@ -13,6 +15,10 @@
 #   - captures arriving but "gate fail" on all of them -> framing/polarity;
 #     send me the logged bytes
 #   - captures with "gate PASS" -> it works; watch insteon-rf/rx/<name>
+#
+# The OLED shows the same story without a laptop, which is what makes it
+# useful for the placement survey: carry the board around and watch RSSI and
+# accepted-per-minute.
 #
 # Deliberately NOT including common/ble-proxy.yaml. WiFi + BLE + continuous
 # SPI FIFO service on one ESP32-S3 risks the interrupt latency that drops
@@ -25,6 +31,12 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  on_boot:
+    # Vext (the OLED's supply) is switched on at HARDWARE priority; give the
+    # panel a moment before the display driver resets it at PROCESSOR.
+    - priority: 600.0
+      then:
+        - delay: 50ms
 
 esp32:
   board: heltec_wifi_lora_32_V3
@@ -85,6 +97,88 @@ insteon_rf:
   rssi_floor: -110
   manchester_gate: 4
   mqtt_topic: insteon-rf/rx/${name}
+
+# ---------------------------------------------------------------- on-board OLED
+
+# Vext powers the OLED (and nothing else we use). Active low, so the pin is
+# inverted and "on" drives it low. Internal: not an entity anyone should flip.
+switch:
+  - platform: gpio
+    id: vext
+    internal: true
+    pin:
+      number: GPIO36
+      inverted: true
+    restore_mode: ALWAYS_ON
+
+i2c:
+  sda: GPIO17
+  scl: GPIO18
+  frequency: 400kHz
+
+font:
+  - file: "gfonts://Roboto"
+    id: f_small
+    size: 11
+  - file: "gfonts://Roboto"
+    id: f_big
+    size: 20
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    reset_pin: GPIO21
+    update_interval: 500ms
+    lambda: |-
+      // Not `rf`: a local of that name would shadow the id() lookup.
+      auto *node = id(rf);  // id() yields a pointer
+      const bool wifi_ok = wifi::global_wifi_component != nullptr &&
+                           wifi::global_wifi_component->is_connected();
+      const bool mqtt_ok = mqtt::global_mqtt_client != nullptr &&
+                           mqtt::global_mqtt_client->is_connected();
+
+      // Title row: name, and W/M flags (upper case = connected).
+      it.print(0, 0, id(f_small), "${friendly_name}");
+      it.printf(128, 0, id(f_small), TextAlign::TOP_RIGHT, "%s%s",
+                wifi_ok ? "W" : "w", mqtt_ok ? "M" : "m");
+
+      if (!node->radio_ok()) {
+        it.print(64, 34, id(f_big), TextAlign::CENTER, "RADIO FAULT");
+        it.print(64, 54, id(f_small), TextAlign::CENTER, "check SPI wiring");
+        return;
+      }
+
+      // Signal row: RSSI of the last real Insteon packet, big, plus a bar.
+      // -110 dBm is the floor, -50 dBm is standing next to the transmitter.
+      const float rssi = node->last_accepted_rssi();
+      if (std::isnan(rssi)) {
+        it.print(0, 14, id(f_big), "--- dBm");
+      } else {
+        it.printf(0, 14, id(f_big), "%.0f dBm", rssi);
+        int w = (int) ((rssi + 110.0f) / 60.0f * 128.0f);
+        if (w < 0) w = 0;
+        if (w > 128) w = 128;
+        it.filled_rectangle(0, 36, w, 3);
+      }
+
+      // Rates: what the gate is doing. Captures without accepts = noise or a
+      // polarity problem; accepts = real packets.
+      it.printf(0, 41, id(f_small), "%u cap/min  %u ok/min",
+                (unsigned) node->captures_last_minute(),
+                (unsigned) node->accepted_last_minute());
+
+      // Age of the last real packet, and lifetime accepted count.
+      const uint32_t age = node->ms_since_accepted();
+      if (age == UINT32_MAX) {
+        it.print(0, 53, id(f_small), "no packet yet");
+      } else if (age < 60000) {
+        it.printf(0, 53, id(f_small), "last %us ago", (unsigned) (age / 1000));
+      } else {
+        it.printf(0, 53, id(f_small), "last %um ago", (unsigned) (age / 60000));
+      }
+      it.printf(128, 53, id(f_small), TextAlign::TOP_RIGHT, "n=%u",
+                (unsigned) node->total_accepted());
 
 sensor:
   - platform: insteon_rf

@@ -26,6 +26,9 @@
 #include "esphome/core/hal.h"
 #include "esphome/components/spi/spi.h"
 
+#include <cmath>
+#include <cstdint>
+
 #ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
 #endif
@@ -118,6 +121,22 @@ class InsteonRF : public Component,
   void set_accepted_sensor(sensor::Sensor *s) { this->accepted_sensor_ = s; }
 #endif
 
+  // -- read-outs for the on-board display (placement survey)
+  bool radio_ok() const { return this->radio_ok_; }
+  float last_rssi() const { return this->last_rssi_; }
+  /// RSSI of the last capture that passed the gate, i.e. the last real
+  /// Insteon packet; NAN until one has.
+  float last_accepted_rssi() const { return this->last_accepted_rssi_; }
+  uint32_t total_captures() const { return this->captures_; }
+  uint32_t total_accepted() const { return this->accepted_; }
+  /// Counts over the previous whole minute, refreshed once a minute.
+  uint32_t captures_last_minute() const { return this->captures_last_minute_; }
+  uint32_t accepted_last_minute() const { return this->accepted_last_minute_; }
+  /// Milliseconds since the last accepted capture, or UINT32_MAX if none.
+  uint32_t ms_since_accepted() const {
+    return this->last_accepted_ms_ ? millis() - this->last_accepted_ms_ : UINT32_MAX;
+  }
+
  protected:
   // -- SX126x plumbing
   void wait_busy_(uint32_t timeout_ms = 100);
@@ -156,6 +175,11 @@ class InsteonRF : public Component,
   uint32_t last_minute_mark_{0};
   uint32_t captures_at_mark_{0};
   uint32_t accepted_at_mark_{0};
+  uint32_t captures_last_minute_{0};
+  uint32_t accepted_last_minute_{0};
+  float last_rssi_{NAN};
+  float last_accepted_rssi_{NAN};
+  uint32_t last_accepted_ms_{0};
   //: The first few captures are logged at INFO with their leading bytes, so
   //: bring-up can be judged from the log alone: are captures arriving, does
   //: the gate pass them, does the polarity look right.

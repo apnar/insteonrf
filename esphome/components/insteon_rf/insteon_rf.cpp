@@ -307,6 +307,9 @@ void InsteonRF::loop() {
     if (this->accepted_sensor_ != nullptr)
       this->accepted_sensor_->publish_state(this->accepted_ - this->accepted_at_mark_);
 #endif
+    // Kept for the display: the previous whole minute, not a rolling window.
+    this->captures_last_minute_ = this->captures_ - this->captures_at_mark_;
+    this->accepted_last_minute_ = this->accepted_ - this->accepted_at_mark_;
     this->captures_at_mark_ = this->captures_;
     this->accepted_at_mark_ = this->accepted_;
     this->last_minute_mark_ = now;
@@ -338,6 +341,7 @@ void InsteonRF::loop() {
 void InsteonRF::handle_capture_() {
   this->captures_++;
   const float rssi = this->read_rssi_();
+  this->last_rssi_ = rssi;
 
   // In continuous RX the chip advances its buffer pointer between packets,
   // so ask where this one starts rather than assuming the base address.
@@ -381,6 +385,8 @@ void InsteonRF::handle_capture_() {
 
   this->accepted_++;
   this->seq_++;
+  this->last_accepted_rssi_ = rssi;
+  this->last_accepted_ms_ = millis();
   this->publish_capture_(this->buffer_, len, rssi);
 }
 

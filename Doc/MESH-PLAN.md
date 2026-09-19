@@ -49,7 +49,9 @@ arithmetic, reading the RX buffer from offset 0 in continuous mode instead of
 Added for bring-up: RX gain boost, `sync_word:` and `preamble_detector_bits:`
 in YAML so the two unproven assumptions can be flipped over OTA, a
 polarity-agnostic Manchester gate so a flipped sync word needs no other
-change, and the first ten captures logged at INFO with their leading bytes.
+change, the first ten captures logged at INFO with their leading bytes, and
+the on-board OLED driven at last (RSSI bar, cap/ok per minute, age of the
+last packet, WiFi/MQTT flags) so the placement survey needs no laptop.
 Compiles clean; still never run on hardware.
 
 ### Findings that changed the design

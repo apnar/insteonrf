@@ -31,6 +31,16 @@ Pre-flash review of the ESPHome listener, with the Heltec LoRa 32 V3 in hand.
   gate verdict.
 - Pins verified against Meshtastic's `heltec_v3` variant: all seven match.
   Compiles clean for esp32-s3 under esp-idf. **Still never run on hardware.**
+- **The on-board OLED is now used.** Previously nothing drove it (Vext was
+  never switched on, so it sat dark). It shows the last real packet's RSSI
+  large with a -110..-50 dBm bar, captures and accepts over the previous
+  minute, the age of the last accepted packet, the lifetime count, and W/M
+  flags for WiFi and MQTT -- upper case when connected. A radio that fails
+  its boot-time readback shows `RADIO FAULT` instead. That is the placement
+  survey without a laptop: carry the board and watch the bar. OLED pins from
+  arduino-esp32's board definition (SDA 17, SCL 18, RST 21, Vext 36 active
+  low). Two lambda mistakes caught by the compiler and worth remembering:
+  a local named `rf` shadows `id(rf)`, and `id()` yields a pointer.
 
 ## 2.5.1 — 2026-09-15
 
