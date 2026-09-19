@@ -188,6 +188,13 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   silently. RTL-SDR Blog V4 needs the rtlsdrblog librtlsdr fork (installed in
   `/usr/local`) and `/etc/modprobe.d/blacklist-rtlsdr.conf`; gain 37.2 with squelch 12
   is right here (49.6 raises the floor to 6.8 and chatters).
+- **Soft decisions travel in the capture payload** (2.6.0): `s` is one signed byte per
+  bit of `b` (`±127` = clean), `snr` the symbol SNR. Only I/Q backends produce it;
+  `Capture.soft`/`Sighting.soft` are `None` for the boards and the dongle. Fusion votes
+  with confidence (hard copies vote `±1`) and tries the least-sure positions first when
+  the CRC fails, so **one soft copy alone can be repaired** while hard copies still need
+  two. `publish_capture` ships from just after the first header in either polarity and
+  says which in `sw` — an SDR burst starts with preamble, unlike a FIFO dump.
 - Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
   Assistant `mqtt.publish` service (no `mosquitto_pub` on the host or in the pod), e.g.
   payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.

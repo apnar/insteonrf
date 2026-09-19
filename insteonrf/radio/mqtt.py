@@ -27,6 +27,16 @@ matching header prepended; without it the default on-air header is used.
 Only ``b`` is required. ``n`` falls back to the last topic segment, which is
 where the node name really lives; the rest is metadata.
 
+**``s`` carries soft decisions**, when the receiver has them: base64 of one
+signed byte per bit of ``b`` (pad bits included), ``+127`` a clean ``1``,
+``-127`` a clean ``0``, values near zero a symbol the detector could not
+tell. Only an I/Q receiver (the ``rtlsdr``/``hackrf`` backends) can produce
+this; the SX1262 and the CC1111 are hardware demodulators and send hard
+bits, so ``s`` is absent from their captures and :class:`Capture.soft` is
+``None``. A capture whose ``s`` does not match ``b`` in length is kept as
+hard bits — the bits are still good, the confidence is not. ``snr`` (dB,
+symbol SNR the demodulator measured) is optional alongside it.
+
 This satisfies :class:`~insteonrf.radio.RadioBackend` so ``insteon-rf
 monitor`` and friends work against the mesh unchanged, but a caller that
 wants per-receiver RSSI should use :meth:`MqttReceiver.iter_captures`
@@ -44,8 +54,10 @@ import queue
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+import numpy as np
 
 from ..packet import START_HEADER, START_HEADER_INV
 
@@ -55,6 +67,8 @@ log = logging.getLogger(__name__)
 DEFAULT_PREFIX = "insteon-rf"
 #: Drop a capture whose payload is larger than this (a board is misbehaving).
 MAX_CAPTURE_BYTES = 4096
+#: One soft decision is a signed byte; this magnitude is "a clean symbol".
+SOFT_SCALE = 127
 
 
 def bits_from_bytes(data: bytes) -> str:
@@ -67,6 +81,23 @@ def bytes_from_bits(bits: str) -> bytes:
     pad = (-len(bits)) % 8
     padded = bits + "0" * pad
     return bytes(int(padded[i : i + 8], 2) for i in range(0, len(padded), 8))
+
+
+def soft_to_bytes(soft: np.ndarray[Any, Any]) -> bytes:
+    """Quantise per-symbol confidence to signed bytes (``±SOFT_SCALE`` = clean)."""
+    q = np.clip(np.rint(np.asarray(soft, dtype=np.float32) * SOFT_SCALE), -SOFT_SCALE, SOFT_SCALE)
+    return q.astype(np.int8).tobytes()
+
+
+def soft_from_bytes(data: bytes) -> np.ndarray[Any, Any]:
+    """Inverse of :func:`soft_to_bytes`: float32 confidence in ``[-1, 1]``."""
+    return np.frombuffer(data, dtype=np.int8).astype(np.float32) / SOFT_SCALE
+
+
+def hard_soft(bits: str) -> np.ndarray[Any, Any]:
+    """``±1`` per bit — the confidence of a bit that is simply known."""
+    a = np.frombuffer(bits.encode("ascii"), dtype=np.uint8)
+    return np.where(a == ord("1"), 1.0, -1.0).astype(np.float32)
 
 
 def with_sync_header(bits: str, sync_word: int | None = None) -> str:
@@ -103,6 +134,11 @@ class Capture:
     micros: int | None = None
     #: The sync word the board matched on, when it said.
     sync_word: int | None = None
+    #: Per-symbol signed confidence aligned with ``bits`` (header included,
+    #: at full confidence), or ``None`` for a hard-bit receiver.
+    soft: np.ndarray[Any, Any] | None = field(default=None, repr=False)
+    #: Symbol SNR the demodulator measured, when it said.
+    snr_db: float | None = None
 
     @classmethod
     def from_payload(cls, topic: str, payload: bytes) -> Capture | None:
@@ -161,14 +197,37 @@ class Capture:
             except ValueError:
                 log.warning("capture on %s has an unparsable sw %r", topic, sw)
 
+        fifo = bits_from_bytes(raw)
+        bits = with_sync_header(fifo, sync_word)
+
+        soft: np.ndarray[Any, Any] | None = None
+        blob_s = rec.get("s")
+        if isinstance(blob_s, str):
+            try:
+                raw_s = base64.b64decode(blob_s, validate=True)
+            except (binascii.Error, ValueError) as err:
+                log.warning("capture on %s has soft decisions that are not base64: %r", topic, err)
+                raw_s = b""
+            if len(raw_s) == len(fifo):
+                # The header the host put back is known, so it is certain.
+                prefix = hard_soft(bits[: len(bits) - len(fifo)])
+                soft = np.concatenate([prefix, soft_from_bytes(raw_s)])
+            elif raw_s:
+                log.warning("capture on %s: %d soft values for %d bits; using hard bits",
+                            topic, len(raw_s), len(fifo))
+
+        snr = rec.get("snr")
+
         return cls(
             receiver=name,
-            bits=with_sync_header(bits_from_bytes(raw), sync_word),
+            bits=bits,
             timestamp=when,
             rssi_dbm=float(rssi) if isinstance(rssi, (int, float)) else None,
             seq=int(seq) if isinstance(seq, int) else None,
             micros=int(micros) if isinstance(micros, int) else None,
             sync_word=sync_word,
+            soft=soft,
+            snr_db=float(snr) if isinstance(snr, (int, float)) else None,
         )
 
 

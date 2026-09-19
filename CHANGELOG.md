@@ -4,6 +4,60 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.6.0 — 2026-09-19
+
+Soft decisions reach the mesh. Until now an I/Q receiver's per-symbol
+confidence — the ~3 dB that `recover.py` has had since 2.2.0 — stopped at the
+host that demodulated it: the capture payload carried bits only, and fusion
+voted hard copies. Both ends now speak confidence, so the RTL-SDR V4 (or any
+`rtlsdr`/`hackrf` backend) joins the mesh as more than another hard receiver.
+
+- **Capture payload: optional `s` and `snr`.** `s` is base64 of one signed
+  byte per bit of `b` (pad bits included), `+127` a clean `1`, `-127` a
+  clean `0`, near zero a symbol the detector could not tell; `snr` is the
+  demodulator's symbol SNR in dB. `Capture.from_payload` keeps a capture
+  whose `s` does not match `b` in length as hard bits (with a warning) — the
+  bits are still good, the confidence is not — and gives the restored sync
+  header full confidence, since the host knows what it put back. Boards and
+  the dongle publish neither field; `Capture.soft` is `None` for them.
+- **`MqttPublisher.publish_capture` takes `soft=` and `snr_db=`**, and now
+  ships every capture from just after the *first* header it finds, in
+  either polarity, naming that header in `sw`. An SDR burst begins with
+  preamble and its header can sit at any offset, so the old "strip a
+  leading inverted header" only fitted the dongle; the consumer would have
+  prepended a second header in front of the preamble. `monitor
+  --mesh-capture NAME --backend rtlsdr` publishes bits, confidence and SNR.
+- **Fusion votes with confidence.** `Sighting.soft` (aligned with
+  `Sighting.bits`, sign-flipped with the polarity normalisation) is each
+  copy's vote; a hard copy votes `±1`. `_vote` returns a `Vote` — bits,
+  hard disagreements, and the per-position mean margin. When the vote
+  still fails the CRC and a soft copy is present, the suspects are the
+  `MAX_DISAGREEMENTS` least-sure positions inside the packet's extent,
+  tried least-sure first, with any hard disagreement folded in; hard-only
+  copies keep the old disagreement-driven search unchanged. **One soft copy
+  alone is now enough to attempt repair** — the single-receiver case hard
+  bits could never try — so a lone V4 capture damaged in two symbols comes
+  out of the mesh as a `combined` event (`combined_from: 1`). Every
+  candidate still has to pass CRC *and* the frame-index counters.
+- **`MqttPublisher` says when the broker refuses it.** Everything it sends is
+  QoS 0, and paho drops a QoS-0 publish made while disconnected without a
+  word, so a refused login looked like "21 captures published" with nothing
+  arriving (this broker rejects anonymous clients; the pods carry
+  credentials, a host-side run needs `--mqtt-user`/`--mqtt-pass`). The
+  connect callback now logs a warning naming the reason.
+- Measured on the first V4 captures carrying `s` (12 captures, symbol SNR
+  11–23 dB): inside a decoded packet at 22 dB, mean confidence 0.98 with
+  every symbol above 0.9; at 11 dB, mean 0.68 with 23% of symbols below
+  0.5 — the region where a confidence-ordered repair has something to
+  work with and a hard receiver has nothing.
+- Tests: confidence alignment and polarity flip, single-copy repair, a
+  confident wrong symbol is *not* repaired from one copy, a hard copy
+  outvotes a doubtful soft symbol, suspects tried least-sure first,
+  end-to-end through `Fusion`, misaligned confidence dropped; payload
+  parsing of `s`/`snr`, wrong-length and non-base64 `s`, and a round trip
+  through the publisher from an SDR-style burst (preamble kept, header
+  found, confidence re-aligned). 374 tests.
+
 ## 2.5.5 — 2026-09-19
 
 The RTL-SDR Blog V4 that was lying around, plugged into the host with a bare

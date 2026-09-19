@@ -216,28 +216,42 @@ occur, fall back to a preamble-only sync word (repeating `0x66`, which matches
 the inverted stream too, just at a 2-bit offset) and resolve polarity in
 software, accepting more false syncs for §3.4 to absorb.
 
-### 3.3 What no deployed receiver has yet: soft decisions
+### 3.3 Soft decisions: only from I/Q, and now in the mesh (2.6.0)
 
-Both deployed receivers give hard bits — the SX1262, and the CC1111 in the
-rfcat dongle too. `cli._receive` says it in one line: *"a hardware
-demodulator (the rfcat dongle) can only give hard bits; the numpy SDR path
-also returns per-symbol confidence."* `Burst.soft` and everything
-`recover.py` builds on it — Manchester soft combining, the CRC-guided
-bounded repair, the ~3 dB measured in 2.2.0 — come from I/Q samples, so
-today they exist only for the `rtlsdr`/`hackrf` backends and file replay,
-none of which is in the mesh. An earlier draft of this plan said the dongle
-had them; it did not. Two compensations for a hard-bit mesh:
+Both boards-class receivers give hard bits — the SX1262, and the CC1111 in
+the rfcat dongle too. `Burst.soft` and everything `recover.py` builds on it
+— Manchester soft combining, the CRC-guided bounded repair, the ~3 dB
+measured in 2.2.0 — come from I/Q samples, so they exist only for the
+`rtlsdr`/`hackrf` backends and file replay. An earlier draft of this plan
+said the dongle had them; it did not.
 
-- Spatial diversity is worth more than 3 dB for "did anyone hear it".
-- With 3+ receivers, **cross-receiver bit combining** recovers some of it
-  (§6.5).
+Since 2.6.0 the confidence travels: `monitor --backend rtlsdr --mesh-capture
+v4` publishes `s` (one signed byte per bit, `±127` = a clean symbol) and
+`snr` alongside `b`, `Capture.soft` carries it into `Sighting.soft`, and
+`combine()` votes with it. Three consequences:
 
-Keep the dongle. On the first day it decoded whole packets the Heltec flipped
-bits in (0 of 10 first packets damaged against 4 of 10 at the same spot), so
-it is the better demodulator on this network today; the Heltecs are the
-distributed ones. Real soft decisions need an SDR front end — an RTL-SDR on
-the host already runs the existing `rtlsdr` backend — plus a capture payload
-that carries per-symbol confidence, which does not exist yet.
+- **A hard copy and a soft copy combine sensibly.** Each copy votes with its
+  confidence — the dongle's bits at `±1`, the V4's at whatever the matched
+  filter measured — so a symbol the V4 was unsure of loses to one the dongle
+  was sure of, and vice versa where the dongle's bit is the lone dissenter
+  against a confident V4 symbol.
+- **When the vote still fails the CRC, the suspects are the least-sure
+  positions**, inside the packet, tried least-sure first. That covers both a
+  disagreement between receivers (its margin is small) and a symbol the I/Q
+  receiver itself flagged. Hard-only groups keep the disagreement-driven
+  search of 2.5.0 unchanged.
+- **One soft copy alone can be repaired.** Hard copies need two to have any
+  suspects at all; a lone V4 capture damaged in two symbols comes out as a
+  `combined` event with `combined_from: 1`. This is the local repair the
+  `monitor` already did on the host, now done in fusion where the result
+  can also be checked against what the PLM heard.
+
+What does not change: spatial diversity is still worth more than 3 dB for
+"did anyone hear it", every candidate still needs CRC *and* frame counters,
+and the V4's weakness in §3.7 — overlapping simulcast copies that the
+matched filter cannot frame — produces no capture at all, so there is no
+confidence to vote with. The dongle's sync correlator remains the better
+receiver for those.
 
 ### 3.4 The on-board validity gate
 
@@ -414,11 +428,10 @@ log (`healing the radio` / `dongle back up`) and in the next day's gap
 list; if it does not, the Heltec is the better reference clock for
 "is the air quiet or is the dongle deaf" and the watchdog should ask it.
 
-**If the V4 joins the mesh:** `monitor --backend rtlsdr --mesh-capture v4`
-publishes its bursts like any board (hard bits, since the capture payload
-has no soft field yet — §3.3). It would be the receiver with the most
-copies at this spot, and the first whose soft decisions *could* reach
-fusion once the payload carries them. Adding the Uputronics filter/preamp
+**The V4 in the mesh:** `monitor --backend rtlsdr --mesh-capture v4`
+publishes its bursts like any board, plus per-symbol confidence and SNR
+(§3.3, 2.6.0). It is the receiver with the most copies at this spot and the
+only one fusion can repair on its own. Adding the Uputronics filter/preamp
 (§3.4b) is the next hardware step; the collision behaviour above will not
 change with it.
 

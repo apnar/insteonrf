@@ -155,9 +155,24 @@ class MqttPublisher:
                        else mqtt.Client(client_id=client_id))
         if username:
             self.client.username_pw_set(username, password)
+        # Everything here is QoS 0, and paho drops a QoS-0 publish made while
+        # not connected without a word — so a refused connection looks like
+        # "21 captures published" and nothing arriving. Say so, loudly.
+        self.client.on_connect = self._on_connect
         self.client.connect_async(host, port)
         self.client.loop_start()
         log.info("publishing to mqtt://%s:%d/%s", host, port, self.topic)
+
+    def _on_connect(self, client: Any, userdata: Any, flags: Any, reason: Any,
+                    properties: Any = None) -> None:
+        failed = getattr(reason, "is_failure", None)
+        if failed is None:  # paho 1.x hands over a plain integer
+            failed = reason != 0
+        if failed:
+            log.warning("mqtt broker refused the connection (%s); nothing published "
+                        "reaches it — check --mqtt-user/--mqtt-pass", reason)
+        else:
+            log.info("mqtt connected")
 
     def publish(self, record: dict[str, Any]) -> None:
         """Publish one packet record, unless configured for alerts only."""
@@ -173,27 +188,39 @@ class MqttPublisher:
 
     def publish_capture(self, bits: str, *, receiver: str, timestamp: float,
                         rssi_dbm: float | None = None, seq: int = 0,
-                        topic: str | None = None) -> None:
+                        topic: str | None = None, soft: Any = None,
+                        snr_db: float | None = None) -> None:
         """Publish a raw burst in the listener-board capture format.
 
-        This is what lets the rfcat dongle act as a member of the listener
-        mesh: ``insteon-rf mesh`` consumes ``<prefix>/rx/<node>`` and does not
-        care whether the bytes came from an ESP32 or from USB. The dongle gives
-        hard bits, like the SX1262 -- soft decisions come only from the I/Q
-        path -- but it is an independent second radio, and on the first day
-        it decoded whole packets the Heltec flipped bits in.
+        This is what lets a host radio act as a member of the listener mesh:
+        ``insteon-rf mesh`` consumes ``<prefix>/rx/<node>`` and does not care
+        whether the bytes came from an ESP32, from the rfcat dongle or from an
+        SDR. ``soft`` is the I/Q path's per-symbol confidence
+        (:attr:`~insteonrf.dsp.Burst.soft`), aligned with ``bits``; it goes
+        out as ``s`` and is what makes an SDR worth more to fusion than its
+        hard bits. Hardware demodulators pass ``None`` and publish bits only.
         """
         import base64
 
-        from .packet import START_HEADER_INV
-        from .radio.mqtt import bytes_from_bits
+        from .packet import START_HEADER, START_HEADER_INV
+        from .radio.mqtt import bytes_from_bits, soft_to_bytes
 
         # The capture contract is FIFO content *after* the sync word, and the
         # consumer puts the header back. receive_bits() has already prepended
-        # the CC1111's consumed header, so take it off again here rather than
-        # ship a capture in a different shape from the boards'.
-        if bits.startswith(START_HEADER_INV):
-            bits = bits[len(START_HEADER_INV):]
+        # the CC1111's consumed header, and an SDR burst starts with preamble
+        # and carries its header in either polarity; either way, ship from
+        # just after the first header and say which one it was, so the
+        # consumer restores the same bits in the same polarity.
+        header = START_HEADER_INV
+        pos = bits.find(START_HEADER_INV)
+        alt = bits.find(START_HEADER)
+        if alt != -1 and (pos == -1 or alt < pos):
+            header, pos = START_HEADER, alt
+        if pos != -1:
+            cut = pos + len(header)
+            bits = bits[cut:]
+            if soft is not None:
+                soft = soft[cut:]
         payload = {
             "n": receiver,
             "seq": seq,
@@ -201,9 +228,15 @@ class MqttPublisher:
             "rssi": rssi_dbm,
             "len": (len(bits) + 7) // 8,
             # What this radio synchronised on: the 16-bit on-air start header.
-            "sw": f"{int(START_HEADER_INV, 2):04X}",
+            "sw": f"{int(header, 2):04X}",
             "b": base64.b64encode(bytes_from_bits(bits)).decode("ascii"),
         }
+        if soft is not None and len(soft) >= len(bits):
+            pad = (-len(bits)) % 8
+            quant = soft_to_bytes(soft[: len(bits)]) + bytes(pad)
+            payload["s"] = base64.b64encode(quant).decode("ascii")
+        if snr_db is not None:
+            payload["snr"] = round(float(snr_db), 1)
         self.client.publish(topic or f"{self.topic}/rx/{receiver}",
                             json.dumps(payload, separators=(",", ":")), qos=0)
         self.captures += 1

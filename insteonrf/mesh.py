@@ -309,7 +309,8 @@ class MeshService:
         """Decode one capture into sightings. Returns how many packets it held."""
         self.captures += 1
         found = sightings_from_capture(
-            cap.bits, cap.receiver, rssi_dbm=cap.rssi_dbm, timestamp=cap.timestamp
+            cap.bits, cap.receiver, rssi_dbm=cap.rssi_dbm, timestamp=cap.timestamp,
+            soft=cap.soft,
         )
         for s in found:
             self.tracker.observe(s.packet)

@@ -176,22 +176,25 @@ def _keep(packets: list[Packet], show_all: bool) -> list[Packet]:
     return packets if show_all else [q for q in packets if q.calc_crc is not None]
 
 
-def _receive(radio: Any, timeout_ms: int) -> tuple[float, str, Any, int | None] | None:
+def _receive(radio: Any, timeout_ms: int
+             ) -> tuple[float, str, Any, int | None, float | None] | None:
     """One burst from any backend, keeping soft decisions where they exist.
 
     A hardware demodulator (the rfcat dongle) can only give hard bits; the
-    numpy SDR path also returns per-symbol confidence and the located frame
-    grid, which :func:`_decode` puts to work.
+    numpy SDR path also returns per-symbol confidence, the located frame
+    grid and the measured symbol SNR, which :func:`_decode` and the mesh
+    capture put to work.
     """
     if hasattr(radio, "receive_burst"):
         burst = radio.receive_burst(timeout_ms)
         if burst is None:
             return None
-        return (burst.timestamp or time.time(), burst.bits, burst.soft, burst.header_index)
+        return (burst.timestamp or time.time(), burst.bits, burst.soft, burst.header_index,
+                burst.snr_db)
     got = radio.receive_bits(timeout_ms)
     if got is None:
         return None
-    return got[0], got[1], None, None
+    return got[0], got[1], None, None, None
 
 
 def _decode(bits: str, ts: float | None, *, repair: bool = True, show_all: bool = False,
@@ -309,7 +312,7 @@ def recv_main(argv: list[str] | None = None) -> int:
                     if getattr(radio, "exhausted", False):
                         break
                     continue  # nothing on the air within the timeout
-                ts, bits, soft, header_index = got
+                ts, bits, soft, header_index, _snr = got
                 if a.decode:
                     pkts = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
                                    soft=soft, header_index=header_index, tracker=tracker)
@@ -828,14 +831,15 @@ def monitor_main(argv: list[str] | None = None) -> int:
                 else:
                     last_block = time.time()
                 if got is not None:
-                    ts, bits, soft, header_index = got
+                    ts, bits, soft, header_index, snr_db = got
                     rssi = None
                     if not a.no_rssi and hasattr(radio, "read_rssi"):
                         rssi = radio.read_rssi()
                     if a.mesh_capture and mqtt is not None:
                         capture_seq += 1
                         mqtt.publish_capture(bits, receiver=a.mesh_capture, timestamp=ts,
-                                             rssi_dbm=rssi, seq=capture_seq)
+                                             rssi_dbm=rssi, seq=capture_seq, soft=soft,
+                                             snr_db=snr_db)
                     for pkt in _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
                                        soft=soft, header_index=header_index, tracker=tracker):
                         pkt.rssi_dbm = rssi

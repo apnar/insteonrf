@@ -17,7 +17,7 @@ import pytest
 
 from insteonrf.inject import Injector, Tier
 from insteonrf.mesh import MeshService, MissTable
-from insteonrf.packet import START_HEADER, START_HEADER_INV, Packet
+from insteonrf.packet import START_HEADER, START_HEADER_INV, Packet, parse_bits
 from insteonrf.plm import to_plm_bytes
 from insteonrf.radio.mqtt import (
     MAX_CAPTURE_BYTES,
@@ -519,3 +519,117 @@ def test_the_service_takes_the_plm_address_from_the_injector():
     svc = MeshService(FakeReceiver(), injector=inj, plm=FakePlm())
     assert svc.misses.plm_addr is not None
     assert str(svc.misses.plm_addr) == PLM
+
+
+# --------------------------------------------------------------------------- soft decisions
+
+
+def soft_payload(raw: bytes, soft_bytes: bytes | None, **over) -> bytes:
+    rec = json.loads(payload(raw, **over))
+    if soft_bytes is not None:
+        rec["s"] = base64.b64encode(soft_bytes).decode()
+    return json.dumps(rec).encode()
+
+
+def test_soft_field_becomes_aligned_confidence_with_a_certain_header():
+    import numpy as np
+
+    raw = capture_bytes()
+    fifo = bits_from_bytes(raw)
+    quant = bytes(127 if b == "1" else -127 & 0xFF for b in fifo)
+    cap = Capture.from_payload("insteon-rf/rx/v4", soft_payload(raw, quant, snr=17.3))
+    assert cap is not None
+    assert cap.soft is not None
+    assert len(cap.soft) == len(cap.bits)
+    assert cap.snr_db == 17.3
+    header = cap.bits[: len(cap.bits) - len(fifo)]
+    assert header == START_HEADER_INV
+    # The restored header is known, so it votes at full confidence.
+    assert (np.abs(cap.soft[: len(header)]) == 1.0).all()
+    for i, b in enumerate(cap.bits):
+        assert (cap.soft[i] > 0) == (b == "1")
+
+
+def test_soft_of_the_wrong_length_is_ignored_but_the_bits_are_kept():
+    raw = capture_bytes()
+    cap = Capture.from_payload("insteon-rf/rx/v4", soft_payload(raw, b"\x7f" * 3))
+    assert cap is not None
+    assert cap.soft is None
+    assert parse_bits(cap.bits)[0].crc_ok is True
+
+
+def test_soft_that_is_not_base64_is_ignored():
+    raw = capture_bytes()
+    rec = json.loads(payload(raw))
+    rec["s"] = "not base64!"
+    cap = Capture.from_payload("insteon-rf/rx/v4", json.dumps(rec).encode())
+    assert cap is not None and cap.soft is None
+
+
+def test_a_hard_capture_has_no_confidence():
+    cap = Capture.from_payload("insteon-rf/rx/up", payload(capture_bytes()))
+    assert cap is not None and cap.soft is None and cap.snr_db is None
+
+
+def test_soft_round_trip_through_the_publisher(monkeypatch):
+    """An SDR burst — preamble, header, packet — goes out from just after the
+    header with its confidence alongside, and comes back aligned."""
+    import sys
+    import types
+
+    import numpy as np
+
+    from insteonrf.monitor import MqttPublisher
+
+    sent = []
+
+    class FakeClient:
+        def __init__(self, client_id=None):
+            pass
+
+        def connect_async(self, host, port):
+            pass
+
+        def loop_start(self):
+            pass
+
+        def loop_stop(self):
+            pass
+
+        def disconnect(self):
+            pass
+
+        def publish(self, topic, payload, qos=0, retain=False):
+            sent.append((topic, payload))
+
+    fake = types.ModuleType("paho.mqtt.client")
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "paho", types.ModuleType("paho"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt", types.ModuleType("paho.mqtt"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt.client", fake)
+
+    p = Packet.build(DEV, group=1, bcast=True, cmd1=0x11, cmd2=0xFF)
+    burst = "0101010101" + p.to_bits()          # an SDR burst keeps the preamble
+    soft = np.where(np.frombuffer(burst.encode(), dtype=np.uint8) == ord("1"), 0.9, -0.9
+                    ).astype(np.float32)
+    soft[len(burst) // 2] = 0.02                 # one doubtful symbol
+
+    pub = MqttPublisher("broker", 1883, "insteon-rf")
+    pub.publish_capture(burst, receiver="v4", timestamp=1789844000.5, rssi_dbm=None,
+                        seq=3, soft=soft, snr_db=15.26)
+    (topic, body), = sent
+    assert topic == "insteon-rf/rx/v4"
+    rec = json.loads(body)
+    assert rec["sw"] == "3155" and rec["snr"] == 15.3 and "s" in rec
+
+    cap = Capture.from_payload(topic, body.encode())
+    assert cap is not None and cap.soft is not None
+    assert cap.receiver == "v4" and cap.snr_db == 15.3
+    # Back to a header-led stream the parser decodes, confidence aligned.
+    assert cap.bits.startswith(START_HEADER_INV)
+    assert parse_bits(cap.bits)[0].crc_ok is True
+    hdr = burst.find(START_HEADER_INV) + len(START_HEADER_INV)
+    doubtful = len(burst) // 2 - hdr + len(START_HEADER_INV)
+    assert abs(cap.soft[doubtful]) < 0.05
+    for i, b in enumerate(cap.bits[:300]):
+        assert (cap.soft[i] > 0) == (b == "1")

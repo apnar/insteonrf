@@ -315,3 +315,116 @@ def test_to_dict_carries_the_mesh_fields():
     assert d["heard_by"]["far"]["rssi_dbm"] == -98
     assert d["plm_saw_it"] is None
     assert d["from"] == DEV  # the normal packet schema is still there
+
+
+# --------------------------------------------------------------------------- soft decisions
+
+
+def soft_sight(receiver="v4", *, damage=(), doubt=(), unsure=0.05, timestamp=None,
+               invert=False, **kw) -> Sighting:
+    """An I/Q receiver's sighting: hard bits plus per-symbol confidence.
+
+    ``damage`` flips bits; ``doubt`` marks positions the detector was unsure
+    of (confidence ``unsure``) without flipping them. ``invert`` presents the
+    capture in the other polarity, as a receiver that matched the inverted
+    sync word would.
+    """
+    import numpy as np
+
+    bits = list(capture(**kw))
+    for i in damage:
+        bits[i] = "0" if bits[i] == "1" else "1"
+    stream = "".join(bits)
+    soft = np.where(np.frombuffer(stream.encode(), dtype=np.uint8) == ord("1"), 1.0, -1.0
+                    ).astype(np.float32)
+    for i in list(damage) + list(doubt):
+        soft[i] *= unsure
+    if invert:
+        stream = "".join("0" if b == "1" else "1" for b in stream)
+        soft = -soft
+    got = sightings_from_capture(stream, receiver, timestamp=timestamp, soft=soft)
+    assert got, "fixture must decode"
+    return got[0]
+
+
+def test_a_soft_sighting_carries_confidence_aligned_with_its_bits():
+    s = soft_sight(doubt=[200])
+    assert s.soft is not None
+    assert len(s.soft) >= len(s.bits)
+    # Positive means '1', and the doubtful symbol is the small one. The
+    # sighting starts at the header, so stream position 200 moves up by the
+    # preamble the capture began with.
+    off = len(capture()) - len(s.bits)
+    for i in (150, 199, 201):
+        assert (s.soft[i] > 0) == (s.bits[i] == "1")
+    assert abs(s.soft[200 - off]) < 0.1
+
+
+def test_polarity_normalisation_flips_the_confidence_too():
+    a = soft_sight(doubt=[200])
+    b = soft_sight(doubt=[200], invert=True)
+    assert a.bits == b.bits
+    assert (a.soft[:400] == b.soft[:400]).all()
+
+
+def test_one_soft_copy_alone_can_be_repaired():
+    """The single-receiver case that hard bits cannot attempt."""
+    s = soft_sight(damage=[200, 230])
+    assert s.packet.crc_ok is not True
+    got = combine([s])
+    assert got is not None
+    packet, n = got
+    assert n == 1
+    assert packet.crc_ok is True
+    assert message_key(packet) == message_key(pkt())
+
+
+def test_a_confident_wrong_symbol_is_not_repaired_from_one_copy():
+    """Confidence is the only clue a single copy gives; a wrong bit the
+    detector was sure of is not among the suspects, so no packet is
+    manufactured for it — MAX_DISAGREEMENTS least-sure positions are tried
+    and the CRC plus frame counters still have to agree."""
+    s = soft_sight(damage=[200], unsure=1.0)
+    got = combine([s])
+    assert got is None or message_key(got[0]) == message_key(pkt())
+
+
+def test_a_hard_copy_outvotes_a_doubtful_soft_symbol():
+    """The dongle is sure, the SDR is not: the SDR's wrong bit loses without
+    any flipping."""
+    hard = sight("dongle", damage=[260])
+    soft = soft_sight("v4", damage=[200, 230])  # wrong where it was unsure
+    got = combine([hard, soft])
+    assert got is not None
+    packet, n = got
+    assert n == 2
+    assert packet.crc_ok is True
+    assert message_key(packet) == message_key(pkt())
+
+
+def test_soft_suspects_are_tried_least_sure_first():
+    """Two damaged symbols, one wrong hard copy elsewhere: the least-sure
+    positions are the damaged ones and the pair is found within the flip
+    budget."""
+    hard = sight("dongle", damage=[300])
+    soft = soft_sight("v4", damage=[200, 230], unsure=0.2, doubt=[150, 170, 190])
+    got = combine([hard, soft])
+    assert got is not None
+    assert got[0].crc_ok is True
+
+
+def test_fusion_repairs_a_lone_soft_sighting_end_to_end():
+    f = Fusion()
+    f.add(soft_sight(damage=[200, 230], timestamp=100.0))
+    (e,) = f.pop_ready(103.0)
+    assert e.combined is True
+    assert e.combined_from == 1
+    assert e.packet.crc_ok is True
+    assert message_key(e.packet) == message_key(pkt())
+
+
+def test_misaligned_confidence_is_dropped_not_trusted():
+    import numpy as np
+
+    s = Sighting(pkt(), "v4", soft=np.zeros(10, dtype=np.float32))
+    assert s.soft is None

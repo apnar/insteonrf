@@ -25,10 +25,15 @@ second button press, is a real event. It is told apart by arriving after the
 bucket for that key has already closed, and comes out with ``repeat_index``
 set rather than being silently absorbed.
 
-:meth:`Fusion.combine` is the multi-receiver substitute for the soft
-decisions an SX1262 cannot give. Thermal noise at different locations is
-independent, so majority-voting the bits of several failed copies recovers
-packets no single receiver got. Every combined candidate still has to satisfy
+:func:`combine` is where several receivers become more than one. Thermal
+noise at different locations is independent, so voting the bits of several
+failed copies recovers packets no single receiver got. A hardware
+demodulator (SX1262, CC1111) contributes its bits as ``±1`` votes; an I/Q
+receiver contributes its per-symbol confidence (:attr:`Sighting.soft`), so a
+symbol it was unsure of is outvoted by one a hard receiver was sure of, and
+the least confident positions are the first to be tried when the vote still
+fails the CRC. One soft copy on its own is enough to attempt repair; hard
+copies need at least two. Every combined candidate still has to satisfy
 *both* CRC and the frame-index counters — an 8-bit CRC accepts one random
 candidate in 256, so combining without the index check would manufacture
 plausible-looking messages, and these get fed to a real protocol stack.
@@ -42,9 +47,14 @@ from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any
 
+import numpy as np
+
 from .packet import (
+    EXT_LEN,
+    FLAG_EXT,
     FRAME_BITS,
     MARKER_OFFSET,
+    STD_LEN,
     Packet,
     decode_frames,
     find_headers,
@@ -90,10 +100,22 @@ class Sighting:
     rssi_dbm: float | None = None
     timestamp: float | None = None
     bits: str = ""
+    #: Per-symbol signed confidence aligned with ``bits`` (positive = ``1``,
+    #: ``±1`` a clean symbol), from an I/Q receiver; ``None`` for hard bits.
+    soft: np.ndarray[Any, Any] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.bits:
             self.bits = self.packet.bits
+        if self.soft is not None and len(self.soft) < len(self.bits):
+            self.soft = None  # misaligned confidence is worse than none
+
+    def votes(self) -> np.ndarray[Any, Any]:
+        """This copy's contribution to a vote: its confidence, or ``±1``."""
+        if self.soft is not None:
+            return np.asarray(self.soft[: len(self.bits)], dtype=np.float32)
+        a = np.frombuffer(self.bits.encode("ascii"), dtype=np.uint8)
+        return np.where(a == ord("1"), 1.0, -1.0).astype(np.float32)
 
     @property
     def when(self) -> float:
@@ -111,6 +133,7 @@ def sightings_from_capture(
     rssi_dbm: float | None = None,
     timestamp: float | None = None,
     min_bytes: int = 4,
+    soft: np.ndarray[Any, Any] | None = None,
 ) -> list[Sighting]:
     """Every packet in one receiver's capture, each with its aligned bits.
 
@@ -119,8 +142,18 @@ def sightings_from_capture(
     the start of the next hop. Each returned sighting carries the capture from
     its own header onwards, which is the aligned substrate
     :func:`combine` votes over.
+
+    ``soft`` is per-symbol confidence aligned with ``capture`` (no surrounding
+    whitespace, then). The capture is polarity-normalised here, and the
+    confidence follows: a flipped stream means every sign flips.
     """
-    bits, offsets = find_headers(capture.strip())
+    stream = capture.strip()
+    bits, offsets = find_headers(stream)
+    conf: np.ndarray[Any, Any] | None = None
+    if soft is not None and len(soft) >= len(stream):
+        conf = np.asarray(soft[: len(stream)], dtype=np.float32)
+        if bits != stream:
+            conf = -conf
     out = []
     for pos in offsets:
         data, idx = decode_frames(bits, pos + MARKER_OFFSET)
@@ -131,7 +164,8 @@ def sightings_from_capture(
                      complete=bool(idx) and idx[-1] == 0)
         pkt.index_ok = indexes_ok(data, idx)
         pkt.rssi_dbm = rssi_dbm
-        out.append(Sighting(pkt, receiver, rssi_dbm, timestamp, bits[pos:]))
+        out.append(Sighting(pkt, receiver, rssi_dbm, timestamp, bits[pos:],
+                            soft=None if conf is None else conf[pos:]))
     return out
 
 
@@ -227,8 +261,20 @@ def hamming(a: str, b: str, limit: int | None = None) -> int | None:
     return d
 
 
-def _vote(sightings: list[Sighting]) -> tuple[str, list[int]] | None:
-    """Majority-vote the aligned bit strings; return ``(bits, disagreements)``.
+@dataclass
+class Vote:
+    """The outcome of voting aligned copies: bits, and how sure each one is."""
+
+    bits: str
+    #: Positions where the copies' hard decisions disagreed.
+    disagree: list[int]
+    #: Per position, the mean signed vote — ``|margin|`` near 1 is unanimous
+    #: and confident, near 0 is a coin toss.
+    margin: np.ndarray[Any, Any]
+
+
+def _vote(sightings: list[Sighting]) -> Vote | None:
+    """Vote the aligned copies; needs two, or one that carries confidence.
 
     ``Packet.bits`` always starts at the start header and in normalised
     polarity (see :func:`~insteonrf.packet.find_headers`), so copies of one
@@ -238,26 +284,45 @@ def _vote(sightings: list[Sighting]) -> tuple[str, list[int]] | None:
     the shortest copy. That matters: a corrupted Manchester pair makes
     ``decode_frames`` stop early, so a damaged copy is often *shorter*, and
     truncating the vote to it would throw away the CRC region and guarantee
-    failure.
+    failure. Each copy votes with its confidence — ``±1`` from a hard
+    receiver, ``[-1, 1]`` from an I/Q one — so a soft copy's doubtful symbol
+    is outweighed by a hard copy's certain one.
     """
-    runs = [s.bits for s in sightings if s.bits]
-    if len(runs) < 2:
+    runs = [s for s in sightings if s.bits]
+    if not runs or (len(runs) < 2 and runs[0].soft is None):
         return None
-    width = max(len(r) for r in runs)
+    width = max(len(s.bits) for s in runs)
     if width == 0:
         return None
-    out = []
-    disagree = []
-    for i in range(width):
-        here = [r[i] for r in runs if i < len(r)]
-        ones = here.count("1")
-        if ones * 2 != len(here):
-            out.append("1" if ones * 2 > len(here) else "0")
-        else:
-            out.append(here[0])
-        if ones not in (0, len(here)):
-            disagree.append(i)
-    return "".join(out), disagree
+    total = np.zeros(width, dtype=np.float32)
+    count = np.zeros(width, dtype=np.int32)
+    ones = np.zeros(width, dtype=np.int32)
+    first = np.zeros(width, dtype=np.int8)
+    for s in runs:
+        v = s.votes()
+        n = len(v)
+        total[:n] += v
+        count[:n] += 1
+        hard = (v > 0).astype(np.int32)
+        ones[:n] += hard
+        first[:n] = np.where(count[:n] == 1, hard, first[:n])
+    margin = total / np.maximum(count, 1)
+    decided = np.where(margin > 0, 1, np.where(margin < 0, 0, first)).astype(np.int8)
+    bits = "".join("1" if b else "0" for b in decided)
+    disagree = [int(i) for i in np.flatnonzero((ones > 0) & (ones < count))]
+    return Vote(bits, disagree, margin)
+
+
+def _packet_extent(bits: str) -> int:
+    """How many bits from the header a packet of these bits occupies.
+
+    Read from the flags byte when the first frame survived; a standard
+    packet when it did not — the guess that keeps repair inside the region
+    where a wrong bit can matter.
+    """
+    data, _ = decode_frames(bits, MARKER_OFFSET)
+    frames = EXT_LEN if data and data[0] & FLAG_EXT else STD_LEN
+    return MARKER_OFFSET + FRAME_BITS * frames
 
 
 def _accept(bits: str, timestamp: float | None) -> Packet | None:
@@ -273,29 +338,48 @@ def _accept(bits: str, timestamp: float | None) -> Packet | None:
 def combine(sightings: list[Sighting]) -> tuple[Packet, int] | None:
     """Try to recover a packet from copies where no single one is intact.
 
-    Majority vote first; if that still fails the CRC, flip small subsets of
-    the positions where the receivers actually disagreed. Those positions are
-    a far better-informed suspect set than a single receiver's soft
-    confidence, because a disagreement is direct evidence that one of them is
-    wrong.
+    Vote first; if that still fails the CRC, flip small subsets of the
+    suspect positions. With hard copies only, the suspects are where the
+    receivers disagreed — direct evidence that one of them is wrong. With a
+    soft copy in the mix, the suspects are the positions the weighted vote
+    was least sure of, which covers both a disagreement and a symbol the
+    I/Q receiver itself flagged as doubtful; one soft copy alone is enough
+    to try.
 
     Returns ``(packet, n_sightings)`` or ``None``.
     """
     voted = _vote(sightings)
     if voted is None:
         return None
-    bits, disagree = voted
+    bits, disagree = voted.bits, voted.disagree
 
     pkt = _accept(bits, sightings[0].when)
     if pkt is not None:
         return pkt, len(sightings)
 
-    if not disagree or len(disagree) > MAX_DISAGREEMENTS:
+    if len(disagree) > MAX_DISAGREEMENTS:
+        return None
+
+    soft_copies = any(s.soft is not None for s in sightings)
+    if soft_copies:
+        # With confidence available the suspects are the positions the vote
+        # was least sure of, inside the packet, tried least-sure first. A
+        # hard disagreement is always among them: its margin is small.
+        extent = min(_packet_extent(bits), len(bits))
+        order = np.argsort(np.abs(voted.margin[:extent]), kind="stable")
+        suspects = [int(i) for i in order[:MAX_DISAGREEMENTS]]
+        for i in disagree:
+            if i not in suspects:
+                suspects.append(i)
+        suspects = suspects[:MAX_DISAGREEMENTS]
+    else:
+        suspects = disagree
+    if not suspects:
         return None
 
     flip = list(bits)
     for count in range(1, MAX_COMBINE_FLIPS + 1):
-        for positions in combinations(disagree, count):
+        for positions in combinations(suspects, count):
             for i in positions:
                 flip[i] = "0" if flip[i] == "1" else "1"
             pkt = _accept("".join(flip), sightings[0].when)
@@ -536,6 +620,7 @@ __all__ = [
     "Fusion",
     "ReceiverView",
     "Sighting",
+    "Vote",
     "combine",
     "hamming",
     "sightings_from_capture",
