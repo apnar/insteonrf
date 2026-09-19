@@ -53,6 +53,8 @@ def _setup_logging(verbosity: int) -> None:
 
 #: Set by SIGINT/SIGTERM/SIGHUP. Every receive loop checks it between blocks.
 STOP = threading.Event()
+#: Set by SIGUSR1: the long-running loops log the radio's diagnostics.
+DIAG = threading.Event()
 
 
 def _install_signal_handlers() -> None:
@@ -71,6 +73,15 @@ def _install_signal_handlers() -> None:
     def handler(signum: int, _frame: Any) -> None:
         STOP.set()
         raise KeyboardInterrupt(f"signal {signum}")
+
+    def diag_handler(signum: int, _frame: Any) -> None:
+        # Ask the running loop to log the radio's own state: a wedged dongle
+        # is only understandable from inside the process that holds it
+        # (``kill -USR1 1`` in the pod).
+        DIAG.set()
+
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, diag_handler)
 
     for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if sig is not None:
@@ -798,7 +809,11 @@ def monitor_main(argv: list[str] | None = None) -> int:
                 print(json.dumps(rec, separators=(",", ":")), flush=True)
 
     capture_seq = 0
+    # Liveness is a *decoded packet*, not a block: a deaf dongle still
+    # false-syncs on noise about once a minute and hands over junk, which
+    # would keep a block-based watchdog quiet indefinitely (seen 2026-09-19).
     last_block = last_action = time.time()
+    junk_blocks = 0
     rearms = heals = 0
     if a.mesh_capture:
         if mqtt is None:
@@ -833,36 +848,37 @@ def monitor_main(argv: list[str] | None = None) -> int:
 
             diag("at start")
             while not STOP.is_set():
+                if DIAG.is_set():
+                    DIAG.clear()
+                    diag(f"on request ({junk_blocks} undecodable block(s) since the last packet)")
                 got = _receive(radio, a.timeout)
-                if got is None:
-                    now = time.time()
-                    want = _silence_action(now - last_block, a.max_silence)
-                    if want != "none" and now - last_action > a.max_silence:
-                        last_action = now
-                        quiet_min = (now - last_block) / 60.0
-                        state = diag(f"after {quiet_min:.0f} min of silence")
-                        if not hasattr(radio, "heal"):
+                now = time.time()
+                want = _silence_action(now - last_block, a.max_silence)
+                if want != "none" and now - last_action > a.max_silence:
+                    last_action = now
+                    quiet_min = (now - last_block) / 60.0
+                    state = diag(f"after {quiet_min:.0f} min without a packet "
+                                 f"({junk_blocks} undecodable block(s) meanwhile)")
+                    if not hasattr(radio, "heal"):
+                        radio.configure_rx(sync_header=not a.carrier)
+                        rearms += 1
+                    elif want == "heal" or state.get("answering") is False:
+                        # A dongle that will not answer a register read
+                        # will not take a mode change either; and a
+                        # re-arm on a deaf dongle that *does* answer was
+                        # never seen to help. Reset, do not wait longer.
+                        heal_now(f"nothing received for {quiet_min:.0f} min"
+                                 + ("" if state.get("answering") is not False
+                                    else " and the dongle is not answering"))
+                    else:
+                        log.warning("nothing received for %.0f min; re-arming receive",
+                                    quiet_min)
+                        try:
                             radio.configure_rx(sync_header=not a.carrier)
                             rearms += 1
-                        elif want == "heal" or state.get("answering") is False:
-                            # A dongle that will not answer a register read
-                            # will not take a mode change either; and a
-                            # re-arm on a deaf dongle that *does* answer was
-                            # never seen to help. Reset, do not wait longer.
-                            heal_now(f"nothing received for {quiet_min:.0f} min"
-                                     + ("" if state.get("answering") is not False
-                                        else " and the dongle is not answering"))
-                        else:
-                            log.warning("nothing received for %.0f min; re-arming receive",
-                                        quiet_min)
-                            try:
-                                radio.configure_rx(sync_header=not a.carrier)
-                                rearms += 1
-                                diag("after re-arm")
-                            except Exception as err:
-                                heal_now(f"re-arm failed ({err!r})")
-                else:
-                    last_block = time.time()
+                            diag("after re-arm")
+                        except Exception as err:
+                            heal_now(f"re-arm failed ({err!r})")
                 if got is not None:
                     ts, bits, soft, header_index, snr_db = got
                     rssi = None
@@ -873,8 +889,14 @@ def monitor_main(argv: list[str] | None = None) -> int:
                         mqtt.publish_capture(bits, receiver=a.mesh_capture, timestamp=ts,
                                              rssi_dbm=rssi, seq=capture_seq, soft=soft,
                                              snr_db=snr_db)
-                    for pkt in _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
-                                       soft=soft, header_index=header_index, tracker=tracker):
+                    packets = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
+                                      soft=soft, header_index=header_index, tracker=tracker)
+                    if any(q.calc_crc is not None for q in packets):
+                        last_block = time.time()
+                        junk_blocks = 0
+                    else:
+                        junk_blocks += 1
+                    for pkt in packets:
                         pkt.rssi_dbm = rssi
                         if a.unknown_commands:
                             note_unknown(pkt)

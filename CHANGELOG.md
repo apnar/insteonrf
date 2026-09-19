@@ -42,6 +42,21 @@ well enough to act on.
   the change (two restarts), but no deaf spell has yet occurred *under* the
   new heal, so its effectiveness is inferred from the external reset it
   reproduces, not yet observed directly.
+- **A deaf dongle is not silent, and that fooled the watchdog.** `py-spy
+  dump --locals` on a deaf pod showed a block two seconds old: the radio
+  still false-syncs on noise about once a minute and hands over junk
+  (`1111…` right after the header — not Manchester). Liveness was "any
+  block", so those kept the silence watchdog quiet indefinitely; it is now
+  "a decoded packet", and the silence line reports how many undecodable
+  blocks arrived meanwhile. So the picture of a deaf spell is: RX, right
+  sync word, false syncs at the usual rate, never a real packet — which
+  says tuned or timed wrong, not asleep.
+- **`diagnostics()` dumps the modem as programmed** — frequency, data
+  rate, deviation, bandwidth, sync word and the raw MDMCFG/MCSM/AGC/FSCAL
+  registers — and `SIGUSR1` makes the monitor log it on demand (from the
+  host: `kill -USR1 $(pgrep -f 'insteon-rf monitor')`; the pod image has no
+  `kill`). Healthy baseline recorded; the next deaf spell gets diffed
+  against it.
 - Not explained: why the pod comes up deaf on roughly half its restarts
   while the same open sequence from the host never has, and what wedges the
   firmware's EP5 IN path mid-run. The firmware's RF ISR also has a branch

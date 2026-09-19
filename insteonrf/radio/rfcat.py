@@ -419,6 +419,30 @@ class RfcatRadio:
             except Exception as err:
                 regs[reg] = f"error: {type(err).__name__}"
         out["sfr"] = regs
+        # The modem as programmed. A radio in RX with the right sync word
+        # that false-syncs on noise at the usual rate yet never frames a real
+        # packet is tuned or timed wrong; this is what to compare between a
+        # deaf spell and a healthy dongle.
+        modem: dict[str, Any] = {}
+        try:
+            d = self.dev
+            d.getRadioConfig()
+            cfg = d.radiocfg
+            modem["freq_hz"] = int(d.getFreq(radiocfg=cfg)[0])
+            modem["drate"] = round(float(d.getMdmDRate(radiocfg=cfg)), 1)
+            modem["deviation"] = round(float(d.getMdmDeviatn(radiocfg=cfg)), 1)
+            modem["chan_bw"] = round(float(d.getMdmChanBW(radiocfg=cfg)), 1)
+            modem["sync"] = f"{d.getMdmSyncWord(radiocfg=cfg):#06x}/mode{d.getMdmSyncMode(radiocfg=cfg)}"
+            for reg in ("mdmcfg4", "mdmcfg3", "mdmcfg2", "mdmcfg1", "mdmcfg0", "deviatn",
+                        "mcsm2", "mcsm1", "mcsm0", "foccfg", "bscfg", "agcctrl2", "agcctrl1",
+                        "agcctrl0", "frend1", "frend0", "fscal3", "fscal2", "fscal1", "fscal0",
+                        "test2", "test1", "test0", "pktctrl1", "pktctrl0", "pktlen",
+                        "freqest", "lqi", "rssi", "marcstate", "pkstatus", "vco_vc_dac"):
+                if hasattr(cfg, reg):
+                    modem[reg] = f"{getattr(cfg, reg):#04x}"
+        except Exception as err:
+            modem["error"] = repr(err)
+        out["modem"] = modem
         return out
 
     def read_rssi(self) -> float | None:
