@@ -13,7 +13,7 @@ from .packet import (
     pkt_crc,
 )
 
-__version__ = "2.5.3"
+__version__ = "2.5.4"
 __all__ = [
     "Address",
     "Command",

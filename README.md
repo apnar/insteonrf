@@ -368,8 +368,10 @@ boards / dongle ──MQTT──> insteon-rf mesh ──MQTT──> insteon-mqtt
 
 ### It starts with no new hardware
 
-The rfcat dongle is a valid mesh receiver — and the only one that can produce
-soft decisions, so it stays useful afterwards:
+The rfcat dongle is a valid mesh receiver, and worth keeping next to the
+boards: on the first day it decoded whole packets the Heltec flipped bits in.
+(It gives hard bits like the SX1262 — soft decisions come only from the SDR
+path — despite what an earlier revision of this section claimed.)
 
 ```bash
 # Dongle publishes raw captures as a mesh member

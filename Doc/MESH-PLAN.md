@@ -120,9 +120,12 @@ usefully: the expensive question ("does the PLM actually miss anything?") gets
 answered before any firmware is written, and the firmware then plugs into a
 path that already works.
 
-It also means the dongle stays in the architecture permanently — it is the one
-receiver that can produce **soft decisions**, so it keeps the ~3 dB and the
-CRC-guided repair that the SX1262 cannot give (§3.3).
+It also means the dongle stays in the architecture permanently. Not for soft
+decisions — an earlier draft claimed that, wrongly: the CC1111 is a hardware
+demodulator and hands over hard bits exactly as the SX1262 does, and soft
+decisions exist only on the I/Q path, which no deployed receiver uses yet
+(§3.3). It stays because it is a proven, independent second radio, and on the
+first day it decoded whole packets the Heltec flipped bits in.
 
 ---
 
@@ -213,18 +216,28 @@ occur, fall back to a preamble-only sync word (repeating `0x66`, which matches
 the inverted stream too, just at a 2-bit offset) and resolve polarity in
 software, accepting more false syncs for §3.4 to absorb.
 
-### 3.3 What is lost versus the dongle
+### 3.3 What no deployed receiver has yet: soft decisions
 
-The SX1262 gives hard bits only. `Burst.soft` and everything `recover.py`
-builds on it — Manchester soft combining, the CRC-guided bounded repair —
-apply to the dongle path but not the Heltec path. Two compensations:
+Both deployed receivers give hard bits — the SX1262, and the CC1111 in the
+rfcat dongle too. `cli._receive` says it in one line: *"a hardware
+demodulator (the rfcat dongle) can only give hard bits; the numpy SDR path
+also returns per-symbol confidence."* `Burst.soft` and everything
+`recover.py` builds on it — Manchester soft combining, the CRC-guided
+bounded repair, the ~3 dB measured in 2.2.0 — come from I/Q samples, so
+today they exist only for the `rtlsdr`/`hackrf` backends and file replay,
+none of which is in the mesh. An earlier draft of this plan said the dongle
+had them; it did not. Two compensations for a hard-bit mesh:
 
 - Spatial diversity is worth more than 3 dB for "did anyone hear it".
 - With 3+ receivers, **cross-receiver bit combining** recovers some of it
   (§6.5).
 
-Keep the dongle. It is the sensitive receiver; the Heltecs are the distributed
-ones.
+Keep the dongle. On the first day it decoded whole packets the Heltec flipped
+bits in (0 of 10 first packets damaged against 4 of 10 at the same spot), so
+it is the better demodulator on this network today; the Heltecs are the
+distributed ones. Real soft decisions need an SDR front end — an RTL-SDR on
+the host already runs the existing `rtlsdr` backend — plus a capture payload
+that carries per-symbol confidence, which does not exist yet.
 
 ### 3.4 The on-board validity gate
 

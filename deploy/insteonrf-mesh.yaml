@@ -14,8 +14,9 @@
 # Separate from the `insteonrf` pod on purpose: that one owns the USB dongle
 # and needs privileged access to it, while this one is a plain network
 # consumer that can be restarted freely. The dongle pod is also still useful
-# as a receiver in its own right — it is the only one that can produce soft
-# decisions, so it keeps the sensitivity advantage the SX1262 cannot match.
+# as a receiver in its own right: an independent second radio that, on the
+# first day, decoded whole packets the Heltec flipped bits in. (It gives hard
+# bits like the SX1262 — soft decisions come only from the SDR path.)
 #
 # Injection is OFF here. The rollout is:
 #   1. this manifest as written    — measure the miss rate for a week

@@ -4,6 +4,23 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.5.4 — 2026-09-19
+
+- **Correction: no deployed receiver produces soft decisions.** The mesh
+  plan, README, this changelog at 2.5.0, `monitor.py` and the mesh pod
+  manifest all said the rfcat dongle was "the only receiver that can produce
+  soft decisions". It cannot. The CC1111 is a hardware demodulator and hands
+  over hard bits exactly as the SX1262 does; `cli._receive` has said so all
+  along. `Burst.soft`, Manchester soft combining and the CRC-guided repair —
+  the ~3 dB measured in 2.2.0 — come from I/Q samples, so today they exist
+  only for the `rtlsdr`/`hackrf` backends and file replay, none of which is
+  in the mesh. The dongle's real, measured advantage is a lower bit-error
+  rate on this network: 0 of 10 first packets damaged against the Heltec's
+  4 of 10 at the same spot. Getting soft decisions into the mesh needs an
+  SDR front end and a capture payload that carries per-symbol confidence;
+  neither exists yet. Caught when the claim was about to drive a hardware
+  purchase.
+
 ## 2.5.3 — 2026-09-19
 
 First contact: the Heltec LoRa 32 V3 received Insteon on the first flash.
@@ -152,8 +169,9 @@ and it is the PLM.
   back as `0x62` echoes, so they looked like the misses of a device that
   misses everything.
 - **`monitor --mesh-capture NAME`** makes the rfcat dongle a mesh receiver, so
-  the measurement needs no new hardware. It is also the only receiver that can
-  produce soft decisions, so it stays useful once boards arrive.
+  the measurement needs no new hardware, and it stays useful once boards
+  arrive as an independent second radio. (This entry originally claimed it
+  produced soft decisions; it does not — see 2.5.4.)
 - **`esphome/components/insteon_rf/`** is the listener firmware: a hand-rolled
   SX126x driver (no external library, builds under esp-idf) using GFSK packet
   mode as a raw bit recorder, because SX126x dropped the continuous mode the

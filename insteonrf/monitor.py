@@ -178,9 +178,10 @@ class MqttPublisher:
 
         This is what lets the rfcat dongle act as a member of the listener
         mesh: ``insteon-rf mesh`` consumes ``<prefix>/rx/<node>`` and does not
-        care whether the bytes came from an ESP32 or from USB. It is also the
-        only receiver that can produce soft decisions, so it stays useful
-        after the boards arrive.
+        care whether the bytes came from an ESP32 or from USB. The dongle gives
+        hard bits, like the SX1262 -- soft decisions come only from the I/Q
+        path -- but it is an independent second radio, and on the first day
+        it decoded whole packets the Heltec flipped bits in.
         """
         import base64
 
