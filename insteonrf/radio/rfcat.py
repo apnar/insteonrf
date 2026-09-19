@@ -18,6 +18,8 @@ dongle when it happens (``auto_reset``, on by default).
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -95,6 +97,43 @@ def usb_reset(vid: int = USB_VID, pid: int = USB_PID, timeout: float = 10.0) -> 
         log.error("USB reset did not finish in %.0fs — unplug and replug the dongle", timeout)
         return False
     return True
+
+
+def external_usb_reset(timeout: float = 20.0) -> bool:
+    """USB-reset the dongle from a *separate* process.
+
+    Measured 2026-09-19 on the pod: a bus reset issued from another process
+    while this one still held the interface cured every deaf spell it was
+    tried on (four of four, within seconds), while the same libusb call made
+    from this process after releasing the interface cured none of four — and
+    once blocked past its own 10 s timeout, apparently because rflib's reader
+    thread was sitting in a bulk read on the same device in the same libusb
+    context. A fresh process has its own context and no such entanglement;
+    this is exactly what an operator typing ``insteon-rf reset`` does.
+    """
+    cmd = [sys.executable, "-c",
+           "from insteonrf.radio.rfcat import usb_reset; raise SystemExit(0 if usb_reset() else 1)"]
+    try:
+        done = subprocess.run(cmd, timeout=timeout, capture_output=True)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        log.warning("external USB reset did not complete: %r", err)
+        return False
+    if done.returncode != 0:
+        log.warning("external USB reset failed: %s", done.stderr.decode(errors="replace").strip()[-200:])
+        return False
+    return True
+
+
+def _code_name(code: int, prefix: str) -> str:
+    """Name of an rflib ``LC_*``/``LCE_*`` firmware trace code, or ``?``."""
+    try:
+        mod = _rflib().chipcon_usb
+    except Exception:
+        return "?"
+    for name in dir(mod):
+        if name.startswith(prefix) and getattr(mod, name, None) == code:
+            return name
+    return "?"
 
 
 def _bounded_rfcat_class() -> Any:
@@ -336,6 +375,52 @@ class RfcatRadio:
 
     # ---- signal strength ------------------------------------------------
 
+    def diagnostics(self) -> dict[str, Any]:
+        """Radio state for a watchdog to log: MARCSTATE, RSSI, PKTSTATUS.
+
+        The CC1111's main radio control state machine says whether the
+        radio is in ``RX`` at all, or parked in ``IDLE`` / ``RXFIFO_OVERFLOW``
+        — the difference between "quiet air" and "not listening", which
+        the USB path cannot tell apart because the dongle answers either
+        way. Read after a block, this is also the channel a moment later.
+        """
+        out: dict[str, Any] = {"answering": True}
+        if self.dev is None:
+            return {"state": "closed", "answering": False}
+        try:
+            name, value = self.dev.getMARCSTATE()
+            out["marcstate"] = f"{name or '?'}({value:#x})"
+        except Exception as err:
+            # A dongle that does not answer a register read is not going to
+            # answer a mode change either: the caller should heal, not re-arm.
+            out["marcstate"] = f"error: {err!r}"
+            out["answering"] = False
+            return out
+        out["rssi_dbm"] = self.read_rssi()
+        # The firmware's own trace: lastCode[0] is where it was, lastCode[1]
+        # the last exceptional thing it did (LCE_DROPPED_PACKET is the one
+        # that matters — the RF ISR drops a packet when the main loop has
+        # not shipped the previous one, and re-arms nothing).
+        try:
+            codes = self.dev.getDebugCodes()
+            out["lastcode"] = [f"{_code_name(c, 'LC_')}({c})" for c in codes[:1]] + [
+                f"{_code_name(c, 'LCE_')}({c})" for c in codes[1:2]]
+        except Exception as err:
+            out["lastcode"] = f"error: {err!r}"
+        # Raw SFRs behind the receive path (XDATA-mapped): is the DMA channel
+        # armed, is an RF interrupt pending, is RX still requested.
+        regs = {}
+        for reg in ("DMAARM", "DMAIRQ", "RFIF", "RFIM", "RFST"):
+            addr = getattr(self.rflib, f"X_{reg}", None)
+            if addr is None:
+                continue
+            try:
+                regs[reg] = f"{self.dev.peek(addr, 1)[0]:#04x}"
+            except Exception as err:
+                regs[reg] = f"error: {type(err).__name__}"
+        out["sfr"] = regs
+        return out
+
     def read_rssi(self) -> float | None:
         """Current RSSI in dBm, or None if the dongle will not answer.
 
@@ -390,12 +475,22 @@ class RfcatRadio:
         return self._timeouts >= self.max_usb_errors and self.usb_errors > 0
 
     def heal(self) -> bool:
-        """Close, USB-reset and reopen the dongle, restoring the last mode."""
+        """USB-reset the dongle from outside, then reopen it in the last mode.
+
+        Order matters and was measured (see :func:`external_usb_reset`): the
+        reset goes first, from a separate process, while this one still
+        holds the interface. rflib's threads see the device vanish and give
+        up, which is fine — the instance is discarded right after. Only if no
+        child process can be started does it fall back to the in-process
+        reset that was never seen to work on a deaf dongle.
+        """
         self._heals += 1
         log.warning("dongle not responding, resetting…")
-        self.close()
-        usb_reset()
+        if not external_usb_reset():
+            self.close()
+            usb_reset()
         time.sleep(RESET_SETTLE)
+        self.close()
         self.dev = self._open()
         self._common()
         self._timeouts = 0

@@ -4,6 +4,51 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.6.1 — 2026-09-19
+
+The deaf dongle, second pass. Still not fully explained, but now measured
+well enough to act on.
+
+- **What a deaf spell looks like from inside.** `RfcatRadio.diagnostics()`
+  reads MARCSTATE, RSSI, the firmware's trace codes (`getDebugCodes`) and
+  the receive-path SFRs (DMAARM, DMAIRQ, RFIF, RFIM, RFST), and the
+  watchdog logs it at start and around every action. First deaf spell
+  caught with it: at start `MARC_STATE_RX`, RSSI −104.5, answering; five
+  minutes later, still silent, **the dongle no longer answered any USB
+  command** (`ChipconUsbTimeoutException` on a register read), and the
+  watchdog's re-arm then crashed the process on `setModeIDLE`. After
+  recovery the firmware's last exception code read
+  `LCE_USB_EP5_TX_WHILE_INBUF_WRITTEN` — its EP5 IN path had been
+  wedged. `receive()`'s own self-heal never fired because it wants USB
+  *errors* alongside the timeouts, and a hung firmware produces neither.
+- **Which reset works, measured.** A bus reset issued from *another*
+  process while the pod still held the interface cured every deaf spell it
+  was tried on (four of four, within seconds — twice `insteon-rf reset` on
+  the host, once from a second process inside the container). The same
+  libusb call from the pod's own process after releasing the interface
+  cured none of four in-pod heals (15:31, 15:58, 16:12, and the 16:43 one
+  that blocked past its 10 s timeout while rflib's reader thread sat in a
+  bulk read on the same device). `dmesg` shows the kernel reset the port
+  either way, so the difference is on the host side, in the libusb context
+  that issues it. `heal()` now does what works: `external_usb_reset()`
+  spawns a fresh interpreter to issue the reset *first*, while this process
+  still holds the interface, then closes and reopens. The in-process reset
+  stays only as a fallback when no child process can be started.
+- **The watchdog escalates instead of crashing.** `diagnostics()` reports
+  `answering: False` when a register read times out, and the silence tick
+  then heals at once rather than re-arming and waiting another five
+  minutes; a re-arm that raises heals too; a heal that raises is logged and
+  retried on the next tick. Verified: the fresh pod comes up hearing after
+  the change (two restarts), but no deaf spell has yet occurred *under* the
+  new heal, so its effectiveness is inferred from the external reset it
+  reproduces, not yet observed directly.
+- Not explained: why the pod comes up deaf on roughly half its restarts
+  while the same open sequence from the host never has, and what wedges the
+  firmware's EP5 IN path mid-run. The firmware's RF ISR also has a branch
+  that drops a packet without re-arming DMA when the main loop has not
+  shipped the previous one (`LCE_DROPPED_PACKET`), a candidate for the
+  "answering but silent" flavour seen earlier in the day.
+
 ## 2.6.0 — 2026-09-19
 
 Soft decisions reach the mesh. Until now an I/Q receiver's per-symbol

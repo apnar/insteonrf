@@ -175,13 +175,18 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   `insteon-rf allon --known-groups <groups.txt>`; build the group list with
   `grep -oE '^  - modem: [0-9]+' /k8s/insteon-config/scenes.yaml | awk '{print $3}' | sort -nu`
   (114 legitimate groups, 0 not among them).
-- **The dongle pod goes deaf without erroring** (2026-09-19: five gaps of 20–100 min in
-  one day while the Heltec a few feet away kept capturing). The rfcat hears fine from the
-  host during a gap; a pod restart did not cure it; `insteon-rf reset` (USB reset) did,
-  instantly. Not reproducible on demand. The pod runs `--max-silence=300` so `heal()` does
-  that reset after 10 min of silence; check `kubectl logs insteonrf` for `healing the
-  radio`. To tell quiet air from a deaf dongle, compare against the Heltec's per-minute
-  `Captures` sensor or `insteon-rf/rx/insteon-rf-main` on MQTT.
+- **The dongle pod goes deaf** (2026-09-19: five gaps of 20–100 min in one day while the
+  Heltec a few feet away kept capturing; also on about half of pod restarts, from the
+  first second). Two flavours seen: still answering USB commands but delivering nothing,
+  and — five minutes into a spell — answering nothing at all (firmware trace code
+  `LCE_USB_EP5_TX_WHILE_INBUF_WRITTEN` afterwards). **A USB bus reset from a separate
+  process while the pod holds the interface cures it within seconds (4 of 4);** the same
+  reset from the pod's own process after releasing did not (0 of 4), so `heal()` spawns a
+  child interpreter to reset *before* closing. `--max-silence=300`; `diagnostics()` is
+  logged around every watchdog action — read `kubectl logs insteonrf` for `radio after N
+  min of silence` and `after heal`. To tell quiet air from a deaf dongle, compare against
+  the Heltec's per-minute `Captures` sensor or `insteon-rf/rx/insteon-rf-main` on MQTT.
+  From the host, `insteon-rf reset` is the operator's cure.
 - **SDR backends live**: `--demod numpy` (the C demodulator fails on real signals); the
   reader thread in `SdrReceiver._iter_numpy` is load-bearing — demodulating one packet
   takes ~85 ms and a pipe holds 14 ms of I/Q, so without it `rtl_sdr` drops samples

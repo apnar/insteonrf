@@ -809,6 +809,29 @@ def monitor_main(argv: list[str] | None = None) -> int:
         with _open_radio(a) as radio:
             radio.configure_rx(sync_header=not a.carrier)
             log.info("monitoring on %s", getattr(radio, "name", a.backend))
+
+            def diag(when: str) -> dict[str, Any]:
+                # What the radio itself says it is doing. Logged around every
+                # watchdog action so a deaf spell leaves a trace of *why*.
+                if not hasattr(radio, "diagnostics"):
+                    return {}
+                state: dict[str, Any] = radio.diagnostics()
+                log.warning("radio %s: %s", when, state)
+                return state
+
+            def heal_now(why: str) -> None:
+                nonlocal heals, last_block
+                log.warning("%s; healing the radio", why)
+                try:
+                    radio.heal()
+                except Exception as err:
+                    # Leave the loop alive: the next silence tick tries again.
+                    log.error("heal failed: %r", err)
+                heals += 1
+                last_block = time.time()
+                diag("after heal")
+
+            diag("at start")
             while not STOP.is_set():
                 got = _receive(radio, a.timeout)
                 if got is None:
@@ -817,17 +840,27 @@ def monitor_main(argv: list[str] | None = None) -> int:
                     if want != "none" and now - last_action > a.max_silence:
                         last_action = now
                         quiet_min = (now - last_block) / 60.0
-                        if want == "heal" and hasattr(radio, "heal"):
-                            log.warning("nothing received for %.0f min; healing the radio",
-                                        quiet_min)
-                            radio.heal()
-                            heals += 1
-                            last_block = now
+                        state = diag(f"after {quiet_min:.0f} min of silence")
+                        if not hasattr(radio, "heal"):
+                            radio.configure_rx(sync_header=not a.carrier)
+                            rearms += 1
+                        elif want == "heal" or state.get("answering") is False:
+                            # A dongle that will not answer a register read
+                            # will not take a mode change either; and a
+                            # re-arm on a deaf dongle that *does* answer was
+                            # never seen to help. Reset, do not wait longer.
+                            heal_now(f"nothing received for {quiet_min:.0f} min"
+                                     + ("" if state.get("answering") is not False
+                                        else " and the dongle is not answering"))
                         else:
                             log.warning("nothing received for %.0f min; re-arming receive",
                                         quiet_min)
-                            radio.configure_rx(sync_header=not a.carrier)
-                            rearms += 1
+                            try:
+                                radio.configure_rx(sync_header=not a.carrier)
+                                rearms += 1
+                                diag("after re-arm")
+                            except Exception as err:
+                                heal_now(f"re-arm failed ({err!r})")
                 else:
                     last_block = time.time()
                 if got is not None:
