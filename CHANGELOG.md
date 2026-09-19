@@ -57,7 +57,30 @@ well enough to act on.
   host: `kill -USR1 $(pgrep -f 'insteon-rf monitor')`; the pod image has no
   `kill`). Healthy baseline recorded; the next deaf spell gets diffed
   against it.
-- Not explained: why the pod comes up deaf on roughly half its restarts
+- **The afternoon's spells were self-inflicted, and that is the useful
+  finding.** A `bpftrace` probe on `usb_reset_device` named the process
+  behind every "mystery" reset: the test suite. `test_watchdog_heals_a_
+  wedged_dongle` stubs `usb_reset` but, once `heal()` started resetting
+  from a child process, the child was real — every `make check` since
+  that change bus-reset the pod's dongle, the pod healed, and about half
+  the time came back deaf. The fixture now stubs `external_usb_reset` too
+  (0 resets during a full `make check`, verified with the probe). Lesson
+  worth keeping: a test that reaches hardware another process is using
+  looks exactly like a flaky device.
+- **The reworked heal recovers from an external reset.** Reproduced on
+  demand five times (`insteon-rf reset` from the host while the pod held
+  the dongle): reset → `dongle not responding` → `back up` within 4 s →
+  hearing on the next probe, five of five. The two deaf outcomes earlier
+  in the afternoon (16:49, 17:02, both after test-suite resets on a
+  pod under two minutes old) are not reproduced and not explained; the
+  re-arm at five minutes cured one of them, so in the worst case the pod
+  is deaf for five minutes, not an hour.
+- `diagnostics()` also reads P1/P2/P2DIR/P2SEL and the amp mode: the
+  Yard Stick One's RX/TX amplifier and bypass switches live on P2 and are
+  set by the firmware on every mode change, outside the radio register
+  file — the one thing a byte-identical modem dump cannot rule out. The
+  next natural spell is logged with them.
+- Not explained: why the pod came up deaf on roughly half its restarts
   while the same open sequence from the host never has, and what wedges the
   firmware's EP5 IN path mid-run. The firmware's RF ISR also has a branch
   that drops a packet without re-arming DMA when the main loop has not

@@ -189,7 +189,11 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   from the host; read `kubectl logs insteonrf` for `radio on request` / `radio after N
   min` / `after heal`. To tell quiet air from a deaf dongle, compare against
   the Heltec's per-minute `Captures` sensor or `insteon-rf/rx/insteon-rf-main` on MQTT.
-  From the host, `insteon-rf reset` is the operator's cure.
+  From the host, `insteon-rf reset` is the operator's cure. **Never let a test or tool
+  reset the dongle while the pod holds it**: `tests/test_radio.py`'s `fake_radio` stubs
+  both `usb_reset` and `external_usb_reset` because, for one afternoon, every `make
+  check` knocked the pod's receiver over and looked like a flaky dongle. `bpftrace -e
+  'kprobe:usb_reset_device { printf("%s %d\n", comm, pid) }'` names the culprit.
 - **SDR backends live**: `--demod numpy` (the C demodulator fails on real signals); the
   reader thread in `SdrReceiver._iter_numpy` is load-bearing — demodulating one packet
   takes ~85 ms and a pipe holds 14 ms of I/Q, so without it `rtl_sdr` drops samples

@@ -169,6 +169,10 @@ def fake_radio(monkeypatch):
 
     monkeypatch.setattr(rfcat_mod, "_rflib", lambda: FakeRflib)
     monkeypatch.setattr(rfcat_mod, "usb_reset", lambda *a, **k: True)
+    # heal() resets from a child process first; never let a test reset a
+    # real dongle another process is using (it did, 2026-09-19, and every
+    # `make check` knocked the pod's receiver over).
+    monkeypatch.setattr(rfcat_mod, "external_usb_reset", lambda *a, **k: True)
     monkeypatch.setattr(rfcat_mod, "RESET_SETTLE", 0)
     monkeypatch.setattr(rfcat_mod, "THREAD_SETTLE", 0)
     monkeypatch.setattr(rfcat_mod.RfcatRadio, "_open", lambda self: _next_fake(fakes))
@@ -307,6 +311,10 @@ def test_open_gives_up_with_a_useful_error(monkeypatch):
     monkeypatch.setattr(rfcat_mod, "_bounded_rfcat_class",
                         lambda: (lambda **kw: (_ for _ in ()).throw(RuntimeError("no dongle"))))
     monkeypatch.setattr(rfcat_mod, "usb_reset", lambda *a, **k: True)
+    # heal() resets from a child process first; never let a test reset a
+    # real dongle another process is using (it did, 2026-09-19, and every
+    # `make check` knocked the pod's receiver over).
+    monkeypatch.setattr(rfcat_mod, "external_usb_reset", lambda *a, **k: True)
     monkeypatch.setattr(rfcat_mod, "RESET_SETTLE", 0)
     monkeypatch.setattr(rfcat_mod, "_rflib", lambda: object())
     with pytest.raises(rfcat_mod.DongleError, match="not responding"):

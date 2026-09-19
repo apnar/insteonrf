@@ -410,8 +410,14 @@ class RfcatRadio:
         # Raw SFRs behind the receive path (XDATA-mapped): is the DMA channel
         # armed, is an RF interrupt pending, is RX still requested.
         regs = {}
-        for reg in ("DMAARM", "DMAIRQ", "RFIF", "RFIM", "RFST"):
-            addr = getattr(self.rflib, f"X_{reg}", None)
+        # P2 carries the Yard Stick One's RF front-end switches (P2_0 TX amp,
+        # P2_4 RX amp, P2_3 bypass), set by the firmware on every mode change
+        # and not part of the radio register file — a receiver with the
+        # bypass off and the RX amp off hears nothing while every radio
+        # register reads normal.
+        for reg in ("DMAARM", "DMAIRQ", "RFIF", "RFIM", "RFST", "P2", "P2DIR", "P2SEL", "P1"):
+            # rflib names most SFRs; P1/P2 themselves are plain XDATA-mapped.
+            addr = getattr(self.rflib, f"X_{reg}", {"P1": 0xDF90, "P2": 0xDFA0}.get(reg))
             if addr is None:
                 continue
             try:
@@ -419,6 +425,12 @@ class RfcatRadio:
             except Exception as err:
                 regs[reg] = f"error: {type(err).__name__}"
         out["sfr"] = regs
+        amp = getattr(self.dev, "getAmpMode", None)
+        if amp is not None:
+            try:
+                out["amp_mode"] = amp()
+            except Exception as err:
+                out["amp_mode"] = f"error: {type(err).__name__}"
         # The modem as programmed. A radio in RX with the right sync word
         # that false-syncs on noise at the usual rate yet never frames a real
         # packet is tuned or timed wrong; this is what to compare between a
