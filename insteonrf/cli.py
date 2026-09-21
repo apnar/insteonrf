@@ -16,6 +16,7 @@ import datetime as _dt
 import json
 import logging
 import os
+import queue
 import signal
 import sys
 import threading
@@ -252,8 +253,31 @@ def _decode(bits: str, ts: float | None, *, repair: bool = True, show_all: bool 
 
 
 
+class _Liveness:
+    """When a real packet last arrived, shared with the decode worker.
+
+    The receive loop must not decode, so it cannot see for itself whether a
+    block held a packet; the worker sets :attr:`last_packet` and the loop
+    only reads it. Plain attributes on purpose -- these are single stores of
+    an immutable value, the watchdog wants an approximate answer, and a lock
+    on the receive thread is exactly the sort of thing this change exists to
+    remove.
+    """
+
+    __slots__ = ("last_packet", "junk_blocks", "dropped")
+
+    def __init__(self) -> None:
+        self.last_packet = time.time()
+        #: Blocks since the last packet that held no packet at all. A deaf
+        #: dongle still false-syncs on noise, so these are not liveness.
+        self.junk_blocks = 0
+        #: Blocks the receive loop had to throw away because the worker was
+        #: too far behind. Should stay at zero; see ``--queue``.
+        self.dropped = 0
+
+
 def _silence_action(quiet_s: float, max_silence: float) -> str:
-    """What to do about ``quiet_s`` seconds with no received block.
+    """What to do about ``quiet_s`` seconds with no decoded packet.
 
     A receiver that has gone deaf is worse than one that has crashed: it
     reports nothing, logs nothing, and every downstream measurement reads as
@@ -265,16 +289,30 @@ def _silence_action(quiet_s: float, max_silence: float) -> str:
     timeouts *plus* USB errors, so a radio that has fallen out of RX while the
     USB path still answers looks healthy and simply returns nothing.
 
-    Silence is genuinely ambiguous -- this network carries only about six RF
-    messages an hour, so a quiet house is indistinguishable from a broken
-    radio over any short window. Hence the long default and the cheap first
-    step: re-arm receive (one register write, fixes a radio that left RX)
-    before reaching for a USB reset.
+    There is exactly one step, and it is cheap: re-arm receive. Measured on
+    2026-09-21 against the Heltec as a reference clock, the dongle wedges
+    *mid-run*, within minutes, while still answering register reads and still
+    reporting ``MARC_STATE_RX`` with a correct modem configuration and a
+    normal noise floor -- and then delivers not one block, not even the noise
+    false-syncs, until it is re-armed. Re-arming is what recovers it: the pod
+    caught 9 of 9 probes, went deaf, missed 8, and came back on the tick
+    exactly five minutes after its last decode, which is when the old
+    threshold re-armed it.
+
+    A **USB reset is not the remedy** and used to be the second step here.
+    Over one day only 8 of 128 resets were followed by a decode inside a
+    minute and the median wait for the next one was half an hour, while the
+    dongle was re-enumerated 200 times for nothing. It is now reached only
+    when the dongle stops answering at all, which the caller decides from
+    :meth:`~insteonrf.radio.rfcat.RfcatRadio.diagnostics`, and by
+    ``RfcatRadio.receive`` itself on repeated USB errors.
+
+    So the threshold wants to be seconds, not the half hour it was: a re-arm
+    costs a handful of register writes and can only lose a packet that
+    happens to be mid-flight, against whole spells of deafness if it waits.
     """
     if max_silence <= 0:
         return "none"
-    if quiet_s > max_silence * 2:
-        return "heal"
     if quiet_s > max_silence:
         return "rearm"
     return "none"
@@ -752,11 +790,20 @@ def monitor_main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-repair", action="store_true",
                    help="do not try to recover packets whose CRC failed")
     p.add_argument("--timeout", type=int, default=2000, help="USB receive timeout in ms")
-    p.add_argument("--max-silence", type=float, default=1800.0, metavar="SECONDS",
-                   help="if nothing is received for this long, re-arm the receiver, and after "
-                        "twice as long USB-reset it (0 disables). A dongle that wedges goes "
-                        "quiet without erroring, which reads downstream as 'there was no "
-                        "traffic' rather than as a fault (default %(default)s)")
+    p.add_argument("--max-silence", type=float, default=20.0, metavar="SECONDS",
+                   help="re-arm the receiver after this many seconds with no decoded packet "
+                        "(0 disables). A dongle that wedges goes quiet without erroring, which "
+                        "reads downstream as 'there was no traffic' rather than as a fault, and "
+                        "re-arming is what recovers it -- so this is seconds, not minutes "
+                        "(default %(default)s)")
+    p.add_argument("--diag-after", type=float, default=300.0, metavar="SECONDS",
+                   help="after this long with no decoded packet, log what the radio says it is "
+                        "doing, and USB-reset it if it has stopped answering altogether "
+                        "(default %(default)s)")
+    p.add_argument("--queue", type=int, default=512, metavar="N",
+                   help="blocks that may be waiting to be decoded. The receive thread does "
+                        "nothing but drain the radio; everything else happens behind this "
+                        "queue (default %(default)s)")
     _log_args(p)
     a = p.parse_args(argv)
     _setup_logging(a.verbose or 1)
@@ -812,22 +859,99 @@ def monitor_main(argv: list[str] | None = None) -> int:
     # Liveness is a *decoded packet*, not a block: a deaf dongle still
     # false-syncs on noise about once a minute and hands over junk, which
     # would keep a block-based watchdog quiet indefinitely (seen 2026-09-19).
-    last_block = last_action = time.time()
-    junk_blocks = 0
+    # The decoder runs on the worker thread, so it is the worker that moves
+    # this forward; the receive loop only reads it.
+    live = _Liveness()
+    last_action = time.time()
     rearms = heals = 0
     if a.mesh_capture:
         if mqtt is None:
             p.error("--mesh-capture needs --mqtt")
         log.info("publishing raw captures as mesh receiver %r", a.mesh_capture)
 
+    def process(item: tuple[Any, ...]) -> None:
+        """Everything that happens to one block. Runs on the worker thread.
+
+        Publishing a capture, decoding with repair, the all-on watcher and
+        the log write together take far longer than a block takes to arrive
+        during a burst. Doing them between reads is what starved the dongle:
+        when the CC1111's USB IN buffer is not emptied promptly its firmware
+        drops the packet *without re-arming DMA* and the receiver then hands
+        over nothing at all until something re-arms it.
+        """
+        nonlocal capture_seq
+        ts, bits, soft, header_index, snr_db, rssi = item
+        if a.mesh_capture and mqtt is not None:
+            capture_seq += 1
+            mqtt.publish_capture(bits, receiver=a.mesh_capture, timestamp=ts,
+                                 rssi_dbm=rssi, seq=capture_seq, soft=soft,
+                                 snr_db=snr_db)
+        packets = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
+                          soft=soft, header_index=header_index, tracker=tracker)
+        if any(q.calc_crc is not None for q in packets):
+            live.last_packet = time.time()
+            live.junk_blocks = 0
+        else:
+            live.junk_blocks += 1
+        for pkt in packets:
+            pkt.rssi_dbm = rssi
+            if a.unknown_commands:
+                note_unknown(pkt)
+            if watcher is not None:
+                for trig in watcher.observe(pkt, bits=bits, rssi_dbm=rssi,
+                                            snr_db=pkt.snr_db):
+                    log.warning("%s", watcher.report(trig))
+                    if mqtt is not None:
+                        mqtt.publish_alert({
+                            "alert": trig.kind, "at": trig.at,
+                            "detail": trig.detail,
+                            "report": watcher.report(trig),
+                            "packet": trig.packet.to_dict()
+                            if trig.packet else None})
+            if dd is None:
+                emit([pkt.to_dict()])
+            else:
+                dd.add(pkt)
+
+    work: queue.Queue[tuple[Any, ...] | None] = queue.Queue(maxsize=max(1, a.queue))
+
+    def worker() -> None:
+        while True:
+            try:
+                item = work.get(timeout=0.5)
+            except queue.Empty:
+                # Deduped records have to age out on time even while the air
+                # is silent, so the idle tick still has to happen.
+                if dd is not None:
+                    emit(dd.pop_ready())
+                continue
+            try:
+                if item is None:
+                    return
+                process(item)
+            except Exception:
+                # One bad block must not take the receiver down with it.
+                log.exception("decoding a block failed")
+            finally:
+                work.task_done()
+            if dd is not None:
+                # Hand over the records whose window has closed — they carry
+                # the final repeats/hops_seen.
+                emit(dd.pop_ready())
+
+    decoder = threading.Thread(target=worker, name="insteon-rf-decode", daemon=True)
+    decoder.start()
+
     try:
         with _open_radio(a) as radio:
             radio.configure_rx(sync_header=not a.carrier)
             log.info("monitoring on %s", getattr(radio, "name", a.backend))
+            lossless = bool(getattr(radio, "lossless", False))
 
             def diag(when: str) -> dict[str, Any]:
-                # What the radio itself says it is doing. Logged around every
-                # watchdog action so a deaf spell leaves a trace of *why*.
+                # What the radio itself says it is doing. Not logged on every
+                # re-arm any more: at a threshold of seconds that would be the
+                # whole log, and the register reads are not free either.
                 if not hasattr(radio, "diagnostics"):
                     return {}
                 state: dict[str, Any] = radio.diagnostics()
@@ -835,7 +959,7 @@ def monitor_main(argv: list[str] | None = None) -> int:
                 return state
 
             def heal_now(why: str) -> None:
-                nonlocal heals, last_block
+                nonlocal heals
                 log.warning("%s; healing the radio", why)
                 try:
                     radio.heal()
@@ -843,87 +967,82 @@ def monitor_main(argv: list[str] | None = None) -> int:
                     # Leave the loop alive: the next silence tick tries again.
                     log.error("heal failed: %r", err)
                 heals += 1
-                last_block = time.time()
+                live.last_packet = time.time()
                 diag("after heal")
 
+            last_diag = 0.0
             diag("at start")
             while not STOP.is_set():
                 if DIAG.is_set():
                     DIAG.clear()
-                    diag(f"on request ({junk_blocks} undecodable block(s) since the last packet)")
+                    diag(f"on request ({live.junk_blocks} undecodable block(s) "
+                         "since the last packet)")
                 got = _receive(radio, a.timeout)
                 now = time.time()
-                want = _silence_action(now - last_block, a.max_silence)
-                if want != "none" and now - last_action > a.max_silence:
+                quiet = now - live.last_packet
+                if (_silence_action(quiet, a.max_silence) == "rearm"
+                        and now - last_action >= a.max_silence):
                     last_action = now
-                    quiet_min = (now - last_block) / 60.0
-                    state = diag(f"after {quiet_min:.0f} min without a packet "
-                                 f"({junk_blocks} undecodable block(s) meanwhile)")
-                    if not hasattr(radio, "heal"):
-                        radio.configure_rx(sync_header=not a.carrier)
-                        rearms += 1
-                    elif want == "heal" or state.get("answering") is False:
-                        # A dongle that will not answer a register read
-                        # will not take a mode change either; and a
-                        # re-arm on a deaf dongle that *does* answer was
-                        # never seen to help. Reset, do not wait longer.
-                        heal_now(f"nothing received for {quiet_min:.0f} min"
-                                 + ("" if state.get("answering") is not False
-                                    else " and the dongle is not answering"))
+                    state: dict[str, Any] = {}
+                    if quiet >= a.diag_after and now - last_diag >= a.diag_after:
+                        last_diag = now
+                        state = diag(f"after {quiet / 60.0:.0f} min without a packet "
+                                     f"({live.junk_blocks} undecodable block(s) meanwhile)")
+                    if state.get("answering") is False and hasattr(radio, "heal"):
+                        # A dongle that will not answer a register read will
+                        # not take a mode change either. This, and repeated
+                        # USB errors in RfcatRadio.receive, are the only two
+                        # things a USB reset is for.
+                        heal_now(f"nothing received for {quiet / 60.0:.0f} min "
+                                 "and the dongle is not answering")
                     else:
-                        log.warning("nothing received for %.0f min; re-arming receive",
-                                    quiet_min)
                         try:
                             radio.configure_rx(sync_header=not a.carrier)
                             rearms += 1
-                            diag("after re-arm")
+                            log.debug("re-armed receive after %.0fs of silence", quiet)
                         except Exception as err:
-                            heal_now(f"re-arm failed ({err!r})")
+                            if hasattr(radio, "heal"):
+                                heal_now(f"re-arm failed ({err!r})")
+                            else:
+                                log.error("re-arm failed: %r", err)
                 if got is not None:
                     ts, bits, soft, header_index, snr_db = got
                     rssi = None
                     if not a.no_rssi and hasattr(radio, "read_rssi"):
                         rssi = radio.read_rssi()
-                    if a.mesh_capture and mqtt is not None:
-                        capture_seq += 1
-                        mqtt.publish_capture(bits, receiver=a.mesh_capture, timestamp=ts,
-                                             rssi_dbm=rssi, seq=capture_seq, soft=soft,
-                                             snr_db=snr_db)
-                    packets = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
-                                      soft=soft, header_index=header_index, tracker=tracker)
-                    if any(q.calc_crc is not None for q in packets):
-                        last_block = time.time()
-                        junk_blocks = 0
+                    item = (ts, bits, soft, header_index, snr_db, rssi)
+                    if lossless:
+                        # Replay: waiting is free and the same file must
+                        # always decode to the same packets.
+                        work.put(item)
                     else:
-                        junk_blocks += 1
-                    for pkt in packets:
-                        pkt.rssi_dbm = rssi
-                        if a.unknown_commands:
-                            note_unknown(pkt)
-                        if watcher is not None:
-                            for trig in watcher.observe(pkt, bits=bits, rssi_dbm=rssi,
-                                                        snr_db=pkt.snr_db):
-                                log.warning("%s", watcher.report(trig))
-                                if mqtt is not None:
-                                    mqtt.publish_alert({
-                                        "alert": trig.kind, "at": trig.at,
-                                        "detail": trig.detail,
-                                        "report": watcher.report(trig),
-                                        "packet": trig.packet.to_dict()
-                                        if trig.packet else None})
-                        if dd is None:
-                            emit([pkt.to_dict()])
-                        else:
-                            dd.add(pkt)
-                # Every tick, hand over the records whose window has closed —
-                # they carry the final repeats/hops_seen.
-                if dd is not None:
-                    emit(dd.pop_ready())
+                        try:
+                            work.put_nowait(item)
+                        except queue.Full:
+                            # Never block on a live radio: a stalled receive
+                            # thread is the fault this queue exists to
+                            # prevent, and a dropped block costs one message
+                            # where stalling costs the next spell of them.
+                            live.dropped += 1
+                            if live.dropped == 1 or live.dropped % 100 == 0:
+                                log.warning("decode queue full, dropped %d block(s) — "
+                                            "raise --queue", live.dropped)
                 if getattr(radio, "exhausted", False):
                     break
     except KeyboardInterrupt:
         pass
     finally:
+        # Stop the worker before the final flush so nothing writes behind it.
+        # Never block on a full queue here: the point is to shut down.
+        try:
+            work.put(None, timeout=5.0)
+        except queue.Full:
+            log.warning("decode queue still full at shutdown; %d block(s) dropped",
+                        work.qsize())
+        decoder.join(timeout=10.0)
+        if decoder.is_alive():
+            log.warning("the decode thread did not stop; %d block(s) unprocessed",
+                        work.qsize())
         if dd is not None:
             emit(dd.flush())
         if writer is not None:
@@ -933,8 +1052,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
                      mqtt.published, mqtt.alerts, mqtt.captures)
             mqtt.close()
         if rearms or heals:
-            log.warning("silence watchdog: %d re-arm(s), %d heal(s) — the radio went quiet "
-                        "without erroring", rearms, heals)
+            # Re-arms are routine now and cheap; heals are not, and a
+            # dropped block means the decoder could not keep up.
+            log.warning("silence watchdog: %d re-arm(s), %d heal(s)%s", rearms, heals,
+                        f", {live.dropped} block(s) dropped" if live.dropped else "")
         if watcher is not None:
             log.warning("all-on watch: %s", watcher.summary())
         if unknown:

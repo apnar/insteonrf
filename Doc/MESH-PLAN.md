@@ -26,6 +26,7 @@ not proven on air**. What is deployed:
 | `insteon` sidecar | patched image `localhost/insteon-mqtt-raw:local`, publishing every inbound message to `insteon/raw/rx`. Injection compiled in but **disabled** in `config.yaml`. |
 | `insteonrf` pod | now also publishes raw captures to `insteon-rf/rx/dongle`, so the rfcat dongle is the mesh's first receiver. |
 | `insteonrf-mesh` pod | fuses captures, compares against `insteon/raw/rx`, writes `/nvme/churn/insteonrf-mesh/log/insteon-rf-mesh.jsonl` and an hourly miss table. **No `--inject`.** |
+| `insteonrf-v4` pod | the RTL-SDR Blog V4 on `insteon-rf/rx/v4` (2026-09-21). Three radios on the air, and the only one of them producing soft decisions. |
 
 Verified end to end on live traffic: a benign Get-Engine probe produced
 captures on `insteon-rf/rx/dongle`, matching frames on `insteon/raw/rx`, fused
@@ -412,6 +413,22 @@ so `rtl_sdr` silently dropped the tail of every packet. A reader thread now
 drains the pipe into a 4 s queue (0 drops in these runs). Also `--demod auto`
 picked the C demodulator, which fails on real signals; `numpy` is the
 default. See the 2.5.5 changelog.
+
+**Resolved 2026-09-21: the dongle wedges, and a reset was the wrong cure.**
+A day with all three receivers made it measurable. The dongle was deaf for
+about three quarters of the day in spells that began the moment a busy
+exchange ended (75 spells, median 2.5 s of listening and an 18 min gap),
+while still answering register reads and still reporting `MARC_STATE_RX`
+with correct registers and a normal noise floor. It is not USB, not the air
+and not the radio — stopped, it decodes 17 packets in 24 s on frequency.
+Only 8 of 128 USB resets were followed by a decode inside a minute, so the
+reset escalation is gone; the threshold is now 20 s and the action is always
+a re-arm. The suspected mechanism is the one below: the firmware's RF ISR
+drops a packet without re-arming DMA when the host has not taken the
+previous one, so the monitor's per-block work (capture publish, decode,
+watcher, log write) now runs on a worker thread and the receive loop does
+nothing but drain the radio. The Heltec did become the reference clock this
+was measured against, as the note below hoped. Superseded detail follows.
 
 **A finding about the dongle, not the V4.** Comparing the three logs showed
 the dongle *pod* deaf for most of the day: gaps of 27, 100, 52, 96, 51 and

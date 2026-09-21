@@ -100,6 +100,11 @@ class Sighting:
     rssi_dbm: float | None = None
     timestamp: float | None = None
     bits: str = ""
+    #: Symbol SNR in dB, from an I/Q receiver; ``None`` for hard bits. Kept
+    #: per receiver rather than per event because comparing receivers is the
+    #: point of having more than one, and this is the number that says how
+    #: much margin each of them had on the same transmission.
+    snr_db: float | None = None
     #: Per-symbol signed confidence aligned with ``bits`` (positive = ``1``,
     #: ``±1`` a clean symbol), from an I/Q receiver; ``None`` for hard bits.
     soft: np.ndarray[Any, Any] | None = field(default=None, repr=False)
@@ -134,6 +139,7 @@ def sightings_from_capture(
     timestamp: float | None = None,
     min_bytes: int = 4,
     soft: np.ndarray[Any, Any] | None = None,
+    snr_db: float | None = None,
 ) -> list[Sighting]:
     """Every packet in one receiver's capture, each with its aligned bits.
 
@@ -165,6 +171,7 @@ def sightings_from_capture(
         pkt.index_ok = indexes_ok(data, idx)
         pkt.rssi_dbm = rssi_dbm
         out.append(Sighting(pkt, receiver, rssi_dbm, timestamp, bits[pos:],
+                            snr_db=snr_db,
                             soft=None if conf is None else conf[pos:]))
     return out
 
@@ -177,12 +184,15 @@ class ReceiverView:
     crc_ok: bool = False
     rssi_dbm: float | None = None
     best_hops_left: int = -1
+    #: Best symbol SNR this receiver had on this message, if it measures one.
+    snr_db: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "copies": self.copies,
             "crc_ok": self.crc_ok,
             "rssi_dbm": self.rssi_dbm,
+            "snr_db": self.snr_db,
             "hops_left": self.best_hops_left if self.best_hops_left >= 0 else None,
         }
 
@@ -552,6 +562,8 @@ class _Bucket:
             v.copies += 1
             if s.rssi_dbm is not None and (v.rssi_dbm is None or s.rssi_dbm > v.rssi_dbm):
                 v.rssi_dbm = s.rssi_dbm
+            if s.snr_db is not None and (v.snr_db is None or s.snr_db > v.snr_db):
+                v.snr_db = s.snr_db
             if s.packet.crc_ok is True:
                 v.crc_ok = True
             v.best_hops_left = max(v.best_hops_left, s.packet.hops_left)

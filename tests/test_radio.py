@@ -344,3 +344,33 @@ def test_sdr_receiver_numpy_stream_decodes_split_bursts(tmp_path):
         rx._start = lambda: None  # already wired to the file
         decoded = [p.data for _, bits in rx.iter_bits() for p in parse_bits(bits) if p.crc_ok]
     assert decoded.count(pkt.data) >= 1
+
+
+def test_read_rssi_reads_the_register_once(fake_radio):
+    """Written as a conditional expression this asked the dongle twice, once
+    for the type test and once for the value -- two USB round-trips per block
+    on the one thread that has to be draining the radio."""
+    radio = rfcat_mod.RfcatRadio()
+    calls = []
+
+    def counting_rssi():
+        calls.append(1)
+        return 0x5A
+
+    radio.dev.getRSSI = counting_rssi
+    assert radio.read_rssi() == 0x5A / 2.0 - rfcat_mod.RSSI_OFFSET_DB
+    assert len(calls) == 1
+
+
+def test_read_rssi_accepts_a_bytes_answer(fake_radio):
+    """Older rflib hands back a buffer rather than an int."""
+    radio = rfcat_mod.RfcatRadio()
+    radio.dev.getRSSI = lambda: b"\x5a"
+    assert radio.read_rssi() == 0x5A / 2.0 - rfcat_mod.RSSI_OFFSET_DB
+
+
+def test_read_rssi_survives_a_junk_answer(fake_radio):
+    """A wedged dongle must not take the receive loop down with it."""
+    radio = rfcat_mod.RfcatRadio()
+    radio.dev.getRSSI = lambda: object()
+    assert radio.read_rssi() is None

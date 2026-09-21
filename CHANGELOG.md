@@ -4,6 +4,86 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.7.0 — 2026-09-21
+
+The deaf dongle, explained and fixed, and a third receiver on the air.
+
+A day with all three listeners running made the dongle's drop-outs
+measurable against the Heltec as a reference clock. It had been deaf for
+about three quarters of the day, in spells that began the moment a busy
+exchange ended: 75 listening spells since the previous midnight, a median
+of 2.5 s and 11 messages each, separated by a median gap of 18 minutes and
+a worst of 183.
+
+**What it is not.** Not USB: the kernel logged no error, no disconnect and
+no over-current on that port all day — every event on it was the watchdog's
+own reset. Not quiet air: the Heltec had heard between 7 and 109 messages
+in the ten minutes before every one of those resets, never zero. Not the
+radio: with the pod stopped the dongle decoded 17 packets in 24 s at
+914.950 MHz and 13 at 915.000, and nothing more than 50 kHz either side, so
+it is correctly tuned and sensitive; carrier-detect capture worked too, and
+host-side runs then heard 24 of 24 probes across four timed phases. Not the
+frequency, the container's libraries (same pyusb both sides), or the RSSI
+peek on its own (6 of 6 probes with it left in).
+
+**What it is.** The receive path wedges mid-run while the chip still
+answers register reads and still reports `MARC_STATE_RX` with a correct
+modem configuration and a normal noise floor, and then hands over nothing
+at all — not even the noise false-syncs. Caught live with a probe every
+30 s: the pod heard 9 of 9, went deaf, missed 8, and came back on the tick
+exactly five minutes after its last decode, which is when the old threshold
+re-armed it. The best-supported mechanism is the one 2.6.1 already
+suspected: the firmware's RF ISR drops a packet *without re-arming DMA*
+when the main loop has not shipped the previous one, so whatever keeps the
+host from draining EP5 during a burst costs the whole spell that follows.
+
+- **Re-arm after 20 s of silence, not 30 minutes.** `--max-silence`
+  defaults to 20 s and the pod passes it explicitly. A re-arm is a handful
+  of register writes and can only lose a packet that is mid-flight.
+- **The USB reset is no longer a step.** Over that day only 8 of 128 resets
+  were followed by a decode inside a minute, the median wait for the next
+  one was half an hour, and only 19% of listening spells began within 90 s
+  of one — while the dongle was re-enumerated 200 times for nothing.
+  `_silence_action` never returns `heal` now. A reset is reached only when
+  the dongle has stopped answering, which the new `--diag-after` (default
+  300 s) decides, and by `receive()` on repeated USB errors as before.
+  Diagnostics are logged on that same slower timer rather than per action,
+  which at a 20 s threshold would have been the whole log.
+- **The decoder runs off the receive thread.** Publishing a capture,
+  decoding with repair, the all-on watcher and the log write together take
+  far longer than a block takes to arrive during a burst, and they sat
+  between reads. They now run on a worker thread behind a bounded queue
+  (`--queue`, default 512); the receive loop reads the radio, samples RSSI
+  and hands the block over. A full queue drops a block and counts it rather
+  than stalling the receiver — except on the `file` backend, which is
+  marked `lossless` so replay still decodes identically whatever the queue
+  size.
+- **`read_rssi()` asked the dongle twice per block.** Written as a
+  conditional expression, the `isinstance` test called `getRSSI()` and then
+  the value called it again: two USB round-trips per block on the one
+  thread that has to be draining the radio.
+- **Two listeners could not share a broker.** `MqttPublisher` used the
+  fixed client id `insteon-rf`, so the dongle pod and the V4 pod evicted
+  each other in a reconnect loop the moment both were running. The id is
+  now unique per process unless the caller names one.
+
+- **Each receiver's SNR now reaches the fused record.** The V4 publishes
+  symbol SNR with every capture and the mesh parsed it, then dropped it:
+  `snr_db` was null on every event ever logged. It is now kept per receiver
+  in `heard_by`, next to that receiver's RSSI and hop count, which is where
+  a comparison between the three radios reads it.
+
+**The V4 joins the mesh** (`deploy/insteonrf-v4.yaml`, receiver name `v4`).
+It had never actually been deployed — it ran by hand once, for thirty
+seconds, on 2026-09-19, which is why it appears in the logs as four events
+and nothing since. It is the only receiver that produces soft decisions, so
+fusion can repair a damaged copy from this radio alone. First minutes on
+air: 3 to 5 captures per probe against 1 to 2 from each of the other two.
+The image now builds the *blog* fork of librtlsdr (stock Osmocom does not
+know the V4's R828D front end) with `DETACH_KERNEL_DRIVER=ON`, because the
+kernel's DVB driver claims this device on sight and the host blacklist only
+helps if those modules were not already loaded.
+
 ## 2.6.1 — 2026-09-19
 
 The deaf dongle, second pass. Still not fully explained, but now measured

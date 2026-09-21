@@ -428,3 +428,26 @@ def test_misaligned_confidence_is_dropped_not_trusted():
 
     s = Sighting(pkt(), "v4", soft=np.zeros(10, dtype=np.float32))
     assert s.soft is None
+
+
+def test_receiver_view_keeps_each_receiver_s_snr():
+    """Comparing receivers is the point of having more than one, and symbol
+    SNR is the number that says how much margin each had on the same
+    transmission. Only I/Q receivers measure one, so it lives per receiver
+    rather than per event."""
+    from insteonrf.fusion import ReceiverView, Sighting, fuse_all
+
+    p = pkt()
+    sights = [
+        Sighting(p, "v4", rssi_dbm=None, timestamp=1.0, snr_db=18.5),
+        Sighting(p, "v4", rssi_dbm=None, timestamp=1.05, snr_db=22.0),
+        Sighting(p, "dongle", rssi_dbm=-70.0, timestamp=1.02),
+    ]
+    events = list(fuse_all(sights))
+    assert len(events) == 1
+    views = events[0].receivers
+    # The best copy's margin, not the last one's.
+    assert views["v4"].snr_db == 22.0
+    assert views["dongle"].snr_db is None
+    assert events[0].to_dict()["heard_by"]["v4"]["snr_db"] == 22.0
+    assert ReceiverView().snr_db is None

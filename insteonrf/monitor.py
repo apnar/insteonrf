@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -130,7 +131,7 @@ class MqttPublisher:
 
     def __init__(self, host: str, port: int = 1883, topic: str = "insteon-rf",
                  *, username: str | None = None, password: str | None = None,
-                 client_id: str = "insteon-rf", per_device: bool = True, qos: int = 0,
+                 client_id: str | None = None, per_device: bool = True, qos: int = 0,
                  alerts_only: bool = False, alert_qos: int = 1,
                  alert_retain: bool = False):
         try:
@@ -149,6 +150,13 @@ class MqttPublisher:
         self.published = 0
         self.alerts = 0
         self.captures = 0
+        # A fixed client id means two listeners evict each other from the
+        # broker in a loop, each reconnect re-subscribing, which reads as a
+        # broker fault rather than as a name collision. There is more than one
+        # of these now -- the dongle and the V4 both publish captures -- so
+        # the id is unique per process unless the caller names one.
+        if client_id is None:
+            client_id = "insteon-rf-" + uuid.uuid4().hex[:8]
         # paho 2.x deprecates the v1 callback API; ask for v2 where it exists.
         api = getattr(mqtt, "CallbackAPIVersion", None)
         self.client = (mqtt.Client(api.VERSION2, client_id=client_id) if api is not None

@@ -472,10 +472,18 @@ class RfcatRadio:
         if dev is None:
             return None
         try:
-            raw = int(dev.getRSSI()[0] if isinstance(dev.getRSSI(), (bytes, bytearray))
-                      else dev.getRSSI())
+            # Exactly one register read. Written as a conditional expression
+            # this called getRSSI() twice -- once for the type test and once
+            # for the value -- so every block cost two USB round-trips on the
+            # thread that has to be draining the dongle.
+            answer = dev.getRSSI()
         except Exception as err:  # a wedged dongle, or an older rflib
             log.debug("getRSSI failed: %r", err)
+            return None
+        try:
+            raw = int(answer[0] if isinstance(answer, (bytes, bytearray)) else answer)
+        except (TypeError, ValueError) as err:
+            log.debug("getRSSI returned %r: %r", answer, err)
             return None
         if raw > 127:
             raw -= 256

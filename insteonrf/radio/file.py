@@ -17,6 +17,12 @@ class FileRadio:
     """Replay bit-string files (``tests/data/*.txt``) as if they were received."""
 
     name = "file"
+    #: A file will wait; a radio will not. Consumers that must never stall a
+    #: live receiver (the dongle's firmware drops a packet without re-arming
+    #: DMA when its USB buffer is not drained) may drop work under load, and
+    #: this says replay is the one source where that would be a bug instead:
+    #: the same file must always decode to the same packets.
+    lossless = True
 
     def __init__(self, paths: Sequence[str | Path] | str | Path = (), *,
                  loop: bool = False, delay_s: float = 0.0, lines: Sequence[str] | None = None):

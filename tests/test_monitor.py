@@ -238,3 +238,32 @@ def test_alerts_can_be_retained(monkeypatch):
     pub = MqttPublisher("broker", alerts_only=True, alert_retain=True)
     pub.publish_alert({"alert": "x"})
     assert sent[0][2] is True
+
+
+def test_two_publishers_do_not_share_a_client_id(monkeypatch):
+    """A fixed id makes two listeners evict each other from the broker in a
+    loop, each reconnect re-subscribing. With the dongle and the V4 both
+    publishing captures that is two pods fighting, and it reads as a broker
+    fault rather than as a name collision."""
+    import sys
+    import types
+
+    ids = []
+
+    class FakeClient:
+        def __init__(self, client_id=None):
+            ids.append(client_id)
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    fake = types.ModuleType("paho.mqtt.client")
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "paho", types.ModuleType("paho"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt", types.ModuleType("paho.mqtt"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt.client", fake)
+
+    MqttPublisher("broker")
+    MqttPublisher("broker")
+    assert len(ids) == 2 and ids[0] != ids[1]
+    assert all(i and i.startswith("insteon-rf-") for i in ids)

@@ -64,10 +64,21 @@ spec:
         # ...except raw captures, which make this dongle a member of the
         # listener mesh that the insteonrf-mesh pod fuses.
         - --mesh-capture=dongle
-        # The dongle goes deaf without erroring (five times on 2026-09-19,
-        # ~5 h of a 7 h day, confirmed against the Heltec's log); a USB reset
-        # cures it. Re-arm after 5 min of silence, USB-reset after 10.
-        - --max-silence=300
+        # The dongle goes deaf without erroring, mid-run, while still
+        # answering register reads and still reporting MARC_STATE_RX with a
+        # correct modem configuration and a normal noise floor. Re-arming
+        # receive is the only thing measured to bring it back, so do it after
+        # 20 s of silence rather than the 5 min it used to wait: on
+        # 2026-09-21 it spent three quarters of the day deaf, in spells that
+        # began the moment a busy exchange ended.
+        #
+        # The USB reset that used to follow at 10 min is gone. Over that same
+        # day only 8 of 128 resets were followed by a decode inside a minute
+        # (median wait: half an hour) while the dongle was re-enumerated 200
+        # times for nothing. A reset now happens only if the dongle stops
+        # answering altogether, which --diag-after decides.
+        - --max-silence=20
+        - --diag-after=300
         - --out=/config/log/insteon-rf.jsonl
         - --watch-all-on
         - --known-groups=/config/groups.txt

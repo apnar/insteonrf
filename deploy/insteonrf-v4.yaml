@@ -1,0 +1,98 @@
+# insteon-rf V4 — RTL-SDR Blog V4 as a third listener, receive only.
+#
+# Why this exists: the mesh is only worth having if its receivers fail
+# independently, and this one fails differently from the other two. It is the
+# only receiver that produces **soft decisions** — one signed byte of
+# confidence per bit — so `fusion` can repair a damaged copy from this radio
+# alone, where the dongle's and the Heltec's hard bits need two copies to vote
+# with. On the one 15 s comparison ever run at this spot (2026-09-19) it had
+# the most CRC-valid copies of the three, and missed only the two faintest
+# things the dongle heard at about -105 dBm.
+#
+# NEVER add a transmit path. There is exactly one transmitter on an Insteon
+# network and it is the PLM. This backend cannot transmit in any case:
+# SdrReceiver.transmit_bits raises.
+#
+# Hardware: RTL-SDR Blog V4 (0bda:2838, "Blog V4", R828D front end) on USB
+# bus 1 port 11. It needs the *blog* fork of librtlsdr, which the image
+# builds; stock Osmocom librtlsdr does not know the R828D and mistunes it.
+#
+# Gain 37.2 with the default squelch of 12 is the setting measured here: at
+# 49.6 the noise floor rises from ~2.7 to 6.8 (|IQ|) and the squelch chatters.
+#
+# Uses the same locally built image as the other two pods, so
+# imagePullPolicy MUST stay Never. See deploy/insteonrf.yaml for the build.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insteonrf-v4
+  labels:
+    app: insteonrf-v4
+spec:
+  restartPolicy: Always
+  containers:
+    - name: insteonrf-v4
+      image: localhost/insteonrf:local
+      imagePullPolicy: Never
+      # privileged + /dev/bus/usb: librtlsdr drives the tuner over raw USB.
+      securityContext:
+        privileged: true
+      env:
+        - name: TZ
+          value: "America/New_York"
+        - name: INSTEONRF_MQTT_USER
+          valueFrom:
+            secretKeyRef:
+              name: mosquitto
+              key: username
+        - name: INSTEONRF_MQTT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: mosquitto
+              key: password
+      args:
+        - monitor
+        - --backend=rtlsdr
+        - --gain=37.2
+        # The C demodulator fails on real signals the numpy path decodes.
+        - --demod=numpy
+        - --mqtt=192.168.88.5:1883
+        - --topic=insteon-rf
+        # Per-packet MQTT is off for the same reason as the dongle pod: the
+        # broker logs a line per publish. Captures still go to the mesh.
+        - --mqtt-alerts-only
+        - --mesh-capture=v4
+        # The all-on watch lives in the dongle pod; this one is a receiver
+        # for the mesh and its own record, nothing more.
+        - --out=/config/log/insteon-rf-v4.jsonl
+        # No silence watchdog: re-arming means nothing to this backend
+        # (SdrReceiver.configure_rx is a no-op) and if rtl_sdr dies the pod
+        # exits on `exhausted` and Kubernetes restarts it, which is the
+        # recovery that actually applies here.
+        - --max-silence=0
+        - --quiet
+        - -v
+      resources:
+        requests:
+          memory: "256Mi"
+        limits:
+          # Demodulating 2.4 Msps of I/Q in numpy is the one CPU-hungry
+          # receiver of the three.
+          memory: "1Gi"
+      volumeMounts:
+        - mountPath: /config
+          name: config
+        - mountPath: /dev/bus/usb
+          name: usb
+  volumes:
+    - name: config
+      hostPath:
+        # On nvme/churn, not nvme/k8s: this is a rotating log, which is
+        # exactly the churn that made nvme/k8s snapshots expensive.
+        path: /nvme/churn/insteonrf-v4
+        type: Directory
+    - name: usb
+      hostPath:
+        path: /dev/bus/usb
+        type: Directory

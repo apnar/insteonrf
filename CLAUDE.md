@@ -71,6 +71,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `esphome/components/insteon_rf/` | ESPHome listener firmware (SX1262, receive only) |
 | `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/k8s/yaml/AGENTS.md` conventions) |
 | `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
+| `deploy/insteonrf-v4.yaml` | the RTL-SDR Blog V4 as a third listener (`--mesh-capture=v4`), the only one producing soft decisions |
 | `deploy/insteon-mqtt/` | patch series + Containerfile adding `insteon/raw/rx` and `insteon/raw/inject` to insteon-mqtt |
 
 Pipeline contract: one burst per line of `0`/`1` characters; blank lines ignored; `#` lines are
@@ -175,25 +176,58 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   `insteon-rf allon --known-groups <groups.txt>`; build the group list with
   `grep -oE '^  - modem: [0-9]+' /k8s/insteon-config/scenes.yaml | awk '{print $3}' | sort -nu`
   (114 legitimate groups, 0 not among them).
-- **The dongle pod goes deaf** (2026-09-19: five gaps of 20–100 min in one day while the
-  Heltec a few feet away kept capturing; also on about half of pod restarts, from the
-  first second). Two flavours seen: still answering USB commands but delivering nothing,
-  and — five minutes into a spell — answering nothing at all (firmware trace code
-  `LCE_USB_EP5_TX_WHILE_INBUF_WRITTEN` afterwards). **A USB bus reset from a separate
-  process while the pod holds the interface cures it within seconds (4 of 4);** the same
-  reset from the pod's own process after releasing did not (0 of 4), so `heal()` spawns a
-  child interpreter to reset *before* closing. `--max-silence=300`, counted from the last *decoded packet* (a deaf dongle still
-  false-syncs on noise about once a minute and hands over junk blocks); `diagnostics()`
-  (MARCSTATE, RSSI, firmware trace codes, SFRs, the modem registers) is logged around
-  every watchdog action and on `SIGUSR1` — `kill -USR1 $(pgrep -f 'insteon-rf monitor')`
-  from the host; read `kubectl logs insteonrf` for `radio on request` / `radio after N
-  min` / `after heal`. To tell quiet air from a deaf dongle, compare against
-  the Heltec's per-minute `Captures` sensor or `insteon-rf/rx/insteon-rf-main` on MQTT.
-  From the host, `insteon-rf reset` is the operator's cure. **Never let a test or tool
-  reset the dongle while the pod holds it**: `tests/test_radio.py`'s `fake_radio` stubs
-  both `usb_reset` and `external_usb_reset` because, for one afternoon, every `make
-  check` knocked the pod's receiver over and looked like a flaky dongle. `bpftrace -e
+- **The dongle wedges mid-run; re-arm, do not reset** (measured 2026-09-21 with the
+  Heltec as a reference clock). It had been deaf about three quarters of the day, in
+  spells that began the moment a busy exchange ended: 75 spells in 32 h, a median of
+  2.5 s and 11 messages each, separated by a median 18 min and a worst of 183. While
+  wedged the chip still answers register reads, still reports `MARC_STATE_RX` with a
+  correct modem configuration and a normal −106 dBm floor, and delivers *nothing* —
+  not even the noise false-syncs. It is not USB (no kernel error, disconnect or
+  over-current on that port all day), not the air (the Heltec heard 7–109 messages in
+  the 10 min before every reset), and not the radio (stopped, it decoded 17 packets in
+  24 s at 914.950 MHz and 13 at 915.000, nothing beyond ±50 kHz of those).
+  **Re-arming receive is what recovers it**; a USB reset is not — only 8 of 128 resets
+  were followed by a decode inside a minute, median wait half an hour, and the dongle
+  was re-enumerated 200 times for nothing. So `--max-silence=20` (a re-arm is a few
+  register writes and can only lose a packet mid-flight) and no time-based heal at all:
+  `_silence_action` never returns `heal`, and a reset happens only when
+  `--diag-after` (300 s) finds the dongle no longer answering, or `receive()` hits
+  repeated USB errors. Liveness is a *decoded packet*, never a block.
+  Leading mechanism, per the firmware: its RF ISR drops a packet **without re-arming
+  DMA** when the main loop has not shipped the previous one, so anything that keeps the
+  host from draining EP5 during a burst costs the whole spell after it. Hence the
+  decode worker (below). `LCE_USB_EP5_TX_WHILE_INBUF_WRITTEN` is **not** a marker of the
+  deaf state — it is in every dump, including `radio at start` on a healthy dongle.
+  `diagnostics()` (MARCSTATE, RSSI, firmware trace codes, SFRs, modem registers) is
+  logged at start, on the `--diag-after` timer and on `SIGUSR1` —
+  `kill -USR1 $(pgrep -f 'insteon-rf monitor')` from the host. To tell quiet air from a
+  deaf dongle, compare against the Heltec's per-minute `Captures` sensor or
+  `insteon-rf/rx/insteon-rf-main` on MQTT. **Never let a test or tool reset the dongle
+  while the pod holds it**: `tests/test_radio.py`'s `fake_radio` stubs both `usb_reset`
+  and `external_usb_reset` because, for one afternoon, every `make check` knocked the
+  pod's receiver over and looked like a flaky dongle. `bpftrace -e
   'kprobe:usb_reset_device { printf("%s %d\n", comm, pid) }'` names the culprit.
+- **Nothing heavy on the receive thread.** `monitor` reads the radio, samples RSSI and
+  hands the block to a worker thread behind a bounded queue (`--queue`, default 512);
+  publishing the capture, decoding with repair, the all-on watcher and the log write all
+  happen there. A full queue drops a block and counts it rather than stalling the
+  receiver — except on the `file` backend, which is marked `lossless` so replay decodes
+  identically at any queue size. `read_rssi()` used to ask the dongle **twice** per
+  block (the `isinstance` test evaluated `getRSSI()` again), which is two USB
+  round-trips per block on exactly the thread that must not be busy.
+- **Two listeners cannot share an MQTT client id.** `MqttPublisher` defaults to a
+  unique one now; with the fixed `insteon-rf` it had, the dongle pod and the V4 pod
+  evicted each other from the broker in a reconnect loop that reads as a broker fault.
+- **The V4 runs as a pod** (`insteonrf-v4`, receiver name `v4`), on the same image: it
+  builds the *blog* fork of librtlsdr with `DETACH_KERNEL_DRIVER=ON`, because stock
+  Osmocom librtlsdr does not know the V4's R828D front end and the kernel DVB driver
+  claims the device on sight (the host blacklist in
+  `/etc/modprobe.d/blacklist-rtlsdr.conf` only helps if those modules were not already
+  loaded, which on 2026-09-19 they were). It is the only receiver with soft decisions,
+  so `fusion` can repair a damaged copy from it alone; each receiver's symbol SNR is
+  carried per receiver in the fused event's `heard_by`. No silence watchdog
+  (`--max-silence=0`): re-arming means nothing to this backend, and if `rtl_sdr` dies
+  the pod exits on `exhausted` and Kubernetes restarts it.
 - **SDR backends live**: `--demod numpy` (the C demodulator fails on real signals); the
   reader thread in `SdrReceiver._iter_numpy` is load-bearing — demodulating one packet
   takes ~85 ms and a pipe holds 14 ms of I/Q, so without it `rtl_sdr` drops samples

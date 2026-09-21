@@ -347,28 +347,32 @@ class TestSilenceAction:
     fault -- which in the miss table means "the PLM misses nothing".
 
     rflib's own recovery needs USB errors as well as timeouts, so it does not
-    cover this. The thresholds are long because this network carries only
-    about six RF messages an hour, making a quiet house indistinguishable
-    from a broken radio over any short window."""
+    cover this. The threshold is seconds, not the half hour it once was: the
+    dongle wedges mid-run while still answering and still reporting RX, and
+    re-arming is the only thing measured to recover it."""
 
     def test_quiet_below_the_threshold_does_nothing(self):
         from insteonrf.cli import _silence_action
 
-        assert _silence_action(0.0, 1800.0) == "none"
-        assert _silence_action(1799.0, 1800.0) == "none"
+        assert _silence_action(0.0, 20.0) == "none"
+        assert _silence_action(19.0, 20.0) == "none"
 
-    def test_past_the_threshold_re_arms_first(self):
-        """Cheap fix first: a radio that fell out of RX costs one register write."""
+    def test_past_the_threshold_re_arms(self):
+        """Cheap fix: a radio that fell out of RX costs a few register writes."""
         from insteonrf.cli import _silence_action
 
-        assert _silence_action(1801.0, 1800.0) == "rearm"
-        assert _silence_action(3599.0, 1800.0) == "rearm"
+        assert _silence_action(21.0, 20.0) == "rearm"
+        assert _silence_action(3599.0, 20.0) == "rearm"
 
-    def test_escalates_to_a_reset_only_after_twice_as_long(self):
+    def test_never_escalates_to_a_reset_on_time_alone(self):
+        """Measured over a day: only 8 of 128 USB resets were followed by a
+        decode inside a minute, while the dongle was re-enumerated 200 times
+        for nothing. A reset is now for a dongle that has stopped answering,
+        which the caller decides from diagnostics, not for mere silence."""
         from insteonrf.cli import _silence_action
 
-        assert _silence_action(3601.0, 1800.0) == "heal"
-        assert _silence_action(86400.0, 1800.0) == "heal"
+        assert _silence_action(3601.0, 20.0) == "rearm"
+        assert _silence_action(86400.0, 20.0) == "rearm"
 
     def test_zero_disables_it(self):
         """A quiet house looks exactly like a deaf radio, so it must be optional."""
@@ -376,3 +380,30 @@ class TestSilenceAction:
 
         assert _silence_action(86400.0, 0.0) == "none"
         assert _silence_action(86400.0, -1.0) == "none"
+
+
+def test_decoding_off_the_receive_thread_keeps_every_packet(tmp_path):
+    """The receive loop now only drains the radio and hands blocks to a worker.
+
+    Doing the work between reads is what starved the dongle: when the
+    CC1111's USB IN buffer is not emptied promptly its firmware drops the
+    packet without re-arming DMA, and the receiver goes silent until
+    something re-arms it. Moving the work behind a queue must not change
+    what comes out, however small the queue is.
+    """
+    import json
+
+    data = str(pathlib.Path(__file__).parent / "data" / "rfcat-get-engine.txt")
+    big, small = tmp_path / "big.jsonl", tmp_path / "small.jsonl"
+    rc_a, _, _ = run(cli.monitor_main, ["--backend", "file", "--replay", data,
+                                        "-o", str(big), "--quiet"])
+    rc_b, _, _ = run(cli.monitor_main, ["--backend", "file", "--replay", data,
+                                        "-o", str(small), "--quiet", "--queue", "1"])
+    assert rc_a == 0 and rc_b == 0
+
+    def content(path):
+        # Everything but the wall clock, which differs between two runs.
+        return [(r["raw"], r["repeats"], r["hops_seen"])
+                for r in map(json.loads, path.read_text().splitlines())]
+
+    assert content(big) and content(big) == content(small)
