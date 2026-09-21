@@ -19,6 +19,7 @@
 # Image is built locally from /nvme/k8s/insteonrf-config/build (buildah bud →
 # ctr image import), so imagePullPolicy MUST stay Never:
 #   cd /nvme/k8s/insteonrf-config/build && buildah bud -t insteonrf:local . \
+#     && rm -f /var/tmp/insteonrf.tar \
 #     && buildah push localhost/insteonrf:local \
 #          docker-archive:/var/tmp/insteonrf.tar:localhost/insteonrf:local \
 #     && microk8s ctr image import /var/tmp/insteonrf.tar
