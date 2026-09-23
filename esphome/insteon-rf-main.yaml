@@ -31,6 +31,16 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  # Reported as the "Project Version" sensor, and the only version this board
+  # publishes that means anything. ESPHome's own build_time_str is frozen
+  # until the config hash changes, so a reflash of unchanged config keeps the
+  # original timestamp -- the board was still announcing a build time from
+  # four days earlier after today's OTA. Keep this equal to the Python
+  # package's version (insteonrf/_version.py) and bump both together, so
+  # "what is this board running" has one answer.
+  project:
+    name: insteonrf.listener
+    version: "2.7.3"
   on_boot:
     # Vext (the OLED's supply) is switched on at HARDWARE priority; give the
     # panel a moment before the display driver resets it at PROCESSOR.
@@ -196,6 +206,15 @@ sensor:
 text_sensor:
   - platform: version
     name: ${friendly_name} ESPHome Version
+  # The repo version this firmware was built from. ESPHome's own build_time
+  # only moves when the config hash changes, so it cannot answer "is this
+  # board running current code" on its own; this can. Matches
+  # insteonrf/_version.py -- bump both together.
+  - platform: template
+    name: ${friendly_name} Firmware Version
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return {ESPHOME_PROJECT_VERSION};'
 
 button:
   - platform: restart

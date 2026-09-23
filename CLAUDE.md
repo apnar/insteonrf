@@ -218,6 +218,15 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
 - **Two listeners cannot share an MQTT client id.** `MqttPublisher` defaults to a
   unique one now; with the fixed `insteon-rf` it had, the dongle pod and the V4 pod
   evicted each other from the broker in a reconnect loop that reads as a broker fault.
+- **The version is written once**, in `insteonrf/_version.py`, and
+  `pyproject.toml` takes it from there (`dynamic` + `attr`); that module
+  imports nothing so setuptools reads it statically and the build never
+  imports the package to learn its version. The Heltec's firmware carries
+  the same number as `esphome.project.version`, published as a *Firmware
+  Version* sensor -- ESPHome's own `build_time_str` only moves when the
+  config hash changes, so a reflash of unchanged config keeps the original
+  timestamp and cannot answer "is this board current". `tests/test_version.py`
+  pins all three together. Bump them in one commit.
 - **The V4 runs as a pod** (`insteonrf-v4`, receiver name `v4`), on the same image: it
   builds the *blog* fork of librtlsdr with `DETACH_KERNEL_DRIVER=ON`, because stock
   Osmocom librtlsdr does not know the V4's R828D front end and the kernel DVB driver

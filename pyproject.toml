@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "insteonrf"
-version = "2.7.2"
+# Single source: insteonrf/_version.py. setuptools parses that module
+# statically, so the build never imports the package to learn its version.
+dynamic = ["version"]
 description = "Receive, decode, build and transmit Insteon 915 MHz RF packets (rfcat / SDR)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,6 +35,9 @@ include = ["insteonrf*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["hardware: needs a real radio (set INSTEONRF_HW=1)"]
+
+[tool.setuptools.dynamic]
+version = { attr = "insteonrf._version.__version__" }
 
 [tool.ruff]
 line-length = 110

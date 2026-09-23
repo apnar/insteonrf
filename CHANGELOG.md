@@ -4,6 +4,26 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.7.3 — 2026-09-23
+
+Version numbers that mean something, and the listener board brought current.
+
+- **One version, in one place.** It was written twice, in `pyproject.toml`
+  and in `__init__.py`, and by 2.7.2 the two had drifted three releases
+  apart: every pod reported 2.5.4 while running 2.7.2 code. That is exactly
+  the question a deployment has to be able to answer about itself. The number
+  now lives in `insteonrf/_version.py` -- a module with no imports, so
+  setuptools reads it statically and the build never imports the package
+  (and numpy, and rflib) to learn its own version -- and `pyproject.toml`
+  takes it from there via `dynamic`. Tests refuse a second copy.
+- **The Heltec was four days stale and now says so.** Its firmware was built
+  2026-09-19 08:31; the last firmware commit landed at 08:37. Reflashed over
+  the air. ESPHome's `build_time_str` only moves when the config hash
+  changes, so the first reflash left the board still announcing the original
+  timestamp -- it now carries `esphome.project.version`, published as a
+  *Firmware Version* sensor, matching the Python package and pinned to it by
+  a test.
+
 ## 2.7.2 — 2026-09-23
 
 Two guards against decoding phantoms, after one of them spent eight days

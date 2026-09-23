@@ -1,5 +1,6 @@
 """Tools for receiving, decoding, building and transmitting Insteon RF packets."""
 
+from ._version import __version__
 from .cmds import Command
 from .debug import dump_frames
 from .packet import (
@@ -13,8 +14,8 @@ from .packet import (
     pkt_crc,
 )
 
-__version__ = "2.5.4"
 __all__ = [
+    "__version__",
     "Address",
     "Command",
     "Flags",
