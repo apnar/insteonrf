@@ -39,6 +39,13 @@ PLM_RX_TOPIC = "insteon/raw/rx"
 #: Where it accepts messages to feed into the protocol stack.
 PLM_INJECT_TOPIC = "insteon/raw/inject"
 
+#: How long a fused event waits before its "did the modem hear this too"
+#: verdict is settled. The modem's copy reaches this pod over MQTT after
+#: insteon-mqtt has parsed it, and measured against the RF path it arrived up
+#: to 1.3 s after the first RF sighting. A fusion bucket can close before
+#: that, so the answer has to be asked later than the question.
+PLM_GRACE_S = 2.5
+
 
 # --------------------------------------------------------------------------- miss table
 
@@ -273,6 +280,7 @@ class MeshService:
         on_event: Callable[[FusedEvent], None] | None = None,
         memory: PlmMemory | None = None,
         plm_addr: Address | str | None = None,
+        plm_grace_s: float = PLM_GRACE_S,
     ):
         self.receiver = receiver
         self.injector = injector
@@ -282,6 +290,13 @@ class MeshService:
         self.tracker = tracker if tracker is not None else CommandTracker()
         self.require_plm_link = require_plm_link
         self.on_event = on_event
+        #: How long a closed event waits for the modem's copy before its
+        #: verdict is settled. Must exceed nothing in particular except the
+        #: spread measured between the two paths; PlmMemory's window is what
+        #: decides whether a late copy still counts.
+        self.plm_grace_s = plm_grace_s
+        #: (deadline, event), oldest first.
+        self._holding: list[tuple[float, FusedEvent]] = []
         self.misses = MissTable(
             plm_addr if plm_addr is not None
             else (injector.plm_addr if injector is not None else None)
@@ -319,28 +334,53 @@ class MeshService:
         return len(found)
 
     def drain(self, now: float | None = None) -> list[FusedEvent]:
-        """Close finished buckets, decide on each, record, return them."""
-        out = []
+        """Close finished buckets, hold them briefly, then decide and record.
+
+        The hold is the point. A fusion bucket closes 0.6 to 2.0 s after the
+        last RF sighting, and the modem's own copy of the same message often
+        has not arrived yet -- it travels the powerline too, insteon-mqtt
+        parses it, and only then is it republished. Deciding at bucket close
+        marked about one in five messages "the PLM missed this" when the
+        modem reported it a second later.
+        """
+        if now is None:
+            now = time.time()
         for event in self.fusion.pop_ready(now):
             self.events += 1
-            # Always answer "did the modem hear this too", injector or not.
-            event.plm_saw_it = self.memory.heard(event.key, now)
-            injected = False
-            if self.injector is not None:
-                if self.require_plm_link and self.plm is not None and not self.plm.healthy():
-                    # Without the modem's mirror we cannot tell what it
-                    # already heard, and injecting blind would double-process.
-                    log.warning("no recent frames from the PLM mirror; not injecting")
-                else:
-                    # Same clock the buckets closed on, so suppression and
-                    # rate limits cannot disagree with the fusion window.
-                    injected = bool(self.injector.consider(event, now))
-            self.misses.note(event, injected)
-            if self.writer is not None:
-                self.writer.write(event.to_dict())
-            if self.on_event is not None:
-                self.on_event(event)
-            out.append(event)
+            self._holding.append((now + self.plm_grace_s, event))
+        out = []
+        while self._holding and self._holding[0][0] <= now:
+            _, event = self._holding.pop(0)
+            out.append(self._finish(event, now))
+        return out
+
+    def _finish(self, event: FusedEvent, now: float) -> FusedEvent:
+        """Settle one event: the modem verdict, injection, the miss table."""
+        # Asked now, not when the bucket closed, so the modem's copy has had
+        # the grace period to arrive. PlmMemory.heard() is symmetric, so a
+        # copy that landed either side of the event still counts.
+        event.plm_saw_it = self.memory.heard(event.key, event.last_seen)
+        injected = False
+        if self.injector is not None:
+            if self.require_plm_link and self.plm is not None and not self.plm.healthy():
+                # Without the modem's mirror we cannot tell what it already
+                # heard, and injecting blind would double-process.
+                log.warning("no recent frames from the PLM mirror; not injecting")
+            else:
+                injected = bool(self.injector.consider(event, now))
+        self.misses.note(event, injected)
+        if self.writer is not None:
+            self.writer.write(event.to_dict())
+        if self.on_event is not None:
+            self.on_event(event)
+        return event
+
+    def flush(self, now: float | None = None) -> list[FusedEvent]:
+        """Settle everything still held, at shutdown."""
+        if now is None:
+            now = time.time()
+        out = [self._finish(e, now) for _, e in self._holding]
+        self._holding.clear()
         return out
 
     def run(self, stop: threading.Event, *, poll_ms: int = 500) -> None:
@@ -350,10 +390,11 @@ class MeshService:
             if cap is not None:
                 self.handle_capture(cap)
             self.drain()
-        for event in self.fusion.flush():
-            self.misses.note(event)
-            if self.writer is not None:
-                self.writer.write(event.to_dict())
+        now = time.time()
+        for event in self.fusion.flush(now):
+            self.events += 1
+            self._holding.append((now, event))
+        self.flush(now)
 
     def stats(self) -> dict[str, Any]:
         d: dict[str, Any] = {

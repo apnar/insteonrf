@@ -15,6 +15,7 @@ import time
 
 import pytest
 
+from insteonrf import mesh as mesh_mod
 from insteonrf.inject import Injector, Tier
 from insteonrf.mesh import MeshService, MissTable
 from insteonrf.packet import START_HEADER, START_HEADER_INV, Packet, parse_bits
@@ -326,11 +327,28 @@ def cap_for(src=LEAK, group=1, receiver="up", t=100.0) -> Capture:
     return Capture(receiver=receiver, bits=p.to_bits(), timestamp=t, rssi_dbm=-70, seq=1)
 
 
+def settle(svc, now=103.0):
+    """Drain, then let the modem's grace period expire.
+
+    A closed event is held before its verdict is settled, because the modem's
+    own copy of the same message routinely arrives after the fusion window
+    shuts. Two calls, therefore, wherever a test wants the finished event.
+
+    The clock stays close to the message's own timestamp (``cap_for`` uses
+    100.0) on purpose: what the modem heard is remembered for ten seconds,
+    and a test that jumped a hundred seconds ahead would age the memory out
+    and "prove" a suppression bug that cannot happen in a run where settling
+    trails the message by the grace period.
+    """
+    svc.drain(now=now)
+    return svc.drain(now=now + mesh_mod.PLM_GRACE_S + 0.1)
+
+
 def test_service_decodes_and_fuses():
     svc = MeshService(FakeReceiver())
     assert svc.handle_capture(cap_for()) == 1
     assert svc.packets == 1
-    events = svc.drain(now=200.0)
+    events = settle(svc)
     assert len(events) == 1
     assert svc.events == 1
 
@@ -338,7 +356,7 @@ def test_service_decodes_and_fuses():
 def test_service_writes_and_reports():
     svc = MeshService(FakeReceiver())
     svc.handle_capture(cap_for())
-    svc.drain(now=200.0)
+    settle(svc)
     assert LEAK in svc.misses.devices
 
 
@@ -348,7 +366,7 @@ def test_service_injects_when_the_plm_link_is_healthy():
                    allow=[Tier.BATTERY], shadow=False)
     svc = MeshService(FakeReceiver(), injector=inj, plm=plm)
     svc.handle_capture(cap_for())
-    svc.drain(now=200.0)
+    settle(svc)
     assert len(plm.published) == 1
 
 
@@ -359,7 +377,7 @@ def test_service_refuses_to_inject_without_the_plm_mirror():
                    allow=[Tier.BATTERY], shadow=False)
     svc = MeshService(FakeReceiver(), injector=inj, plm=plm)
     svc.handle_capture(cap_for())
-    svc.drain(now=200.0)
+    settle(svc)
     assert plm.published == []
     assert inj.counters.injected == 0
 
@@ -371,9 +389,9 @@ def test_service_suppresses_what_the_plm_reported():
     svc = MeshService(FakeReceiver(), injector=inj, plm=plm)
     # The patched insteon-mqtt reports the same message first.
     p = Packet.build(LEAK, group=1, bcast=True, cmd1=0x11, cmd2=0xFF)
-    inj.note_plm(to_plm_bytes(p), now=199.9)
+    inj.note_plm(to_plm_bytes(p), now=100.5)
     svc.handle_capture(cap_for())
-    svc.drain(now=200.0)
+    settle(svc)
     assert plm.published == []
     assert inj.counters.refused["the PLM already heard it"] == 1
 
@@ -397,9 +415,9 @@ def test_the_plm_comparison_works_without_an_injector():
     assert plm.on_frame == svc.memory.note
 
     p = Packet.build(LEAK, group=1, bcast=True, cmd1=0x11, cmd2=0xFF)
-    svc.memory.note(to_plm_bytes(p), now=199.9)
+    svc.memory.note(to_plm_bytes(p), now=100.5)
     svc.handle_capture(cap_for())
-    (event,) = svc.drain(now=200.0)
+    (event,) = settle(svc)
     assert event.plm_saw_it is True
     assert svc.misses.devices[LEAK].plm_also_heard == 1
 
@@ -407,7 +425,7 @@ def test_the_plm_comparison_works_without_an_injector():
 def test_a_message_the_plm_missed_is_recorded_as_missed():
     svc = MeshService(FakeReceiver(), plm=FakePlm())
     svc.handle_capture(cap_for())
-    (event,) = svc.drain(now=200.0)
+    (event,) = settle(svc)
     assert event.plm_saw_it is False
     assert svc.misses.devices[LEAK].plm_missed == 1
 
@@ -423,7 +441,7 @@ def test_undecodable_fragments_do_not_inflate_the_miss_table():
     truncated.data = truncated.data[:5]          # below the CRC
     svc.fusion = Fusion()
     svc.fusion.add(Sighting(truncated, "up", -70, 100.0))
-    svc.drain(now=200.0)
+    settle(svc)
     assert svc.misses.devices == {}
     assert svc.misses.undecodable == 1
     assert "undecodable" in svc.misses.report()
@@ -633,3 +651,62 @@ def test_soft_round_trip_through_the_publisher(monkeypatch):
     assert abs(cap.soft[doubtful]) < 0.05
     for i, b in enumerate(cap.bits[:300]):
         assert (cap.soft[i] > 0) == (b == "1")
+
+
+def test_a_modem_copy_arriving_after_the_fusion_window_still_counts():
+    """The bug this grace period exists for.
+
+    A fusion bucket closes 0.6-2.0 s after the last RF sighting, and the
+    modem's copy of the same message reaches this pod later than that: it
+    travels the powerline too, insteon-mqtt parses it, and only then is it
+    republished. Measured live on 2026-09-21, one in five messages the modem
+    did report were marked "PLM MISSED" because the verdict was taken at
+    bucket close. With injection on, each of those is a message handed to
+    insteon-mqtt just before it reports the same one itself.
+    """
+    svc = MeshService(FakeReceiver(), plm=FakePlm())
+    svc.handle_capture(cap_for())
+    svc.drain(now=103.0)                       # bucket closes, verdict held
+    p = Packet.build(LEAK, group=1, bcast=True, cmd1=0x11, cmd2=0xFF)
+    svc.memory.note(to_plm_bytes(p), now=101.3)   # the modem, a beat late
+    (event,) = svc.drain(now=103.0 + mesh_mod.PLM_GRACE_S + 0.1)
+    assert event.plm_saw_it is True
+    assert svc.misses.devices[LEAK].plm_missed == 0
+
+
+def test_the_verdict_is_not_settled_before_the_grace_expires():
+    svc = MeshService(FakeReceiver(), plm=FakePlm())
+    svc.handle_capture(cap_for())
+    assert svc.drain(now=103.0) == []
+    assert svc.misses.devices == {}, "nothing is counted until it is settled"
+    assert svc.events == 1, "but the event is known to have closed"
+
+
+def test_shutdown_settles_whatever_is_still_held():
+    svc = MeshService(FakeReceiver(), plm=FakePlm())
+    svc.handle_capture(cap_for())
+    svc.drain(now=103.0)
+    (event,) = svc.flush(now=103.1)
+    assert event.plm_saw_it is False
+    assert svc.misses.devices[LEAK].plm_missed == 1
+    assert svc.flush(now=103.2) == []
+
+
+def test_the_miss_table_excludes_the_modem_s_own_transmissions():
+    """The modem is heard on RF but never comes back as an inbound message,
+    so counting it makes it the device that misses everything -- it led the
+    first live miss table at a 100% rate and buried every real device."""
+    svc = MeshService(FakeReceiver(), plm_addr=PLM)
+    svc.handle_capture(cap_for(src=PLM))
+    settle(svc)
+    assert svc.misses.devices == {}
+    assert svc.misses.plm_own_transmissions == 1
+    assert "from the modem itself" in svc.misses.report()
+
+
+def test_without_the_modem_address_it_is_counted_like_any_device():
+    """Which is why the mesh command has to pass it, injector or not."""
+    svc = MeshService(FakeReceiver())
+    svc.handle_capture(cap_for(src=PLM))
+    settle(svc)
+    assert PLM in svc.misses.devices

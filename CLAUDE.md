@@ -270,6 +270,20 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   behaves like stock. It also validates its config against a cerberus schema that rejects
   unknown keys under `mqtt:`, so a new config section needs a schema patch or the sidecar
   crash-loops and Insteon goes down.
+- **The modem's copy of a message can arrive after the RF copy**, so a
+  "did the PLM hear this too" verdict cannot be taken when the fusion bucket
+  closes. It travels the powerline as well as the air, insteon-mqtt parses it
+  and only then republishes it; measured 2026-09-21 it landed 0.7-1.3 s after
+  the first RF sighting for one message in five. `MeshService` holds a closed
+  event for `PLM_GRACE_S` (2.5 s) before settling it, and `PlmMemory.heard()`
+  is two-sided and anchored on the *message's* time, not on the clock -- using
+  the clock would push every message out of its own suppression window by
+  however long it waited.
+- **`--plm-addr` has to reach the miss table**, which means passing it to
+  `MeshService`, not only to the injector: with no `--inject` there is no
+  injector to borrow it from, and the modem then leads its own miss report at
+  100% (2,936 messages) because its transmissions are heard on RF and never
+  come back as inbound messages.
 - **insteon-mqtt's own duplicate window is `hops_left * 0.087` s** (`* 0.183` extended),
   which is *zero* at no hops left. Measured live: it processed two copies of one ACK, at
   hops 1 and 0, 87 ms apart. Anything feeding it messages must do its own suppression.

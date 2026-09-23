@@ -1196,9 +1196,13 @@ def mesh_main(argv: list[str] | None = None) -> int:
         print(f"{_ts_line(event.first_seen, 0).split()[0]} {event.packet.summary()}  "
               f"[{event.heard_by} rx, closest {who}]{flag}", flush=True)
 
+    # plm_addr matters even with no injector: without it the miss table
+    # counts the modem's own transmissions, which are heard on RF but never
+    # come back as inbound messages, so the modem leads its own report at a
+    # 100% miss rate and every real device is buried under it.
     service = MeshService(receiver, injector=injector, plm=plm, fusion=fusion,
                           writer=writer, require_plm_link=not a.no_plm,
-                          on_event=echo)
+                          on_event=echo, plm_addr=a.plm_addr)
 
     if battery:
         log.info("%d battery devices treated as unpollable", len(battery))

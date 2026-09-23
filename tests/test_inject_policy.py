@@ -153,10 +153,16 @@ def test_suppression_ignores_hops():
 
 
 def test_suppression_window_expires():
-    """Past the window it is a new transmission, not a duplicate."""
+    """Past the window it is a new transmission, not a duplicate.
+
+    The window is measured between the two paths' copies of one message, so
+    it is the *message* that has to be later, not merely the moment the
+    decision is taken: an event can wait a grace period before being settled
+    and that must not age it out of its own suppression.
+    """
     inj = injector(suppress_window_s=2.0)
     inj.note_plm(to_plm_bytes(event(src=LEAK, group=1).packet), now=100.0)
-    d = inj.consider(event(src=LEAK, group=1), now=105.0)
+    d = inj.consider(event(src=LEAK, group=1, timestamp=105.0), now=105.0)
     assert d.inject is True
     assert d.reason == "injected"
 
@@ -294,3 +300,29 @@ def test_counters_report_why_things_were_refused():
     assert d["refused"]["reply to an outstanding command"] == 1
     assert d["refused"]["the PLM's own transmission"] == 1
     assert d["refused"]["tier GROUP not enabled"] == 1
+
+
+def test_suppression_is_anchored_on_the_message_not_the_decision():
+    """An event waits a grace period before being settled, so that the
+    modem's copy has time to arrive. If the suppression lookup used the
+    moment of the decision instead of the message's own time, that wait
+    would push every message out of its own window and the injector would
+    hand insteon-mqtt messages it had already reported."""
+    inj = injector(suppress_window_s=2.0)
+    p = event(src=LEAK, group=1, timestamp=100.0)
+    inj.note_plm(to_plm_bytes(p.packet), now=100.4)
+    d = inj.consider(event(src=LEAK, group=1, timestamp=100.0), now=102.6)
+    assert d.inject is False
+    assert d.reason == "the PLM already heard it"
+
+
+def test_the_modem_may_report_a_message_after_the_rf_copy():
+    """Measured: the modem's copy landed up to 1.3 s after the first RF
+    sighting for one message in five. The window is two-sided for that."""
+    inj = injector(suppress_window_s=2.0)
+    p = event(src=LEAK, group=1, timestamp=100.0)
+    inj.note_plm(to_plm_bytes(p.packet), now=101.3)      # modem, later
+    assert inj.consider(event(src=LEAK, group=1, timestamp=100.0), now=103.0).inject is False
+    inj2 = injector(suppress_window_s=2.0)
+    inj2.note_plm(to_plm_bytes(p.packet), now=98.7)      # modem, earlier
+    assert inj2.consider(event(src=LEAK, group=1, timestamp=100.0), now=103.0).inject is False

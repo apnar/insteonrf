@@ -4,6 +4,36 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.7.1 — 2026-09-23
+
+Two measurement bugs in the mesh, both found on 2026-09-21 and both fixed
+here. Neither changed what was received; both changed what the numbers said
+about it, and both would have misfired once injection was switched on.
+
+- **The miss table counted the modem as a device.** `MeshService` accepted a
+  `plm_addr` and the mesh command never passed one, so the exclusion that
+  `MissTable` already implemented never ran: with no `--inject` there is no
+  injector to borrow the address from. The modem therefore led its own report
+  at a 100% miss rate over 2,936 messages, which is exactly backwards -- its
+  transmissions are heard on RF and never come back as inbound messages -- and
+  buried every real device under it. `--plm-addr` now reaches the miss table
+  whether or not injection is on.
+- **"The PLM missed this" was decided too early.** The verdict was taken when
+  the fusion bucket closed, 0.6 to 2.0 s after the last RF sighting. The
+  modem's copy of the same message routinely arrives later than that: it
+  travels the powerline as well as the air, insteon-mqtt parses it, and only
+  then republishes it. Measured against the modem's own log, it landed 0.7 to
+  1.3 s after the first RF sighting for 116 of 587 messages -- about one in
+  five of every "PLM MISSED" mark. A closed event now waits `PLM_GRACE_S`
+  (2.5 s) before its verdict is settled, and `PlmMemory.heard()` is two-sided
+  so a copy either side of the message counts.
+- **Both lookups are anchored on the message, not the clock.** `heard()` is
+  asked about the event's own time. Without that the new grace period would
+  itself push every message out of its own suppression window, which is the
+  more dangerous half of the same bug: the injector would hand insteon-mqtt
+  messages the modem had already reported, and upstream's duplicate window is
+  zero at no hops left.
+
 ## 2.7.0 — 2026-09-21
 
 The deaf dongle, explained and fixed, and a third receiver on the air.

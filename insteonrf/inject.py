@@ -96,10 +96,26 @@ class PlmMemory:
         return True
 
     def heard(self, key: tuple[Any, ...], now: float | None = None) -> bool:
+        """Whether the modem reported this message around time ``now``.
+
+        Symmetric on purpose. The modem's copy does not reliably arrive
+        first: it travels the powerline as well as the air, insteon-mqtt
+        parses it and only then republishes it, and measured against the RF
+        path on 2026-09-21 it landed **0.7 to 1.3 s after** the first RF
+        sighting for one in five messages. Asking ``now - when`` only, at the
+        moment the fusion window closed, therefore answered "the modem missed
+        it" for messages the modem reported a second later -- about 20% of
+        every "PLM MISSED" verdict in the miss table, and, with injection
+        enabled, a double-processed message each time.
+
+        The caller is expected to ask late enough for the modem's copy to
+        have arrived (see ``MeshService`` and its grace period); this window
+        is what makes asking late still work.
+        """
         if now is None:
             now = time.time()
         when = self._seen.get(key)
-        return when is not None and now - when <= self.window_s
+        return when is not None and abs(now - when) <= self.window_s
 
     def forget_old(self, now: float) -> None:
         for key, when in list(self._seen.items()):
@@ -264,7 +280,12 @@ class Injector:
                 f"(need {self.min_combined_receivers})"
             )
 
-        if self.plm_heard(event.key, now):
+        # Anchored on the message, not on the clock. ``now`` is when this
+        # event was settled, which is a grace period after the message; the
+        # window is about how far apart the two paths delivered the same
+        # message, so comparing against anything else narrows or widens it by
+        # however long the event happened to wait.
+        if self.plm_heard(event.key, event.last_seen):
             event.plm_saw_it = True
             return self._no("the PLM already heard it")
         event.plm_saw_it = False
