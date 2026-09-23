@@ -410,6 +410,32 @@ class Packet:
         return (self.flags_byte >> 2) & 3
 
     @property
+    def hops_ok(self) -> bool:
+        """Whether the hop fields are ones a real transmission can carry.
+
+        A device sends with ``hops_left == max_hops`` and every repeater
+        decrements hops-left, so hops-left can never exceed max-hops. Nothing
+        on the air says otherwise: across 18,939 received messages from this
+        network's own devices it held 99.96% of the time, and the handful of
+        exceptions were bit errors.
+
+        It is worth checking because the other guards do not cover the flags
+        byte. A capture is longer than one packet -- a message, the start of
+        its next hop, then padding -- and :func:`parse_bits` looks for the
+        start header at every offset in either polarity, so a false lock in
+        that tail occasionally yields a short frame whose 5-bit counters
+        descend correctly *and* whose 8-bit CRC matches by luck (one in 256
+        per candidate, against ~19,000 real messages a day each offering
+        several offsets). Those phantoms then repeat forever, because the
+        same byte pattern recurs. One family of them, ``AC/AD/AE/AF.4C.1E``,
+        spent eight days looking like a neighbour's device: 82 clean decodes,
+        every one within a second of one of this network's own messages
+        (median 31 ms), 38% of them with hops-left above max-hops, and an
+        "address" whose top byte cycled while its low two bytes never moved.
+        """
+        return self.hops_left <= self.max_hops
+
+    @property
     def msg_type(self) -> MsgType:
         return MsgType(self.flags_byte >> 5)
 
@@ -530,6 +556,7 @@ class Packet:
             "group_msg": self.group_msg,
             "hops_left": self.hops_left,
             "max_hops": self.max_hops,
+            "hops_ok": self.hops_ok,
             "to": str(self.to_addr) if self.to_addr else None,
             "from": str(self.from_addr) if self.from_addr else None,
             "group": self.group,

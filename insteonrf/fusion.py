@@ -338,7 +338,7 @@ def _packet_extent(bits: str) -> int:
 def _accept(bits: str, timestamp: float | None) -> Packet | None:
     """Parse a candidate and accept it only if it is unambiguously a packet."""
     for pkt in parse_bits(bits, timestamp):
-        if pkt.crc_ok is True and pkt.index_ok is not False:
+        if pkt.crc_ok is True and pkt.index_ok is not False and pkt.hops_ok:
             if pkt.extended and pkt.ext_crc_ok is False:
                 continue
             return pkt
@@ -564,11 +564,16 @@ class _Bucket:
                 v.rssi_dbm = s.rssi_dbm
             if s.snr_db is not None and (v.snr_db is None or s.snr_db > v.snr_db):
                 v.snr_db = s.snr_db
-            if s.packet.crc_ok is True:
+            if s.packet.crc_ok is True and s.packet.hops_ok:
                 v.crc_ok = True
             v.best_hops_left = max(v.best_hops_left, s.packet.hops_left)
 
-        good = [s for s in self.sightings if s.packet.crc_ok is True]
+        # A verified copy has to survive the flags byte too. hops-left above
+        # max-hops is a flags byte no transmitter emits, and it is the only
+        # thing that distinguishes a false header lock inside the tail of a
+        # real capture -- whose frame counters and CRC can both pass by luck
+        # -- from a message. See Packet.hops_ok.
+        good = [s for s in self.sightings if s.packet.crc_ok is True and s.packet.hops_ok]
         combined = False
         combined_from = 0
 

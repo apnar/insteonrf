@@ -31,6 +31,9 @@
 #   grep -hoE '^- [0-9a-fA-F]{2}\.[0-9a-fA-F]{2}\.[0-9a-fA-F]{2}' \
 #     /k8s/insteon-config/{remotes,water_sensors,door_sensors}.yaml \
 #     | cut -d' ' -f2 > /nvme/churn/insteonrf-mesh/battery.txt
+#   grep -rhoE '\b[0-9a-fA-F]{2}\.[0-9a-fA-F]{2}\.[0-9a-fA-F]{2}\b' \
+#     /k8s/insteon-config/*.yaml | tr 'a-f' 'A-F' | sort -u \
+#     > /nvme/churn/insteonrf-mesh/known.txt   # regenerate when devices change
 #   cp deploy/insteonrf-mesh.yaml /k8s/yaml/
 #   microk8s kubectl apply -f /k8s/yaml/insteonrf-mesh.yaml
 #
@@ -72,6 +75,15 @@ spec:
         - --plm-topic=insteon/raw/rx
         - --inject-topic=insteon/raw/inject
         - --battery-addrs=/config/battery.txt
+        # Every address this network has. Nothing from any other address is
+        # ever injected. The decoder occasionally invents a packet -- a
+        # capture holds more than one, the parser tries every offset in both
+        # polarities, and a false lock in the tail can produce frame counters
+        # and a CRC that both pass by luck -- and it invents the sender too.
+        # Eight days of capture produced 61 such addresses over 234 messages,
+        # one family of which spent those days looking like a neighbour's
+        # device. insteon-mqtt would create state for every one of them.
+        - --known-addrs=/config/known.txt
         # Keeps the modem out of its own miss table: its transmissions are
         # heard on RF but never come back as inbound messages, so without
         # this it leads every report at a 100% miss rate.

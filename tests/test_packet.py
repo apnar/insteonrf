@@ -222,3 +222,46 @@ def test_dump_frames_mentions_crc():
     p = Packet.build("13.25.80", "16.3F.E5", cmd1=0x13)
     out = dump_frames(p.to_bits())
     assert "crc OK" in out and "idx= 0" in out and "flags: Direct" in out
+
+
+class TestHopSanity:
+    """hops-left above max-hops is a flags byte no transmitter emits.
+
+    A device sends with the two equal and every repeater decrements
+    hops-left, so the check is free and exact. It matters because nothing
+    else looks at the flags byte: a capture holds more than one packet, the
+    parser scans every offset in both polarities, and a false lock in the
+    tail occasionally yields a short frame whose 5-bit counters descend
+    correctly and whose 8-bit CRC matches by luck.
+    """
+
+    def test_a_normal_packet_passes(self):
+        from insteonrf.packet import Packet
+
+        p = Packet.build("2B.93.07", "29.4E.52", cmd1=0x0F, cmd2=0x00)
+        assert p.hops_ok is True
+
+    def test_a_repeated_packet_passes(self):
+        from insteonrf.packet import Packet
+
+        p = Packet.build("2B.93.07", "29.4E.52", cmd1=0x0F, cmd2=0x00,
+                         hops_left=0, max_hops=3)
+        assert p.hops_ok is True
+
+    def test_more_hops_left_than_the_maximum_is_rejected(self):
+        from insteonrf.packet import Packet
+
+        p = Packet.build("2B.93.07", "29.4E.52", cmd1=0x0F, cmd2=0x00,
+                         hops_left=2, max_hops=0)
+        assert p.hops_ok is False
+        assert p.to_dict()["hops_ok"] is False
+
+    def test_the_phantom_family_seen_on_air_is_rejected(self):
+        """One of the 82 decodes that spent eight days looking like a
+        neighbour's device at AC.4C.1E."""
+        from insteonrf.packet import Packet
+
+        p = Packet(bytes.fromhex("08C800001E4CAC4F0091"))
+        assert p.crc_ok is True, "it really does pass the CRC"
+        assert p.hops_ok is False
+        assert (p.hops_left, p.max_hops) == (2, 0)

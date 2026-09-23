@@ -326,3 +326,30 @@ def test_the_modem_may_report_a_message_after_the_rf_copy():
     inj2 = injector(suppress_window_s=2.0)
     inj2.note_plm(to_plm_bytes(p.packet), now=98.7)      # modem, earlier
     assert inj2.consider(event(src=LEAK, group=1, timestamp=100.0), now=103.0).inject is False
+
+
+def test_an_address_this_network_does_not_have_is_never_injected():
+    """A decoder that occasionally invents a packet invents its sender too,
+    and insteon-mqtt would create state for a device that does not exist."""
+    inj = injector(allow=[Tier.GROUP], known_addrs=[DEV])
+    d = inj.consider(event(src="AC.4C.1E", group=1))
+    assert d.inject is False
+    assert d.reason == "sender is not a device on this network"
+    assert inj.consider(event(src=DEV, group=1)).inject is True
+
+
+def test_no_list_means_no_check():
+    """The old behaviour, kept so the measurement phase is unaffected -- but
+    the mesh command warns when injection runs without a list."""
+    inj = injector(allow=[Tier.GROUP])
+    assert inj.known_addrs is None
+    assert inj.consider(event(src="AC.4C.1E", group=1)).inject is True
+
+
+def test_impossible_hop_fields_are_refused_at_the_injector_too():
+    """Defence in depth: fusion should never hand one over, and the PLM
+    conversion would refuse it, but this is the decision that matters."""
+    inj = injector(allow=[Tier.GROUP])
+    d = inj.consider(event(src=DEV, group=1, hops_left=2, max_hops=0))
+    assert d.inject is False
+    assert d.reason == "impossible hop fields"

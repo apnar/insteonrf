@@ -4,6 +4,44 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.7.2 — 2026-09-23
+
+Two guards against decoding phantoms, after one of them spent eight days
+looking like a neighbour's Insteon device.
+
+`AC.4C.1E` and its family are not a device. All 82 clean decodes landed
+within a second of one of this network's own messages (median 31 ms, 43 of
+them inside 50 ms): they are second, false packets found inside the same
+radio burst that carried a real one. A capture is longer than one packet --
+a message, the start of its next hop, then padding -- and `parse_bits` looks
+for the start header at every offset in either polarity, so a false lock in
+that tail occasionally yields a short frame whose 5-bit counters descend
+correctly *and* whose 8-bit CRC matches by luck. One in 256 per candidate,
+against ~19,000 real messages a day each offering several offsets. They then
+repeat forever, because the same byte pattern recurs.
+
+- **`Packet.hops_ok`.** A device transmits with hops-left equal to max-hops
+  and every repeater decrements hops-left, so hops-left can never exceed
+  max-hops. Nothing checked the flags byte before. Enforced where a packet is
+  admitted (`fusion`'s bucket and `_accept`), where one is repaired
+  (`recover`, the one place a phantom can be *manufactured* rather than
+  merely accepted), where one is counted (`MissTable`), and where one is
+  converted for a protocol stack (`plm.to_plm_bytes`). Measured on 18,829
+  messages from this network's real devices it rejects **none**, and it
+  removes 18% of the phantom traffic outright. `hops_ok` is in `to_dict()`,
+  so the logs show it.
+- **An injection allowlist.** `--known-addrs FILE` names every address the
+  network has, and `Injector.classify` refuses anything else. The remaining
+  phantoms have plausible-looking flags, so structure alone will not catch
+  them -- but an address that is not yours is proof enough. Eight days
+  produced 61 such addresses over 234 messages, 13 of which are sitting in
+  the miss table as devices the modem "misses" 100% of the time. Without the
+  list injection is unrestricted, and the mesh command now says so loudly at
+  startup.
+
+`load_battery_addrs` is now `load_addrs`, since it reads both lists; the old
+name still works.
+
 ## 2.7.1 — 2026-09-23
 
 Two measurement bugs in the mesh, both found on 2026-09-21 and both fixed

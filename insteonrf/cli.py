@@ -1089,7 +1089,7 @@ def allon_main(argv: list[str] | None = None) -> int:
 def mesh_main(argv: list[str] | None = None) -> int:
     """Run the listener mesh: captures in, miss table out, injection optional."""
     from .fusion import Fusion
-    from .inject import Injector, Tier, load_battery_addrs
+    from .inject import Injector, Tier, load_addrs
     from .mesh import PLM_INJECT_TOPIC, PLM_RX_TOPIC, MeshService, PlmLink
     from .monitor import JsonlWriter
     from .radio.mqtt import DEFAULT_PREFIX, MqttReceiver
@@ -1139,6 +1139,11 @@ def mesh_main(argv: list[str] | None = None) -> int:
     p.add_argument("--battery-addrs", metavar="FILE",
                    help="one address per line: devices with no powerline path, which cannot be "
                         "polled and so can only be helped by injection")
+    p.add_argument("--known-addrs", metavar="FILE",
+                   help="one address per line: every device this network has. Nothing from any "
+                        "other address is injected. Strongly recommended with --inject: a "
+                        "decoder that occasionally invents a packet invents its sender too, and "
+                        "insteon-mqtt would create state for a device that does not exist")
     p.add_argument("--per-device-interval", type=float, default=30.0,
                    help="seconds between injections naming one device (default %(default)s)")
     p.add_argument("--global-per-minute", type=int, default=6,
@@ -1172,16 +1177,23 @@ def mesh_main(argv: list[str] | None = None) -> int:
     plm = None if a.no_plm else PlmLink(host, port_n, username=a.mqtt_user,
                                         password=a.mqtt_pass, rx_topic=a.plm_topic,
                                         inject_topic=a.inject_topic)
-    battery = load_battery_addrs(a.battery_addrs) if a.battery_addrs else set()
+    battery = load_addrs(a.battery_addrs) if a.battery_addrs else set()
+    known = load_addrs(a.known_addrs) if a.known_addrs else None
     injector = None
     if tiers:
         injector = Injector(
             publish=plm.publish_inject if plm is not None else None,
-            plm_addr=a.plm_addr, battery_addrs=battery, allow=tiers,
+            plm_addr=a.plm_addr, battery_addrs=battery, known_addrs=known,
+            allow=tiers,
             shadow=not a.live, per_device_interval_s=a.per_device_interval,
             global_per_minute=a.global_per_minute)
         log.info("injection tiers %s, %s", [t.name for t in tiers],
                  "LIVE" if a.live else "shadow mode")
+        if known is None:
+            log.warning("--inject without --known-addrs: any address that decodes will be "
+                        "injected, including ones this network does not have")
+        else:
+            log.info("%d known addresses; nothing else is injected", len(known))
     elif a.live:
         log.warning("--live has no effect without --inject")
 

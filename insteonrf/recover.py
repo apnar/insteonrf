@@ -262,6 +262,12 @@ def _recover_at(bits: str, sym: np.ndarray[Any, Any], pos: int, timestamp: float
     pkt = Packet(data, bits[pos : first + nframes * FRAME_BITS], timestamp, complete=True)
     pkt.corrected = corrected
     pkt.index_ok = True
+    if not pkt.hops_ok:
+        # Repair is guided by the CRC, so it is the one place a phantom can
+        # be *manufactured* rather than merely accepted. hops-left above
+        # max-hops is a flags byte no transmitter emits (see Packet.hops_ok),
+        # so a repair that produces one repaired the wrong thing.
+        return None
     return Recovered(pkt, corrected=corrected, index_errors=idx_bad,
                      manchester_errors=illegal,
                      min_confidence=float(min(all_conf)) if all_conf else 0.0)

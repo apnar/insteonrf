@@ -21,12 +21,18 @@ Every check is a refusal, in order of how badly it would go wrong:
    *zero* for a copy that arrives with no hops left. Measured on live air: two
    copies of one ACK at hops 1 and 0 were both processed, 87 ms apart. So
    suppression cannot be delegated upstream; this keeps its own fixed window.
-5. **Unverified bytes are never injected.** CRC must pass and the frame-index
-   counters must not have been rejected. A combined packet (recovered by
+5. **Addresses that are not on this network are never injected.** A decoder
+   that occasionally invents a packet invents the address it came from too,
+   and insteon-mqtt would create state for a device that does not exist.
+   Eight days of capture here produced 13 such addresses, every one a false
+   decode from inside a real capture (see ``Packet.hops_ok``).
+6. **Unverified bytes are never injected.** CRC must pass, the frame-index
+   counters must not have been rejected, and the hop fields must be ones a
+   transmitter can actually emit. A combined packet (recovered by
    voting across receivers rather than heard intact by anyone) additionally
    needs enough receivers to have voted, because a two-way vote ties on every
    disagreement and leaves the CRC doing all the work.
-6. **Rate limits.** Inbound messages push out insteon-mqtt's next allowed
+7. **Rate limits.** Inbound messages push out insteon-mqtt's next allowed
    transmit (``set_wait_time``), so a flood of injections would stall outbound
    commands. Per-device and global caps, both deliberately low.
 """
@@ -189,6 +195,7 @@ class Injector:
         *,
         plm_addr: Address | str | None = None,
         battery_addrs: Iterable[Address | str] = (),
+        known_addrs: Iterable[Address | str] | None = None,
         allow: Iterable[Tier] = (),
         shadow: bool = True,
         enabled: Callable[[], bool] = lambda: True,
@@ -201,6 +208,14 @@ class Injector:
         self.publish = publish
         self.plm_addr = Address(plm_addr) if plm_addr is not None else None
         self.battery_addrs = {Address(a) for a in battery_addrs}
+        #: Addresses this network actually has. ``None`` means "do not
+        #: check", which is the old behaviour and is not what you want with
+        #: injection enabled: a decoder that occasionally invents a packet
+        #: also invents the address it came from, and an address that is not
+        #: yours is the cheapest possible proof that a message is not real.
+        self.known_addrs: set[Address] | None = (
+            None if known_addrs is None else {Address(a) for a in known_addrs}
+        )
         self.allow = frozenset(allow)
         self.shadow = shadow
         self.enabled = enabled
@@ -240,6 +255,12 @@ class Injector:
             return None, "no sender address"
         if self.plm_addr is not None and sender == self.plm_addr:
             return None, "the PLM's own transmission"
+        if self.known_addrs is not None and sender not in self.known_addrs:
+            # Nothing downstream can tell a phantom from a device, and
+            # insteon-mqtt would create state for an address that does not
+            # exist. Eight days of capture produced 13 such addresses here,
+            # every one of them a false decode from inside a real capture.
+            return None, "sender is not a device on this network"
 
         if sender in self.battery_addrs:
             return Tier.BATTERY, "battery device"
@@ -272,6 +293,11 @@ class Injector:
             return self._no("CRC did not pass")
         if packet.index_ok is False:
             return self._no("frame-index counters rejected")
+        if not packet.hops_ok:
+            # Passes the CRC and the counters and is still not a message.
+            # See Packet.hops_ok. to_plm_bytes() would refuse it as well;
+            # this refuses it as a decision, so it is counted as one.
+            return self._no("impossible hop fields")
         if packet.extended and packet.ext_crc_ok is False:
             return self._no("extended data CRC did not pass")
         if event.combined and event.combined_from < self.min_combined_receivers:
@@ -326,15 +352,22 @@ class Injector:
         self._recent_injections = [t for t in self._recent_injections if now - t < 60.0]
 
 
-def load_battery_addrs(path: str) -> set[Address]:
+def load_addrs(path: str) -> set[Address]:
     """Read one Insteon address per line (``#`` comments allowed).
 
-    Build the list from the insteon-mqtt config, which knows which device
-    classes have no powerline path::
+    Two lists are built this way. The battery list names the devices with no
+    powerline path, which cannot be polled and so can only be helped by
+    injection::
 
         grep -hoE '^- [0-9a-fA-F]{2}\\.[0-9a-fA-F]{2}\\.[0-9a-fA-F]{2}' \\
           /k8s/insteon-config/{remotes,water_sensors,door_sensors}.yaml \\
           | cut -d' ' -f2 > battery.txt
+
+    The known list names every address this network has, and nothing outside
+    it is ever injected::
+
+        grep -rhoE '\\b[0-9a-fA-F]{2}\\.[0-9a-fA-F]{2}\\.[0-9a-fA-F]{2}\\b' \\
+          /k8s/insteon-config/*.yaml | tr 'a-f' 'A-F' | sort -u > known.txt
     """
     out = set()
     with open(path, encoding="utf-8") as fh:
@@ -343,6 +376,10 @@ def load_battery_addrs(path: str) -> set[Address]:
             if line:
                 out.add(Address(line))
     return out
+
+
+#: Kept for callers that predate the second list.
+load_battery_addrs = load_addrs
 
 
 __all__ = [
@@ -356,6 +393,7 @@ __all__ = [
     "Injector",
     "PlmMemory",
     "Tier",
+    "load_addrs",
     "load_battery_addrs",
     "sender_of",
 ]

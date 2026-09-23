@@ -710,3 +710,24 @@ def test_without_the_modem_address_it_is_counted_like_any_device():
     svc.handle_capture(cap_for(src=PLM))
     settle(svc)
     assert PLM in svc.misses.devices
+
+
+def test_a_packet_with_impossible_hop_fields_is_not_a_device():
+    """It passes the CRC and the frame counters, and is still not a message.
+
+    Eight days of capture put thirteen such addresses in the miss table as
+    devices the modem missed 100% of the time, the loudest being a family at
+    AC/AD/AE/AF.4C.1E whose 82 decodes each landed within a second of one of
+    this network's own messages.
+    """
+    from insteonrf.fusion import Fusion, sightings_from_capture
+
+    svc = MeshService(FakeReceiver())
+    phantom = Packet(bytes.fromhex("08C800001E4CAC4F0091"))
+    assert phantom.crc_ok is True and phantom.hops_ok is False
+    svc.fusion = Fusion()
+    for s in sightings_from_capture(phantom.to_bits(), "v4", timestamp=100.0):
+        svc.fusion.add(s)
+    settle(svc)
+    assert svc.misses.devices == {}
+    assert svc.misses.undecodable == 1

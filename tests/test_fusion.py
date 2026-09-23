@@ -451,3 +451,27 @@ def test_receiver_view_keeps_each_receiver_s_snr():
     assert views["dongle"].snr_db is None
     assert events[0].to_dict()["heard_by"]["v4"]["snr_db"] == 22.0
     assert ReceiverView().snr_db is None
+
+
+def test_fusion_refuses_a_packet_with_impossible_hop_fields():
+    """The guard that would have stopped eight days of phantom devices.
+
+    These pass the header scan, the frame counters and the CRC -- the three
+    checks that existed -- because a capture holds more than one packet and
+    the parser tries every offset in both polarities. Only the flags byte
+    gives them away.
+    """
+    from insteonrf.fusion import fuse_all, sightings_from_capture
+    from insteonrf.packet import Packet
+
+    bad = Packet.build("44.12.AB", "2B.93.07", cmd1=0x11, cmd2=0xFF,
+                       hops_left=2, max_hops=0)
+    assert bad.crc_ok is True and bad.hops_ok is False, "it passes every older check"
+    (event,) = fuse_all(sightings_from_capture(bad.to_bits(), "v4", timestamp=1.0))
+    assert event.packet.crc_ok is True
+    assert event.receivers["v4"].crc_ok is False, "not counted as a verified copy"
+
+    good = Packet.build("44.12.AB", "2B.93.07", cmd1=0x11, cmd2=0xFF,
+                        hops_left=1, max_hops=3)
+    (event,) = fuse_all(sightings_from_capture(good.to_bits(), "v4", timestamp=1.0))
+    assert event.receivers["v4"].crc_ok is True

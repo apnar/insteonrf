@@ -97,7 +97,11 @@ class MissTable:
         # four-byte fragment (enough to look like a packet start, not enough
         # to name a sender or carry a CRC) and counting those would inflate
         # every device's "heard on RF" total with noise.
-        if event.packet.crc_ok is not True:
+        if event.packet.crc_ok is not True or not event.packet.hops_ok:
+            # Not just a failed CRC: a packet whose hops-left exceeds its
+            # max-hops passes the CRC and the frame counters and is still not
+            # a message (see Packet.hops_ok). Thirteen such addresses sat in
+            # this table as devices the modem "missed" 100% of the time.
             self.undecodable += 1
             return
         who = sender_of(event.packet)

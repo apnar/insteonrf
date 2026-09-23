@@ -111,6 +111,16 @@ def to_plm_bytes(pkt: Packet, *, validate: bool = True) -> bytes:
     if validate:
         if pkt.index_ok is False:
             raise PlmFormatError("frame-index counters were rejected; these bytes are not a packet")
+        if not pkt.hops_ok:
+            # hops-left above max-hops is a flags byte no transmitter emits,
+            # and it is the signature of a false header lock inside the tail
+            # of a real capture whose counters and CRC both passed by luck.
+            # See Packet.hops_ok. This is the last gate before a protocol
+            # stack, so it refuses rather than warns.
+            raise PlmFormatError(
+                f"impossible hop fields (hops_left {pkt.hops_left} > max_hops "
+                f"{pkt.max_hops}); these bytes are not a packet"
+            )
         if pkt.crc_ok is False:
             raise PlmFormatError(f"packet CRC mismatch (got {pkt.crc:#04x}, want {pkt.calc_crc:#04x})")
         if pkt.crc_ok is None:
