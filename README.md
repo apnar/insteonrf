@@ -561,7 +561,7 @@ esp-idf. The SX1262 has no continuous-bitstream mode — the SX127x family
 exposes DATA and DCLK pins for that and SX126x dropped it — so GFSK packet
 mode is used as a raw bit recorder: sync word set to the invariant start of
 every Insteon packet, preamble detector off, CRC off, whitening off, fixed
-128-byte payload. On-board, each capture must pass a **Manchester-validity
+162-byte payload (sized to the 50 ms slot grid so no slot is cut in half). On-board, each capture must pass a **Manchester-validity
 gate**: 26 of every 28 on-air bits are Manchester pairs, and a valid pair is
 only `01` or `10`, so noise fails within a handful of bits. That is what makes
 running with the preamble detector off viable in a crowded 915 MHz band.

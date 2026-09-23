@@ -49,6 +49,14 @@ MIN_PACKET_SYMBOLS = 13 * 28
 #: starts before the template's preamble section ends.
 HEADER_SYMBOL_IN_TEMPLATE = SYNC_PREAMBLE_CELLS * 4 - 5
 
+#: The longest packet, in on-air symbols from the start of the sync template:
+#: the template's preamble, then an extended packet's 32 frames (index 31,
+#: then 30..0), and a little pad. Demodulating further than this from one
+#: sync is wasted work -- the next packet in the run has a sync of its own --
+#: and it used to be the dominant cost: every rate hypothesis re-demodulated the whole squelch run
+#: from the sync to its end, so a busy exchange cost O(packets x run length).
+MAX_PACKET_SYMBOLS = HEADER_SYMBOL_IN_TEMPLATE + 32 * 28 + 32
+
 
 def _bit_array(bits: str) -> np.ndarray[Any, Any]:
     a = np.frombuffer(bits.encode("ascii"), dtype=np.uint8)
@@ -206,9 +214,10 @@ def find_sync(
     *,
     decim: int = 8,
     threshold: float = 0.55,
-    max_syncs: int = 4,
+    max_syncs: int | None = None,
     min_gap_symbols: int = MIN_PACKET_SYMBOLS,
     rel_threshold: float = 0.25,
+    predecimated: bool = False,
 ) -> list[tuple[int, float, int]]:
     """Locate packet starts by correlating against the known head pattern.
 
@@ -238,11 +247,15 @@ def find_sync(
     norm = float(np.sqrt((t * t).sum()))
     if norm == 0:
         return []
-    d = disc[: (disc.size // decim) * decim].reshape(-1, decim).mean(axis=1).astype(np.float32)
+    if predecimated:
+        # Already one value per ``decim`` samples (see _block_disc).
+        d = np.asarray(disc, dtype=np.float32)
+    else:
+        d = disc[: (disc.size // decim) * decim].reshape(-1, decim).mean(axis=1).astype(np.float32)
     if d.size < t.size:
         return []
     # Normalised cross-correlation, mean-removed over each window.
-    corr = np.correlate(d, t, mode="valid")
+    corr = _xcorr_valid(d, t)
     win = t.size
     csum = np.concatenate(([0.0], np.cumsum(d, dtype=np.float64)))
     csum2 = np.concatenate(([0.0], np.cumsum(d.astype(np.float64) ** 2)))
@@ -268,9 +281,214 @@ def find_sync(
             continue
         taken.append(i)
         out.append((i * decim, float(abs(score[i])), 1 if score[i] > 0 else -1))
-        if len(out) >= max_syncs:
+        if max_syncs is not None and len(out) >= max_syncs:
             break
     return out
+
+
+def _xcorr_valid(d: np.ndarray[Any, Any], t: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
+    """``np.correlate(d, t, "valid")``, by FFT once that is cheaper.
+
+    The direct form is O(len(d) x len(t)); a busy half second against the
+    ~1250-tap sync template is a few hundred million multiply-adds, which is
+    the difference between keeping up with 2.4 Msps and not.
+    """
+    if d.size * t.size < 2_000_000:
+        return np.correlate(d, t, mode="valid")
+    n = d.size + t.size - 1
+    nfft = 1 << (n - 1).bit_length()
+    full = np.fft.irfft(np.fft.rfft(d, nfft) * np.conj(np.fft.rfft(t, nfft)), nfft)
+    return full[: d.size - t.size + 1].astype(np.float32)
+
+
+def _tone_sums(
+    x: np.ndarray[Any, Any],
+    deviation: float,
+    sample_rate: float,
+    *,
+    cfo_hz: float = 0.0,
+) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+    """Running sums of ``x`` mixed down onto each tone, zero-prefixed.
+
+    The integral of one symbol against a tone is then two lookups, whatever
+    the symbol boundaries are -- which is what lets :func:`_demod_burst` try a
+    grid of symbol rates for the price of index arithmetic instead of
+    re-mixing the whole segment for each one.
+    """
+    n = np.arange(x.size, dtype=np.float64)
+    # Both tones in one rotation each, carrier offset folded in.
+    yp = np.cumsum(x * np.exp(-2j * np.pi * (cfo_hz + deviation) * n / sample_rate))
+    ym = np.cumsum(x * np.exp(-2j * np.pi * (cfo_hz - deviation) * n / sample_rate))
+    zero = np.zeros(1, dtype=yp.dtype)
+    return np.concatenate((zero, yp)), np.concatenate((zero, ym))
+
+
+#: Carrier offsets searched by :func:`_template_cfo`. Measured devices sit
+#: within about 25 kHz (the capture in ``Dat/`` is 24 kHz off); the block
+#: discriminator stays unambiguous to ~70 kHz.
+MAX_CFO_HZ = 45_000
+
+
+#: Carrier-offset hypotheses for :func:`_tone_sync`, Hz. Half-symbol tone
+#: windows tolerate a few kHz of residual (the correlation falls off as
+#: sinc(f * T/2)), so an 8 kHz grid leaves at most 4 kHz -- a loss of about
+#: 1 dB -- across the whole range devices have been seen at.
+TONE_SYNC_CFOS = tuple(range(-40_000, 40_001, 8_000))
+
+
+def _tone_sync(
+    seg: np.ndarray[Any, Any],
+    sps: float,
+    deviation: float,
+    sample_rate: float,
+    *,
+    decim: int,
+    threshold: float,
+) -> list[tuple[int, float, int]]:
+    """Find packet starts where the phase discriminator cannot: weak signals.
+
+    The discriminator is a nonlinearity, and below the FM threshold its
+    output is mostly noise -- sync failed from about 15 dB symbol SNR down,
+    while the matched filter still decoded to about 9 dB, so weak devices
+    were lost to sync alone. Here the frequency track comes from tone
+    energies instead, which degrade gracefully: for each carrier-offset
+    hypothesis, the difference of the two tones' energies over half a
+    symbol, correlated against the known template exactly as
+    :func:`find_sync` does. The best hypothesis wins.
+
+    Used only when the discriminator found nothing, so strong signals are
+    handled exactly as before and this costs nothing on them.
+    """
+    n = seg.size // decim
+    if n < 4:
+        return []
+    y = seg[: n * decim].reshape(n, decim).mean(axis=1)
+    rate = sample_rate / decim
+    win = max(1, int(round(sps / decim / 2)))
+    t = np.arange(n, dtype=np.float64) / rate
+    best: list[tuple[int, float, int]] = []
+    best_score = 0.0
+    for cfo in TONE_SYNC_CFOS:
+        base = y * np.exp(-2j * np.pi * cfo * t)
+        rot = np.exp(-2j * np.pi * deviation * t)
+        ep = _window_mag(base * rot, win)
+        em = _window_mag(base * np.conj(rot), win)
+        track = (ep - em).astype(np.float32)
+        # Centre the window on its sample, as the discriminator's is.
+        track = np.roll(track, -(win // 2))
+        found = find_sync(track, sps, decim=decim, threshold=threshold, predecimated=True)
+        if found and found[0][1] > best_score:
+            best, best_score = found, found[0][1]
+    return best
+
+
+def _window_mag(z: np.ndarray[Any, Any], win: int) -> np.ndarray[Any, Any]:
+    """|sum of z over a trailing window of ``win``|, per sample."""
+    c = np.concatenate((np.zeros(1, dtype=z.dtype), np.cumsum(z)))
+    out = np.zeros(z.size, dtype=np.float64)
+    out[win - 1:] = np.abs(c[win:] - c[:-win])
+    return out
+
+
+def _template_cfo(
+    seg: np.ndarray[Any, Any],
+    start: int,
+    sps: float,
+    deviation: float,
+    sample_rate: float,
+    polarity: int,
+) -> float:
+    """Carrier offset from the known head of the packet, by FFT.
+
+    The sync template's symbols are known, so the FSK they put on the air is
+    known: multiply it out, and what is left over the template is a single
+    tone at the carrier offset, found with the processing gain of the whole
+    template (~10,000 samples) rather than from the mean of a discriminator.
+
+    That matters because the matched filter needs the offset to within about
+    2 kHz: a residual of f over a 110 us symbol rotates the correlation by
+    2*pi*f*T, and at 15 kHz that is ten radians -- nothing left. The mean of
+    the discriminator, even low-passed, is biased towards zero at the SNR
+    where the matched filter still works, so a 20 kHz device went undecoded
+    at 13 dB symbol SNR while one at 0 kHz decoded every time.
+    """
+    template = _sync_template()
+    if polarity < 0:
+        template = "".join("1" if b == "0" else "0" for b in template)
+    n = int(round(len(template) * sps))
+    piece = seg[start : start + n]
+    if piece.size < n // 2:
+        return 0.0
+    freq = _resample_template(template, sps)[: piece.size] * deviation
+    ref = np.exp(-2j * np.pi * np.cumsum(freq) / sample_rate)
+    r = piece * ref
+    nfft = 1 << 16
+    spec = np.abs(np.fft.fft(r, nfft))
+    f = np.fft.fftfreq(nfft, 1.0 / sample_rate)
+    band = np.abs(f) <= MAX_CFO_HZ
+    k = int(np.argmax(np.where(band, spec, 0.0)))
+    # Parabolic interpolation between bins: the bin is 37 Hz, but cheap.
+    if 0 < k < nfft - 1:
+        a, b, c = spec[k - 1], spec[k], spec[k + 1]
+        den = a - 2 * b + c
+        if den != 0:
+            return float(f[k] + 0.5 * (a - c) / den * (sample_rate / nfft))
+    return float(f[k])
+
+
+#: Block rate for the sync discriminator: comfortably wider than the signal
+#: (±75 kHz deviation plus crystal offset), and at 2.4 Msps a block of 8 --
+#: about 9 dB less noise per value than the full rate. The phase step per
+#: block stays under pi up to ~70 kHz of offset. See :func:`_sync_decim`.
+SYNC_BLOCK_RATE = 300_000
+
+
+def _sync_decim(sample_rate: float) -> int:
+    """Samples per block for the sync discriminator at this sample rate."""
+    return max(1, int(sample_rate // SYNC_BLOCK_RATE))
+
+
+def _block_disc(x: np.ndarray[Any, Any], decim: int) -> np.ndarray[Any, Any]:
+    """Instantaneous frequency (radians per *input* sample) at 1/``decim`` rate.
+
+    The I/Q is averaged over blocks first -- a low-pass -- and the phase step
+    is taken between block means. Averaging *before* the angle is what makes
+    it work on weak signals; averaging after it (what find_sync used to do to
+    the full-rate discriminator) averages an already-biased estimate.
+    """
+    n = x.size // decim
+    if n < 2:
+        return np.zeros(0, dtype=np.float32)
+    xs = x[: n * decim].reshape(n, decim).mean(axis=1)
+    return cast("np.ndarray[Any, Any]",
+                (np.angle(xs[1:] * np.conj(xs[:-1])) / decim).astype(np.float32))
+
+
+def _ml_from_sums(
+    yp: np.ndarray[Any, Any],
+    ym: np.ndarray[Any, Any],
+    start: float,
+    sps: float,
+    nsym: int | None = None,
+) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+    """Per-symbol decisions from :func:`_tone_sums` output; see :func:`_ml_soft`."""
+    size = yp.size - 1
+    avail = max(0, int((size - start) / sps))
+    nsym = avail if nsym is None else min(nsym, avail)
+    if nsym <= 0:
+        empty = np.zeros(0, dtype=np.float32)
+        return empty, empty, empty
+    k = np.arange(nsym)
+    lo = np.clip(np.rint(start + k * sps).astype(np.int64), 0, size)
+    hi = np.clip(np.rint(start + (k + 1) * sps).astype(np.int64), 0, size)
+    width = np.maximum(hi - lo, 1)
+    sp = np.abs(yp[hi] - yp[lo]) / width
+    sm = np.abs(ym[hi] - ym[lo]) / width
+    scale = np.maximum(np.maximum(sp, sm), 1e-9)
+    soft = ((sp - sm) / scale).astype(np.float32)
+    matched = np.maximum(sp, sm).astype(np.float32)
+    unmatched = np.minimum(sp, sm).astype(np.float32)
+    return soft, matched, unmatched
 
 
 def _ml_soft(
@@ -293,32 +511,8 @@ def _ml_soft(
     discriminator followed by integrate-and-dump, because it matches the actual
     signal shape instead of differentiating phase (which amplifies noise).
     """
-    n = np.arange(x.size, dtype=np.float64)
-    if cfo_hz:
-        x = x * np.exp(-2j * np.pi * cfo_hz * n / sample_rate)
-    rot = 2 * np.pi * deviation * n / sample_rate
-    yp = np.cumsum(x * np.exp(-1j * rot))
-    ym = np.cumsum(x * np.exp(+1j * rot))
-    yp = np.concatenate(([0], yp))
-    ym = np.concatenate(([0], ym))
-
-    nsym = max(0, int((x.size - start) / sps))
-    if nsym == 0:
-        empty = np.zeros(0, dtype=np.float32)
-        return empty, empty, empty
-    k = np.arange(nsym)
-    lo = np.rint(start + k * sps).astype(np.int64)
-    hi = np.rint(start + (k + 1) * sps).astype(np.int64)
-    lo = np.clip(lo, 0, x.size)
-    hi = np.clip(hi, 0, x.size)
-    width = np.maximum(hi - lo, 1)
-    sp = np.abs(yp[hi] - yp[lo]) / width
-    sm = np.abs(ym[hi] - ym[lo]) / width
-    scale = np.maximum(np.maximum(sp, sm), 1e-9)
-    soft = ((sp - sm) / scale).astype(np.float32)
-    matched = np.maximum(sp, sm).astype(np.float32)
-    unmatched = np.minimum(sp, sm).astype(np.float32)
-    return soft, matched, unmatched
+    yp, ym = _tone_sums(x, deviation, sample_rate, cfo_hz=cfo_hz)
+    return _ml_from_sums(yp, ym, start, sps)
 
 
 def _rate_candidates(coarse: float = 0.005, step: float = 0.001) -> np.ndarray[Any, Any]:
@@ -347,8 +541,14 @@ def demodulate_bursts(
     refine_rate: bool = True,
     sync_threshold: float = 0.45,
     timestamp: float | None = None,
+    t0: float | None = None,
 ) -> list[Burst]:
     """Demodulate I/Q into :class:`Burst` objects with soft decisions.
+
+    ``t0`` is the wall-clock time of the first sample. Given it, each burst
+    is stamped with when *its own* first symbol was on the air, rather than
+    all of them with ``timestamp`` -- a buffer can hold several messages, and
+    fusion groups receivers' sightings by time.
 
     The chain is: envelope squelch to find candidate bursts → correlate the
     known preamble/start-header pattern to lock frame timing, polarity and the
@@ -363,9 +563,7 @@ def demodulate_bursts(
     if x.size < 8:
         return []
     sps = sample_rate / baud
-    win = max(1, int(round(sps)))
-    env = cast("np.ndarray[Any, Any]", np.convolve(np.abs(x), np.ones(win) / win, mode="same"))
-    hot = env > squelch
+    hot = _envelope(x, sps) > squelch
     if not hot.any():
         return []
 
@@ -387,7 +585,29 @@ def demodulate_bursts(
         out += _demod_burst(seg, dseg, lo, sps, deviation, sample_rate,
                             min_bits=min_bits, refine_rate=refine_rate,
                             sync_threshold=sync_threshold, timestamp=timestamp)
+    if t0 is not None:
+        for b in out:
+            b.timestamp = t0 + b.start / sample_rate
     return out
+
+
+def _envelope(x: np.ndarray[Any, Any], sps: float) -> np.ndarray[Any, Any]:
+    """|x| averaged over one symbol, centred -- the squelch's view of power.
+
+    A running sum rather than ``np.convolve``: the direct convolution is 263
+    multiply-adds per sample at 2.4 Msps, over half a billion a second, which
+    on its own was most of the real-time budget.
+    """
+    win = max(1, int(round(sps)))
+    a = np.abs(x).astype(np.float64)
+    c = np.concatenate(([0.0], np.cumsum(a)))
+    half = win // 2
+    idx = np.arange(a.size)
+    lo = np.clip(idx - half, 0, a.size)
+    hi = np.clip(idx - half + win, 0, a.size)
+    # Same normalisation as mode="same": the edges average over fewer samples
+    # but are divided by the full window, exactly as before.
+    return cast("np.ndarray[Any, Any]", ((c[hi] - c[lo]) / win).astype(np.float32))
 
 
 def estimate_cfo(
@@ -397,6 +617,7 @@ def estimate_cfo(
     sample_rate: float,
     *,
     cells: int = SYNC_PREAMBLE_CELLS,
+    decim: int = 1,
 ) -> float:
     """Carrier frequency offset in Hz, from the preamble the sync matched.
 
@@ -410,8 +631,8 @@ def estimate_cfo(
     roughly 26 ppm at 915 MHz. Left uncorrected that offset biases every symbol
     decision toward one tone.
     """
-    lo = int(round(start))
-    hi = int(round(start + cells * 4 * sps))
+    lo = int(round(start / decim))
+    hi = int(round((start + cells * 4 * sps) / decim))
     seg = disc[max(0, lo) : min(hi, disc.size)]
     if seg.size == 0:
         return 0.0
@@ -449,7 +670,21 @@ def _demod_burst(
     timestamp: float | None,
 ) -> list[Burst]:
     """Demodulate one squelch-delimited burst, from every sync it contains."""
-    syncs: list[tuple[int, float, int]] = find_sync(dseg, sps, threshold=sync_threshold)
+    # Sync and carrier offset are found on a discriminator taken *after* a
+    # low-pass, not on the full-rate one. At 2.4 Msps the per-sample SNR of a
+    # weak packet is near 0 dB, below the FM threshold, where the phase
+    # difference is dominated by noise and its mean is pulled towards zero --
+    # so a carrier offset, which every cheap-crystal device has, tipped the
+    # correlator into finding nothing: at 23.7 dB symbol SNR a 9 kHz offset
+    # decoded 15%, 20 kHz 5-10%, where 6 kHz decoded 100%.
+    decim = _sync_decim(sample_rate)
+    dd = _block_disc(seg, decim)
+    syncs: list[tuple[int, float, int]] = find_sync(dd, sps, decim=decim,
+                                                    threshold=sync_threshold,
+                                                    predecimated=True)
+    if not syncs and seg.size >= MIN_PACKET_SYMBOLS * sps:
+        syncs = _tone_sync(seg, sps, deviation, sample_rate, decim=decim,
+                           threshold=sync_threshold)
     synced = bool(syncs)
     if not syncs:
         # No frame lock: demodulate the whole burst from its start anyway, so a
@@ -457,29 +692,65 @@ def _demod_burst(
         syncs = [(0, 0.0, 1)]
 
     out: list[Burst] = []
-    for start, _score, polarity in syncs:
-        cfo_hz = estimate_cfo(dseg, float(start), sps, sample_rate) if synced else 0.0
+    # Enough symbols for the longest packet at the slowest rate tried.
+    nsym = MAX_PACKET_SYMBOLS if synced else None
+    judge = HEADER_SYMBOL_IN_TEMPLATE + MIN_PACKET_SYMBOLS if synced else None
+    # In time order, so each packet's real length is known before the next
+    # sync is considered: find_sync can only space syncs by the *shortest*
+    # packet, and an extended packet's payload is long enough to hold a
+    # convincing false one. Nothing real starts inside a packet.
+    busy_until = -1.0
+    for start, _score, polarity in sorted(syncs):
+        if start < busy_until:
+            continue
+        cfo_hz = (_template_cfo(seg, int(start), sps, deviation, sample_rate, polarity)
+                  if synced else 0.0)
+        # Sync is only placed to within a block (``decim`` samples), and the
+        # tone sync to within about two; near threshold that is worth half a
+        # dB. So the start is searched too, on the same sums as the rate.
+        shifts = range(-decim, decim + 1, 2) if synced else range(1)
+        if nsym is None:
+            piece, base = seg, 0
+        else:
+            base = max(0, int(start) - decim)
+            piece = seg[base : base + int(np.ceil(nsym * sps * 1.01)) + 2 * decim + 2]
+        # Mixing is the expensive part and does not depend on the symbol
+        # rate or timing, so do it once per sync and try every candidate on
+        # the sums.
+        yp, ym = _tone_sums(piece, deviation, sample_rate, cfo_hz=cfo_hz)
         rates = _rate_candidates() if refine_rate else np.zeros(1)
         best: tuple[float, np.ndarray[Any, Any], np.ndarray[Any, Any],
-                    np.ndarray[Any, Any], float] | None = None
-        for delta in rates:
-            trial = sps * (1.0 + float(delta))
-            soft, matched, unmatched = _ml_soft(seg, float(start), trial, deviation,
-                                                sample_rate, cfo_hz=cfo_hz)
-            if soft.size == 0:
+                    np.ndarray[Any, Any], float, int] | None = None
+        for shift in shifts:
+            at = start + shift - base
+            if at < 0:
                 continue
-            confidence = float(np.abs(soft).mean())
-            if best is None or confidence > best[0]:
-                best = (confidence, soft, matched, unmatched, trial)
+            for delta in rates:
+                trial = sps * (1.0 + float(delta))
+                soft, matched, unmatched = _ml_from_sums(yp, ym, float(at), trial, nsym)
+                if soft.size == 0:
+                    continue
+                # Judge on the part that is certainly packet. Past the
+                # shortest packet's end there may be only noise, which scores
+                # alike under every candidate and just dilutes the comparison.
+                confidence = float(np.abs(soft[:judge]).mean())
+                if best is None or confidence > best[0]:
+                    best = (confidence, soft, matched, unmatched, trial, shift)
         if best is None:
             continue
-        _conf, soft, matched, unmatched, trial_sps = best
+        _conf, soft, matched, unmatched, trial_sps, shift = best
+        start += shift
         # soft is already in transmitted polarity: its sign is the tone the
         # symbol was sent on, and a data 1 is the higher tone. The sync
         # template is written in logical polarity, so a normal (inverted)
         # on-air packet matches it at polarity -1 — that says which template
         # matched, and must not be used to flip the bits.
         bits = "".join("1" if v > 0 else "0" for v in soft)
+        if synced:
+            keep = _packet_symbols(bits, polarity)
+            bits, soft, matched, unmatched = (bits[:keep], soft[:keep],
+                                              matched[:keep], unmatched[:keep])
+            busy_until = start + (keep - 8) * trial_sps
         if len(bits) < min_bits:
             continue
         out.append(Burst(
@@ -494,6 +765,25 @@ def _demod_burst(
             timestamp=timestamp,
         ))
     return out
+
+
+def _packet_symbols(bits: str, polarity: int) -> int:
+    """How many symbols of a synced burst belong to its own packet.
+
+    Read from the flags byte, so a standard packet is not followed by the
+    first part of whatever came next on the air -- which the parser would
+    find and report a second time, with the wrong timestamp. When the first
+    frame did not survive, the extended length is kept: better a tail than
+    a truncated packet.
+    """
+    from .manchester import invert_bits
+    from .packet import EXT_LEN, FLAG_EXT, FRAME_BITS, MARKER_OFFSET, STD_LEN, decode_frames
+
+    logical = invert_bits(bits) if polarity < 0 else bits
+    data, _ = decode_frames(logical, HEADER_SYMBOL_IN_TEMPLATE + MARKER_OFFSET)
+    frames = STD_LEN if data and not data[0] & FLAG_EXT else EXT_LEN
+    # A few symbols of pad: parse_bits wants to see the frame end cleanly.
+    return HEADER_SYMBOL_IN_TEMPLATE + MARKER_OFFSET + FRAME_BITS * frames + 8
 
 
 def demodulate_fsk2(
@@ -579,8 +869,7 @@ def iq_bursts(
     if x.size == 0:
         return []
     win = max(1, int(round(sample_rate / baud)))
-    env = np.convolve(np.abs(x), np.ones(win) / win, mode="same")
-    hot = env > squelch
+    hot = _envelope(x, sample_rate / baud) > squelch
     if not hot.any():
         return []
     pad = int(round(pad_s * sample_rate))

@@ -271,6 +271,10 @@ class Packet:
     corrected: int = field(default=0, repr=False, compare=False)
     #: Estimated SNR of the burst this came from, when a soft demodulator saw it.
     snr_db: float | None = field(default=None, repr=False, compare=False)
+    #: Carrier offset of the burst this came from, Hz, when an I/Q receiver
+    #: measured it. Per device it is that device's crystal error, and a large
+    #: one can put a tone outside a narrow receiver's channel filter.
+    cfo_hz: float | None = field(default=None, repr=False, compare=False)
     #: Receiver signal strength in dBm, when the radio reports it.
     rssi_dbm: float | None = field(default=None, repr=False, compare=False)
     #: For an ACK/NAK: whether the query it answers was extended, when
@@ -572,6 +576,7 @@ class Packet:
             "complete": self.complete,
             "corrected": self.corrected,
             "snr_db": round(self.snr_db, 1) if self.snr_db is not None else None,
+            "cfo_hz": round(self.cfo_hz) if self.cfo_hz is not None else None,
             "rssi_dbm": round(self.rssi_dbm, 1) if self.rssi_dbm is not None else None,
             "raw": bytes(self.data).hex().upper(),
         }

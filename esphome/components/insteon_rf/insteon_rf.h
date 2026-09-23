@@ -24,6 +24,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
 #include "esphome/components/spi/spi.h"
 
 #include <cmath>
@@ -161,7 +162,7 @@ class InsteonRF : public Component,
   uint32_t frequency_hz_{914950000};
   uint32_t sync_word_{INSTEON_SYNC_WORD};
   uint8_t preamble_detector_{0x00};  // off; see __init__.py for the codes
-  uint8_t capture_bytes_{128};
+  uint8_t capture_bytes_{162};
   float rssi_floor_{-110.0f};
   uint8_t manchester_gate_{4};
   uint8_t tcxo_voltage_{0x02};  // 1.8 V; Heltec V3 drives the TCXO from DIO3
@@ -180,6 +181,13 @@ class InsteonRF : public Component,
   float last_rssi_{NAN};
   float last_accepted_rssi_{NAN};
   uint32_t last_accepted_ms_{0};
+  //: millis() when the last RxDone was seen, for stamping the capture with
+  //: when it was on the air rather than when it was published.
+  uint32_t rx_done_ms_{0};
+  //: Keeps loop() running flat out instead of every 16 ms, so RxDone is
+  //: noticed within a millisecond and the timestamp does not wander by a
+  //: loop period.
+  HighFrequencyLoopRequester high_freq_;
   //: The first few captures are logged at INFO with their leading bytes, so
   //: bring-up can be judged from the log alone: are captures arriving, does
   //: the gate pass them, does the polarity look right.

@@ -173,19 +173,24 @@ abuses **GFSK packet mode as a raw bit recorder**:
 | CRC | off | Insteon's CRC is its own algorithm |
 | Address filter | off | Insteon addresses are not where the chip looks |
 | Whitening | off | would destroy the payload |
-| Packet length | **fixed**, 128 bytes | Insteon has no length field the chip can read |
+| Packet length | **fixed**, 162 bytes (was 128) | Insteon has no length field the chip can read; sized to the slot grid, see below |
 
 The packet engine is a shift register feeding a 256-byte FIFO; it does not care
 that the payload is Manchester-coded with interleaved frame counters. It hands
 over raw on-air bits — exactly what the host pipeline already consumes ("one
 burst per line of `0`/`1` characters").
 
-128 bytes = 1024 bits = **112 ms** of air. Longer than a standard packet
-(13 frames × 28 bits = 364 bits = 40 ms) and longer than an extended one
-(32 frames = 896 bits = 98 ms), so a capture usually holds the tail of one
-transmission plus the start of the next hop repeat. That is fine —
-`parse_bits()` finds every packet in a bit string at any offset and in either
-polarity. Make the length configurable so it can be tuned.
+The first cut used 128 bytes = 1024 bits = 112 ms of air: longer than a
+standard packet (13 frames × 28 bits = 364 bits = 40 ms) and an extended one
+(32 frames = 896 bits = 98 ms), on the reasoning that `parse_bits()` finds
+every packet in a capture anyway. What that missed is the **slot grid**
+(`Doc/MESH-TRANSMIT.md`): copies and replies sit on 456-bit slots, the FIFO
+starts at the same point in each, and the next slot's 32-bit sync word begins
+424 bits after it. A capture that ends inside a sync word or a packet loses
+that slot outright, and 1024 bits ended inside slot 2 — where the ACK to a
+one-hop message goes. Since 2.8.0 it is **162 bytes = 1296 bits**: slots 0–2
+whole (the third ends at bit 1265), stopping 40 bits before slot 3's sync so
+continuous RX picks that slot up by itself. Configurable as `capture_bytes`.
 
 Per the decision above there is no separate feasibility phase. The first commit
 of Phase 4 is still "sync and dump a FIFO", and if the packet-mode trick does

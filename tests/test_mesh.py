@@ -731,3 +731,51 @@ def test_a_packet_with_impossible_hop_fields_is_not_a_device():
     settle(svc)
     assert svc.misses.devices == {}
     assert svc.misses.undecodable == 1
+
+
+# --------------------------------------------------------------------------- listener consistency
+
+
+def test_coverage_scores_every_receiver_against_one_denominator():
+    """The point of comparing receivers: each is scored over the same set of
+    device messages, so a receiver that hears little shows as such rather
+    than as a device the modem misses."""
+    from insteonrf.fusion import Fusion, sightings_from_capture
+
+    t = MissTable(plm_addr=PLM)
+    for i, who in enumerate([("a", "b"), ("a",), ("a", "b"), ("b",)]):
+        p = Packet.build(LEAK, group=1, bcast=True, cmd1=0x11, cmd2=i)
+        f = Fusion()
+        for name in who:
+            for s in sightings_from_capture(p.to_bits(), name, timestamp=100.0 + i):
+                f.add(s)
+        (e,) = f.flush(200.0)
+        t.note(e)
+    cov = t.coverage()
+    assert t.messages == 4
+    assert cov["a"] == {"heard": 3, "rate": 0.75, "sole": 1}
+    assert cov["b"] == {"heard": 3, "rate": 0.75, "sole": 1}
+    assert "# receiver coverage of 4 device messages" in t.report()
+    assert t.to_dict()["coverage"] == cov
+
+
+def test_the_modem_does_not_count_toward_coverage():
+    t = MissTable(plm_addr=PLM)
+    t.note(fused(src=PLM))
+    assert t.messages == 0 and t.coverage() == {}
+
+
+def test_stats_report_timing_per_receiver():
+    svc = MeshService(FakeReceiver())
+    svc.handle_capture(cap_for())
+    st = svc.stats()
+    assert {"late_copies", "arrival_lag", "clock_offsets"} <= set(st)
+    json.dumps(st)
+
+
+def test_the_service_waits_for_late_receivers_by_default():
+    from insteonrf.fusion import LATENESS_S
+
+    svc = MeshService(FakeReceiver())
+    assert svc.fusion.lateness_s == LATENESS_S
+    assert svc.fusion.skew is not None

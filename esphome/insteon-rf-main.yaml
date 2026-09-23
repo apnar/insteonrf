@@ -40,7 +40,7 @@ esphome:
   # "what is this board running" has one answer.
   project:
     name: insteonrf.listener
-    version: "2.7.3"
+    version: "2.8.0"
   on_boot:
     # Vext (the OLED's supply) is switched on at HARDWARE priority; give the
     # panel a moment before the display driver resets it at PROCESSOR.
@@ -103,7 +103,7 @@ insteon_rf:
   # From tools/gen_sync_word.py; complement is 0xCCCCCEAA (see bring-up above).
   sync_word: 0x33333155
   preamble_detector_bits: 0
-  capture_bytes: 128
+  capture_bytes: 162
   rssi_floor: -110
   manchester_gate: 4
   mqtt_topic: insteon-rf/rx/${name}

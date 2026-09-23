@@ -189,7 +189,7 @@ def _keep(packets: list[Packet], show_all: bool) -> list[Packet]:
 
 
 def _receive(radio: Any, timeout_ms: int
-             ) -> tuple[float, str, Any, int | None, float | None] | None:
+             ) -> tuple[float, str, Any, int | None, float | None, float | None] | None:
     """One burst from any backend, keeping soft decisions where they exist.
 
     A hardware demodulator (the rfcat dongle) can only give hard bits; the
@@ -201,12 +201,13 @@ def _receive(radio: Any, timeout_ms: int
         burst = radio.receive_burst(timeout_ms)
         if burst is None:
             return None
+        synced = burst.header_index is not None
         return (burst.timestamp or time.time(), burst.bits, burst.soft, burst.header_index,
-                burst.snr_db)
+                burst.snr_db, burst.cfo_hz if synced else None)
     got = radio.receive_bits(timeout_ms)
     if got is None:
         return None
-    return got[0], got[1], None, None, None
+    return got[0], got[1], None, None, None, None
 
 
 def _decode(bits: str, ts: float | None, *, repair: bool = True, show_all: bool = False,
@@ -361,7 +362,7 @@ def recv_main(argv: list[str] | None = None) -> int:
                     if getattr(radio, "exhausted", False):
                         break
                     continue  # nothing on the air within the timeout
-                ts, bits, soft, header_index, _snr = got
+                ts, bits, soft, header_index, _snr, _cfo = got
                 if a.decode:
                     pkts = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
                                    soft=soft, header_index=header_index, tracker=tracker)
@@ -880,12 +881,19 @@ def monitor_main(argv: list[str] | None = None) -> int:
         over nothing at all until something re-arms it.
         """
         nonlocal capture_seq
-        ts, bits, soft, header_index, snr_db, rssi = item
+        ts, bits, soft, header_index, snr_db, cfo_hz, rssi = item
         if a.mesh_capture and mqtt is not None:
             capture_seq += 1
+            # Not the dongle's RSSI: it is a register snapshot taken after a
+            # 224 ms block has ended, so it mostly reads the channel's floor
+            # (-104 dBm for a device it decodes 96% of the time). In the mesh
+            # it sat beside the boards' real per-packet figures, broke the
+            # "closest receiver" tie and filled the miss table's RSSI column.
+            # It stays in this pod's own log, where it is documented as what
+            # it is.
             mqtt.publish_capture(bits, receiver=a.mesh_capture, timestamp=ts,
-                                 rssi_dbm=rssi, seq=capture_seq, soft=soft,
-                                 snr_db=snr_db)
+                                 rssi_dbm=None if a.backend == "rfcat" else rssi,
+                                 seq=capture_seq, soft=soft, snr_db=snr_db)
         packets = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
                           soft=soft, header_index=header_index, tracker=tracker)
         if any(q.calc_crc is not None for q in packets):
@@ -895,6 +903,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
             live.junk_blocks += 1
         for pkt in packets:
             pkt.rssi_dbm = rssi
+            if snr_db is not None:
+                pkt.snr_db = snr_db
+            if cfo_hz is not None:
+                pkt.cfo_hz = cfo_hz
             if a.unknown_commands:
                 note_unknown(pkt)
             if watcher is not None:
@@ -1006,11 +1018,11 @@ def monitor_main(argv: list[str] | None = None) -> int:
                             else:
                                 log.error("re-arm failed: %r", err)
                 if got is not None:
-                    ts, bits, soft, header_index, snr_db = got
+                    ts, bits, soft, header_index, snr_db, cfo_hz = got
                     rssi = None
                     if not a.no_rssi and hasattr(radio, "read_rssi"):
                         rssi = radio.read_rssi()
-                    item = (ts, bits, soft, header_index, snr_db, rssi)
+                    item = (ts, bits, soft, header_index, snr_db, cfo_hz, rssi)
                     if lossless:
                         # Replay: waiting is free and the same file must
                         # always decode to the same packets.
@@ -1088,7 +1100,7 @@ def allon_main(argv: list[str] | None = None) -> int:
 
 def mesh_main(argv: list[str] | None = None) -> int:
     """Run the listener mesh: captures in, miss table out, injection optional."""
-    from .fusion import Fusion
+    from .fusion import LATENESS_S, ClockSkew, Fusion
     from .inject import Injector, Tier, load_addrs
     from .mesh import PLM_INJECT_TOPIC, PLM_RX_TOPIC, MeshService, PlmLink
     from .monitor import JsonlWriter
@@ -1155,6 +1167,13 @@ def mesh_main(argv: list[str] | None = None) -> int:
 
     p.add_argument("--window", type=float, default=0.6,
                    help="seconds to hold a message open for further copies (default %(default)s)")
+    p.add_argument("--lateness", type=float, default=LATENESS_S,
+                   help="extra seconds, by the wall clock, to wait for receivers that deliver "
+                        "late; copies arriving after that are counted as late_copies in the "
+                        "stats and dropped (default %(default)s)")
+    p.add_argument("--no-clock-skew", action="store_true",
+                   help="take each receiver's timestamps as given instead of learning and "
+                        "removing its offset from the messages the receivers share")
     p.add_argument("--report-every", type=float, default=900.0,
                    help="seconds between miss-table reports, 0 to disable (default %(default)s)")
     p.add_argument("--report-file", metavar="FILE",
@@ -1198,7 +1217,8 @@ def mesh_main(argv: list[str] | None = None) -> int:
         log.warning("--live has no effect without --inject")
 
     writer = JsonlWriter(a.out, max_bytes=a.max_bytes, backups=a.backups) if a.out else None
-    fusion = Fusion(a.window, allow_combine=not a.no_combine)
+    fusion = Fusion(a.window, allow_combine=not a.no_combine, lateness_s=a.lateness,
+                    skew=None if a.no_clock_skew else ClockSkew())
 
     def echo(event: Any) -> None:
         if a.quiet:

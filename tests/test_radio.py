@@ -374,3 +374,99 @@ def test_read_rssi_survives_a_junk_answer(fake_radio):
     radio = rfcat_mod.RfcatRadio()
     radio.dev.getRSSI = lambda: object()
     assert radio.read_rssi() is None
+
+
+# ---- when a capture was on the air ----
+
+
+def test_dongle_stamps_the_start_of_its_block(fake_radio):
+    """rflib stamps a block as it comes off USB, after the radio recorded the
+    whole of it: 255 bytes are 224 ms of air. Every receiver in the mesh has
+    to stamp the start of its capture or fusion puts the dongle's copy of a
+    message a quarter of a second after everyone else's."""
+    radio = rfcat_mod.RfcatRadio()
+    radio.dev.fail_after = None
+    radio.dev.blocks = [bytes(255)]
+    ts, data = radio.receive()
+    assert len(data) == 255
+    assert ts == pytest.approx(1.0 - 255 * 8 / rfcat_mod.DEFAULT_DRATE)
+
+
+def test_sample_clock_takes_the_least_delayed_read():
+    """A read can be late (scheduling, pipe, rtl_sdr's block size) but never
+    early, so the tightest bound over recent reads is the estimate."""
+    from insteonrf.radio.sdr import SampleClock
+
+    clock = SampleClock(1000.0)
+    assert clock.at(0) is None
+    clock.note(1000, 101.30)  # 0.3 s late
+    clock.note(2000, 102.01)  # 10 ms late
+    clock.note(3000, 103.50)
+    assert clock.at(0) == pytest.approx(100.01)
+    assert clock.at(2500) == pytest.approx(102.51)
+
+
+def _busy_stream(n: int, *, gap_slots: int = 1):
+    """``n`` standard packets on the 456-bit slot grid, back to back, plus
+    where each one starts -- what a busy exchange looks like to an SDR."""
+    import numpy as np
+
+    from insteonrf.dsp import modulate_fsk2
+
+    rate, baud = 2_400_000, 9124
+    slot = 456 * rate / baud
+    pkts = [Packet.build("2B.93.07", "29.4E.52", cmd1=0x0F, cmd2=i) for i in range(n)]
+    lead = 30_000
+    total = int(lead + slot * gap_slots * n + 0.2 * rate)
+    iq = np.zeros(2 * total, dtype=np.int16)
+    starts = []
+    for i, pkt in enumerate(pkts):
+        # to_bits() carries more preamble and pad than real devices send;
+        # trim so a packet fits its slot as it does on the air.
+        wave = modulate_fsk2(pkt.to_bits()[:-60], preamble_s=0, trailer_s=0).astype(np.int16)
+        at = int(lead + i * gap_slots * slot)
+        iq[2 * at:2 * at + wave.size] += wave
+        starts.append(at)
+    return np.clip(iq, -127, 127).astype(np.int8), pkts, starts
+
+
+def test_sdr_stream_decodes_a_busy_exchange_once_each(tmp_path):
+    """Back-to-back slots used to hold the squelch open for the whole
+    exchange; the buffer was demodulated in one go, slower than real time,
+    four syncs at most. Every packet must come out, and exactly once, even
+    where it straddles two passes."""
+    from insteonrf.radio import sdr
+
+    stream, pkts, _ = _busy_stream(24)
+    path = tmp_path / "busy.iq"
+    stream.tofile(path)
+    rx = sdr.SdrReceiver("rtl_sdr", demod="numpy", signed=True)
+    with path.open("rb") as fh:
+        rx._iq = fh
+        rx._start = lambda: None
+        got = [p.data for _, bits in rx.iter_bits() for p in parse_bits(bits) if p.crc_ok]
+    assert sorted(got) == sorted(p.data for p in pkts)
+
+
+def test_sdr_bursts_are_stamped_by_their_own_position(tmp_path, monkeypatch):
+    """Each burst gets the time its own first symbol was on the air, so two
+    packets one slot apart are stamped one slot apart -- not both with the
+    time the buffer holding them was demodulated."""
+    from insteonrf.radio import sdr
+
+    stream, _, starts = _busy_stream(6, gap_slots=3)
+    path = tmp_path / "timed.iq"
+    stream.tofile(path)
+    rx = sdr.SdrReceiver("rtl_sdr", demod="numpy", signed=True)
+    # A clock that says sample 0 went out at t=1000.
+    monkeypatch.setattr(sdr.SampleClock, "at",
+                        lambda self, sample: 1000.0 + sample / self.rate)
+    with path.open("rb") as fh:
+        rx._iq = fh
+        rx._start = lambda: None
+        bursts = [b for b in rx.iter_bursts()
+                  if any(p.crc_ok for p in parse_bits(b.bits))]
+    assert len(bursts) == 6
+    for b, at in zip(sorted(bursts, key=lambda b: b.timestamp), starts, strict=True):
+        # The sync template begins in the preamble, a few symbols early.
+        assert b.timestamp == pytest.approx(1000.0 + at / 2_400_000, abs=0.004)

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .context import CommandTracker
-from .fusion import FusedEvent, Fusion, sightings_from_capture
+from .fusion import LATENESS_S, ClockSkew, FusedEvent, Fusion, sightings_from_capture
 from .inject import Injector, PlmMemory, sender_of
 from .monitor import JsonlWriter
 from .packet import Address
@@ -91,6 +91,13 @@ class MissTable:
         self.plm_own_transmissions = 0
         #: Fused events whose bytes never verified. Reported, not attributed.
         self.undecodable = 0
+        #: Decodable messages from devices (not the modem), and per receiver
+        #: how many of them it heard and how many it alone heard. This is the
+        #: listener-consistency measure: every receiver is scored against the
+        #: same denominator, so the figures are comparable.
+        self.messages = 0
+        self.heard: dict[str, int] = {}
+        self.sole: dict[str, int] = {}
 
     def note(self, event: FusedEvent, injected: bool = False) -> None:
         # Only count messages that actually decoded. A capture can yield a
@@ -110,6 +117,12 @@ class MissTable:
         if self.plm_addr is not None and who == self.plm_addr:
             self.plm_own_transmissions += 1
             return
+        self.messages += 1
+        for name in event.receivers:
+            self.heard[name] = self.heard.get(name, 0) + 1
+        if len(event.receivers) == 1:
+            (only,) = event.receivers
+            self.sole[only] = self.sole.get(only, 0) + 1
         d = self.devices.setdefault(str(who), DeviceMisses())
         d.heard_by_rf += 1
         if event.plm_saw_it is True:
@@ -149,7 +162,25 @@ class MissTable:
                 f"{d.plm_missed:7d} {d.miss_rate:6.1%} {rssi:>6}  "
                 f"{','.join(sorted(d.receivers))}"
             )
+        out.extend(self.coverage_report())
         return "\n".join(out)
+
+    def coverage(self) -> dict[str, dict[str, Any]]:
+        """Per receiver: share of all decodable device messages it heard."""
+        n = self.messages
+        return {
+            r: {"heard": h, "rate": round(h / n, 4) if n else 0.0, "sole": self.sole.get(r, 0)}
+            for r, h in sorted(self.heard.items())
+        }
+
+    def coverage_report(self) -> list[str]:
+        if not self.messages:
+            return []
+        out = [f"# receiver coverage of {self.messages} device messages",
+               f"{'receiver':18} {'heard':>6} {'rate':>6} {'alone':>6}"]
+        for r, c in sorted(self.coverage().items(), key=lambda kv: -kv[1]["heard"]):
+            out.append(f"{r:18} {c['heard']:6d} {c['rate']:6.1%} {c['sole']:6d}")
+        return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -157,6 +188,8 @@ class MissTable:
             "hours": round((time.time() - self.started) / 3600.0, 3),
             "undecodable": self.undecodable,
             "plm_own_transmissions": self.plm_own_transmissions,
+            "messages": self.messages,
+            "coverage": self.coverage(),
             "devices": {a: d.to_dict() for a, d in self.devices.items()},
         }
 
@@ -289,7 +322,10 @@ class MeshService:
         self.receiver = receiver
         self.injector = injector
         self.plm = plm
-        self.fusion = fusion if fusion is not None else Fusion()
+        # Fed live: captures arrive late by different amounts per receiver,
+        # and each receiver's clock is corrected against the others.
+        self.fusion = (fusion if fusion is not None
+                       else Fusion(lateness_s=LATENESS_S, skew=ClockSkew()))
         self.writer = writer
         self.tracker = tracker if tracker is not None else CommandTracker()
         self.require_plm_link = require_plm_link
@@ -327,13 +363,14 @@ class MeshService:
     def handle_capture(self, cap: Capture) -> int:
         """Decode one capture into sightings. Returns how many packets it held."""
         self.captures += 1
+        arrived = time.time()
         found = sightings_from_capture(
             cap.bits, cap.receiver, rssi_dbm=cap.rssi_dbm, timestamp=cap.timestamp,
             soft=cap.soft, snr_db=cap.snr_db,
         )
         for s in found:
             self.tracker.observe(s.packet)
-            self.fusion.add(s)
+            self.fusion.add(s, arrived=arrived)
         self.packets += len(found)
         return len(found)
 
@@ -409,6 +446,14 @@ class MeshService:
             "capture_gaps": self.receiver.gaps,
             "captures_dropped": self.receiver.dropped,
         }
+        # Consistency diagnostics: stragglers mean the lateness allowance is
+        # too short for that receiver; the lag says by how much; the offsets
+        # are what each clock was corrected by.
+        d["late_copies"] = dict(sorted(self.fusion.late.items()))
+        d["repaired_copies_folded"] = self.fusion.folded
+        d["arrival_lag"] = self.fusion.arrival_lag()
+        if self.fusion.skew is not None:
+            d["clock_offsets"] = self.fusion.skew.to_dict()
         d["plm_messages_seen"] = self.memory.frames
         d["undecodable_events"] = self.misses.undecodable
         if self.plm is not None:

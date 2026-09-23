@@ -75,11 +75,21 @@ CONFIG_SCHEMA = (
             ),
             cv.Optional(CONF_SYNC_WORD, default=DEFAULT_SYNC_WORD): cv.hex_uint32_t,
             cv.Optional(CONF_PREAMBLE_DETECTOR, default=0): cv.enum(PREAMBLE_DETECTOR),
-            # 128 bytes is 112 ms of air: longer than a standard packet
-            # (40 ms) or an extended one (98 ms), so a capture usually holds
-            # a packet plus the start of the next hop repeat. The host finds
-            # every packet in the block, so that is a feature.
-            cv.Optional(CONF_CAPTURE_BYTES, default=128): cv.int_range(min=32, max=255),
+            # Sized to the slot grid, not to a packet. Insteon traffic sits
+            # on 456-bit (50 ms) slots: a message, its hop repeats and then
+            # the ACK, back to back. The FIFO starts at the same point in
+            # every slot, and the next slot's 32-bit sync word begins 424
+            # bits after it -- so a capture must end just short of a sync
+            # word, or the packet in that slot is cut in half and lost, and
+            # the chip only resumes hunting at the slot after.
+            #
+            # 162 bytes = 1296 bits holds slots 0, 1 and 2 whole (the third
+            # ends at bit 1265) and stops 40 bits before slot 3's sync
+            # (bit 1336), so continuous RX picks that slot up by itself. The
+            # old 128 (1024 bits) ended inside slot 2 -- which is exactly
+            # where the ACK to a one-hop message goes. It also fits an
+            # extended packet (857 bits after the sync).
+            cv.Optional(CONF_CAPTURE_BYTES, default=162): cv.int_range(min=32, max=255),
             cv.Optional(CONF_RSSI_FLOOR, default=-110.0): cv.float_range(
                 min=-130.0, max=0.0
             ),

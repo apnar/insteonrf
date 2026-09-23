@@ -64,7 +64,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `Src/fsk2_demod.c` | FSK2 demod + squelch + framing for raw 8-bit I/Q (`-U` signed/HackRF) |
 | `Src/rf_clip.c` | split an I/Q stream into per-burst files |
 | `insteonrf/plm.py` | RF packet <-> PLM `02 50`/`02 51` frames; `message_key()` is the hop-insensitive identity both paths share |
-| `insteonrf/fusion.py` | multi-receiver fusion: hop/receiver folding, retransmission numbering, hops-left attribution, cross-receiver bit combining |
+| `insteonrf/fusion.py` | multi-receiver fusion: hop/receiver folding, retransmission numbering, hops-left attribution, cross-receiver bit combining, per-receiver clock correction (`ClockSkew`) and lateness |
 | `insteonrf/inject.py` | what may be handed to insteon-mqtt: tiers, shadow mode, PLM-heard suppression, rate limits |
 | `insteonrf/mesh.py` | the mesh service and the miss table (`insteon-rf mesh`) |
 | `insteonrf/radio/mqtt.py` | listener-board captures over MQTT, also a `RadioBackend` |
@@ -238,11 +238,57 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   (`--max-silence=0`): re-arming means nothing to this backend, and if `rtl_sdr` dies
   the pod exits on `exhausted` and Kubernetes restarts it.
 - **SDR backends live**: `--demod numpy` (the C demodulator fails on real signals); the
-  reader thread in `SdrReceiver._iter_numpy` is load-bearing — demodulating one packet
-  takes ~85 ms and a pipe holds 14 ms of I/Q, so without it `rtl_sdr` drops samples
-  silently. RTL-SDR Blog V4 needs the rtlsdrblog librtlsdr fork (installed in
-  `/usr/local`) and `/etc/modprobe.d/blacklist-rtlsdr.conf`; gain 37.2 with squelch 12
-  is right here (49.6 raises the floor to 6.8 and chatters).
+  reader thread in `SdrReceiver._start_reader` is load-bearing — a pipe holds 14 ms of
+  I/Q, so without it `rtl_sdr` drops samples silently. RTL-SDR Blog V4 needs the
+  rtlsdrblog librtlsdr fork (installed in `/usr/local`) and
+  `/etc/modprobe.d/blacklist-rtlsdr.conf`; gain 37.2 with squelch 12 is right here (49.6
+  raises the floor to 6.8 and chatters).
+- **The SDR demodulator has to beat real time on busy air, and until 2.8.0 it did not.**
+  It waited for the squelch to close, but back-to-back 50 ms slots hold it open for a
+  whole exchange; then every one of 11 symbol-rate hypotheses re-mixed the whole run
+  from each sync, and `find_sync` stopped at 4 syncs. 2.1 s of busy air took 37 s and
+  decoded 12 of 40 packets; the pod logged >1,000 dropped I/Q chunks in 81 minutes and
+  stamped bursts 0.05–2.1 s late. Now: overlapping passes (`HOP_S` 0.2 s new +
+  `OVERLAP_S` 0.12 s, longer than any packet; a burst belongs to the pass whose first
+  `HOP_S` holds its sync), tone sums mixed once per sync and reused for every rate, one
+  packet's extent per sync (read from the flags byte), no sync cap, FFT correlation and a
+  running-sum envelope: 40/40 in 0.5 s. Bursts are stamped per sample by `SampleClock`
+  (tightest `t_read - sample/rate` over recent reads). `tests/test_dsp.py` and
+  `tests/test_radio.py` pin all of it.
+- **SDR sync is the sensitivity limit, not the matched filter.** The full-rate
+  discriminator is below the FM threshold where ML still decodes, so sync failed from
+  ~15 dB symbol SNR and any carrier offset made it worse (near threshold, 20 kHz off
+  decoded 0%). A zero-offset packet decoded anyway through the no-sync fallback, which
+  assumes zero offset — so a benchmark at `--cfo 0` flatters the old code; always
+  bench with an offset too. Now: sync on a low-passed (8-sample block) discriminator,
+  a tone-energy fallback sync over ±40 kHz (`_tone_sync`), the offset from an FFT of the
+  known template multiplied out (`_template_cfo`; ML needs it within ~2 kHz), and a
+  ±1 block timing search on the same sums as the rate. The real capture in `Dat/` is
+  29.5 kHz off, not the ~24 kHz once quoted.
+- **Every receiver stamps the on-air time of its capture's first bit**, and
+  `sightings_from_capture` adds `pos / 9124` for packets further in. Before 2.8.0: the
+  Heltec sent `time(nullptr)*1000` (whole seconds, 0–1 s early at random), the dongle the
+  USB arrival of its 255-byte block (224 ms late), the V4 its demod backlog. Fusion then
+  split one transmission into up to three events — of 3,858 in a day only 367 were
+  credited to all three receivers, and each receiver looked as if it heard what the others
+  missed. Corrected offline, coverage was dongle 75%, Heltec 41%, V4 42%, not the
+  45/30/59 the log showed.
+- **Fusion has two clocks** (2.8.0): windows are on-air time; buckets close
+  `--lateness` (1.0 s) later by the wall clock, for receivers that deliver late. A copy
+  later than that is a straggler (`late_copies` in the stats), never a retransmission.
+  `ClockSkew` learns each receiver's constant offset from shared messages (hop copies
+  normalised to the first slot) and corrects before matching; `clock_offsets` and
+  per-receiver `arrival_lag` are in the stats, and the miss report ends with **receiver
+  coverage** — every receiver scored against the same set of device messages.
+- **The Heltec's capture is sized to the slot grid** (162 bytes, 2.8.0). The FIFO starts
+  at the same point in every slot and the next slot's 32-bit sync begins 424 bits later,
+  so a capture must end just short of a sync word or that slot is cut in half. 128 bytes
+  ended inside slot 2 — where the ACK to a one-hop message goes; 162 holds slots 0–2 and
+  stops 40 bits before slot 3's sync. The firmware also no longer re-issues `SetRx` after
+  each capture: continuous RX re-arms itself, and restarting it aborted a packet already
+  arriving. The dongle's 255-byte block covers slots 0–3 and loses 4; left as it is (it is
+  the best receiver, and its firmware drops blocks it cannot ship, so more of them is not
+  obviously better).
 - **Soft decisions travel in the capture payload** (2.6.0): `s` is one signed byte per
   bit of `b` (`±127` = clean), `snr` the symbol SNR. Only I/Q backends produce it;
   `Capture.soft`/`Sighting.soft` are `None` for the boards and the dongle. Fusion votes

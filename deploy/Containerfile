@@ -1,18 +1,49 @@
-# insteon-rf RF listener for the house.
+# insteon-rf RF listeners for the house: the rfcat dongle pod, the mesh pod
+# and the RTL-SDR V4 pod all run this one image.
 #
 # Built locally (buildah bud → ctr image import) so restarts do not re-download
-# anything and the pod works without internet:
+# anything and the pods work without internet:
+#   rsync -a --delete --exclude .git --exclude .venv --exclude '*.pyc' \
+#         /root/insteon/insteonrf/ /nvme/k8s/insteonrf-config/build/src/
 #   cd /nvme/k8s/insteonrf-config/build && buildah bud -t insteonrf:local .
+#   rm -f /var/tmp/insteonrf.tar   # docker-archive will not overwrite one
 #   buildah push localhost/insteonrf:local docker-archive:/var/tmp/insteonrf.tar:localhost/insteonrf:local
 #   microk8s ctr image import /var/tmp/insteonrf.tar
 #
 # libusb-1.0-0 is the part that is easy to miss: pyusb needs the shared library,
 # and python:*-slim does not ship it, so rflib cannot see the dongle without it.
+
+# --- librtlsdr for the V4 --------------------------------------------------
+# The RTL-SDR Blog V4 needs the blog fork, not Osmocom's librtlsdr: the stock
+# library does not know the R828D front end the V4 uses and tunes it wrongly.
+# DETACH_KERNEL_DRIVER matters here. The kernel's DVB driver claims this
+# device on sight (it did on 2026-09-19, registering a frontend and polling
+# an IR remote every 200 ms); the host blacklist stops that only if the
+# modules were not already loaded, so the library is built able to take the
+# device back on its own.
+FROM python:3.13-slim AS rtlsdr
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential cmake git pkg-config libusb-1.0-0-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/rtlsdrblog/rtl-sdr-blog /src/rtl-sdr-blog \
+ && cmake -S /src/rtl-sdr-blog -B /src/build \
+      -DCMAKE_BUILD_TYPE=Release -DINSTALL_UDEV_RULES=OFF -DDETACH_KERNEL_DRIVER=ON \
+ && cmake --build /src/build -j"$(nproc)" \
+ && cmake --install /src/build
+
+# --- the listener ----------------------------------------------------------
 FROM python:3.13-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libusb-1.0-0 git \
  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rtlsdr /usr/local/bin/rtl_sdr /usr/local/bin/rtl_test /usr/local/bin/
+COPY --from=rtlsdr /usr/local/lib/librtlsdr.so* /usr/local/lib/
+RUN ldconfig && rtl_sdr -h 2>&1 | head -1
 
 COPY src /src
 RUN pip install --no-cache-dir /src "/src[mqtt,radio]" \

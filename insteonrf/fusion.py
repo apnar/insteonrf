@@ -7,6 +7,27 @@ which copy is closest to the transmitter — is carried *in the packet*: the
 flags byte holds hops-left, and the copy with the most hops left has travelled
 least. Timestamps are used only to decide which sightings belong together.
 
+That makes them load-bearing all the same. Two clocks are in play, and they
+must not be mixed up:
+
+* **On-air time** (:attr:`Sighting.when`) -- when the receiver says the packet
+  was on the air. Every receiver stamps the *start* of its capture, and
+  :class:`ClockSkew` learns and removes whatever constant offset each one
+  still has. Grouping and windows are in this clock.
+* **Arrival time** (the ``now`` passed to :meth:`Fusion.pop_ready`) -- when
+  the capture reached this process. Receivers deliver late by different
+  amounts (the dongle a block's length, the SDR a demodulation pass, a board
+  a WiFi hop), so a bucket is only closed ``lateness_s`` after its on-air
+  deadline. A copy that turns up later still is a *straggler*: counted per
+  receiver in :attr:`Fusion.late` and dropped, never re-emitted as a
+  retransmission.
+
+Measured 2026-09-23 before these existed: the Heltec stamped whole seconds,
+the dongle stamped the end of its 224 ms block and the SDR the end of a
+demodulation backlog, and one transmission heard by all three receivers came
+out as up to three events -- each receiver looking as if it had heard what the
+others missed. Of 3,858 events in a day, 367 were credited to all three.
+
 Four kinds of duplication arrive, and conflating them loses information:
 
 ===========================  =============================  ==================
@@ -42,9 +63,11 @@ plausible-looking messages, and these get fed to a real protocol stack.
 from __future__ import annotations
 
 import time
+from collections import deque
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from itertools import combinations
+from statistics import median
 from typing import Any
 
 import numpy as np
@@ -71,6 +94,17 @@ EXTEND_S = 0.2
 MAX_WINDOW_S = 2.0
 #: How long a closed key is remembered, for numbering retransmissions.
 REPEAT_MEMORY_S = 60.0
+#: How long past a bucket's on-air deadline to wait, in arrival time, for
+#: receivers that deliver late. It has to cover the slowest receiver's
+#: capture-to-arrival delay; the mesh reports those per receiver
+#: (``Fusion.arrival_lag``) so this can be checked rather than guessed.
+LATENESS_S = 1.0
+
+#: On-air bit rate, for placing a packet within its capture in time.
+BAUD = 9124
+#: Consecutive hop repeats start this far apart: 456 bits, six half-cycles of
+#: 60 Hz (measured 2026-09-15, see ``Doc/MESH-TRANSMIT.md``).
+SLOT_S = 456 / BAUD
 
 #: Most bits to flip when combining copies that disagree.
 MAX_COMBINE_FLIPS = 2
@@ -108,6 +142,8 @@ class Sighting:
     #: Per-symbol signed confidence aligned with ``bits`` (positive = ``1``,
     #: ``±1`` a clean symbol), from an I/Q receiver; ``None`` for hard bits.
     soft: np.ndarray[Any, Any] | None = field(default=None, repr=False)
+    #: The receiver's own timestamp, before :class:`ClockSkew` corrected it.
+    raw_when: float | None = None
 
     def __post_init__(self) -> None:
         if not self.bits:
@@ -166,11 +202,17 @@ def sightings_from_capture(
         if len(data) < min_bytes:
             continue
         end = pos + MARKER_OFFSET + FRAME_BITS * len(data)
-        pkt = Packet(data, bits[pos:end], timestamp,
+        # A capture's timestamp is its first bit; a packet further in went
+        # out that much later. One capture routinely holds a message and its
+        # next hop repeat 50 ms on, and stamping both with the capture's time
+        # would make the second look like it came from a receiver with a
+        # different clock.
+        when = None if timestamp is None else timestamp + pos / BAUD
+        pkt = Packet(data, bits[pos:end], when,
                      complete=bool(idx) and idx[-1] == 0)
         pkt.index_ok = indexes_ok(data, idx)
         pkt.rssi_dbm = rssi_dbm
-        out.append(Sighting(pkt, receiver, rssi_dbm, timestamp, bits[pos:],
+        out.append(Sighting(pkt, receiver, rssi_dbm, when, bits[pos:],
                             snr_db=snr_db,
                             soft=None if conf is None else conf[pos:]))
     return out
@@ -400,6 +442,65 @@ def combine(sightings: list[Sighting]) -> tuple[Packet, int] | None:
     return None
 
 
+# --------------------------------------------------------------------------- clocks
+
+
+class ClockSkew:
+    """Learn each receiver's constant clock offset from messages they share.
+
+    Every receiver is meant to stamp the on-air time of its capture's first
+    bit, but each gets there differently -- SNTP on a board, the host clock
+    minus a block length for the dongle, a sample counter for the SDR -- and
+    each can be off by a constant. A shared message is a reference: when
+    several receivers verified the same transmission, where each one placed
+    it, less the consensus, is a sample of that receiver's offset.
+
+    Offsets are relative to the consensus of the receivers themselves; there
+    is no reference clock to be right against, and grouping needs none.
+    Hop copies are normalised to the originating slot first
+    (``SLOT_S`` per hop used), so a receiver that only heard the last hop
+    is not mistaken for a slow clock.
+
+    A median over the last ``keep`` samples, applied only once ``min_samples``
+    have been seen and clamped to ``max_abs_s``: a wrong offset would stop the
+    very matching it is learned from, so it has to be slow and hard to fool.
+    """
+
+    def __init__(self, *, min_samples: int = 20, keep: int = 200, max_abs_s: float = 2.0):
+        self.min_samples = min_samples
+        self.keep = keep
+        self.max_abs_s = max_abs_s
+        self._samples: dict[str, deque[float]] = {}
+        self._offset: dict[str, float] = {}
+
+    def offset(self, receiver: str) -> float:
+        return self._offset.get(receiver, 0.0)
+
+    def correct(self, receiver: str, when: float) -> float:
+        return when - self.offset(receiver)
+
+    def learn(self, raw: dict[str, float]) -> None:
+        """One shared message: ``raw`` is each receiver's uncorrected origin time."""
+        if len(raw) < 2:
+            return
+        consensus = median(t - self.offset(r) for r, t in raw.items())
+        for r, t in raw.items():
+            q = self._samples.setdefault(r, deque(maxlen=self.keep))
+            q.append(t - consensus)
+        ready = {r: median(q) for r, q in self._samples.items() if len(q) >= self.min_samples}
+        if not ready:
+            return
+        # Relative offsets only: re-centre so the receivers' median is zero,
+        # which keeps the set from drifting as a whole.
+        centre = median(ready.values())
+        for r, v in ready.items():
+            self._offset[r] = max(-self.max_abs_s, min(self.max_abs_s, v - centre))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {r: {"offset_ms": round(self.offset(r) * 1000.0, 1), "samples": len(q)}
+                for r, q in sorted(self._samples.items())}
+
+
 # --------------------------------------------------------------------------- fusion
 
 
@@ -407,8 +508,14 @@ class Fusion:
     """Collect sightings into :class:`FusedEvent` objects.
 
     Buckets stay open for ``window_s`` after the last sighting, extended by
-    ``extend_s`` each time and capped at ``max_window_s``. :meth:`pop_ready`
-    hands over the ones that have closed.
+    ``extend_s`` each time and capped at ``max_window_s`` -- all in on-air
+    time -- and are then held ``lateness_s`` more, in arrival time, for
+    receivers that deliver late. :meth:`pop_ready` hands over the ones that
+    have closed.
+
+    ``lateness_s`` defaults to zero here, where ``now`` and the sightings'
+    times are the same clock (tests, and :func:`fuse_all` replaying a file);
+    the mesh service, which is fed live, uses :data:`LATENESS_S`.
     """
 
     def __init__(
@@ -419,22 +526,57 @@ class Fusion:
         max_window_s: float = MAX_WINDOW_S,
         repeat_memory_s: float = REPEAT_MEMORY_S,
         allow_combine: bool = True,
+        lateness_s: float = 0.0,
+        skew: ClockSkew | None = None,
     ):
         self.window_s = window_s
         self.extend_s = extend_s
         self.max_window_s = max_window_s
         self.repeat_memory_s = repeat_memory_s
         self.allow_combine = allow_combine
+        self.lateness_s = lateness_s
+        #: Per-receiver clock correction; ``None`` to take timestamps as given.
+        self.skew = skew
         self._open: dict[tuple[Any, ...], _Bucket] = {}
-        self._closed: dict[tuple[Any, ...], tuple[float, int]] = {}
+        #: Buckets a newer transmission of the same key has already ended.
+        self._ready: list[_Bucket] = []
+        #: key -> (closed at, repeat index, on-air first seen, on-air last seen)
+        self._closed: dict[tuple[Any, ...], tuple[float, int, float, float]] = {}
+        #: Per receiver: copies that arrived after their message's event had
+        #: been emitted. Non-zero means ``lateness_s`` is too short for it.
+        self.late: dict[str, int] = {}
+        #: Repaired copies merged into their message's event rather than
+        #: emitted as one of their own.
+        self.folded = 0
+        #: Per receiver: recent (arrival - on-air) delays, seconds.
+        self._lag: dict[str, deque[float]] = {}
 
     # -- input ------------------------------------------------------------
-    def add(self, sighting: Sighting) -> None:
-        """Fold one sighting into the open buckets."""
+    def add(self, sighting: Sighting, *, arrived: float | None = None) -> None:
+        """Fold one sighting into the open buckets.
+
+        ``arrived`` is when it reached this process, for the per-receiver
+        delay statistics; leave it out when replaying.
+        """
+        if self.skew is not None:
+            raw = sighting.when
+            sighting.raw_when = raw
+            sighting.timestamp = self.skew.correct(sighting.receiver, raw)
+        if arrived is not None:
+            self._lag.setdefault(sighting.receiver, deque(maxlen=500)).append(
+                arrived - sighting.when)
         key = message_key(sighting.packet)
         bucket = self._open.get(key)
         if bucket is not None:
-            bucket.add(sighting)
+            if bucket.accepts(sighting.when):
+                bucket.add(sighting)
+                return
+            # Same bytes, but past that bucket's window: a retransmission, not
+            # a copy. End the old one now rather than let the key carry both.
+            del self._open[key]
+            self._ready.append(bucket)
+        elif self._is_straggler(key, sighting):
+            self.late[sighting.receiver] = self.late.get(sighting.receiver, 0) + 1
             return
 
         # An exact key only groups copies that decoded identically, which is
@@ -455,6 +597,16 @@ class Fusion:
 
         self._open[key] = _Bucket(key, sighting, self)
 
+    def _is_straggler(self, key: tuple[Any, ...], sighting: Sighting) -> bool:
+        """A copy of a message whose event has already been emitted."""
+        if sighting.packet.crc_ok is not True:
+            return False
+        seen = self._closed.get(key)
+        if seen is None:
+            return False
+        _, _, first, last = seen
+        return first - self.window_s <= sighting.when <= last + self.window_s
+
     def _nearest(self, sighting: Sighting) -> _Bucket | None:
         """The open bucket whose bits are closest, if close enough to be the
         same transmission."""
@@ -464,6 +616,8 @@ class Fusion:
         for bucket in self._open.values():
             if incoming_good and bucket.has_good:
                 continue  # two confirmed packets: trust their bytes
+            if not bucket.accepts(sighting.when):
+                continue
             d = hamming(sighting.bits, bucket.ref_bits, MAX_DISAGREEMENTS)
             if d is not None and d <= MAX_DISAGREEMENTS and d < best_d:
                 best, best_d = bucket, d
@@ -485,11 +639,57 @@ class Fusion:
         if now is None:
             now = time.time()
         self._forget_old(now)
-        out = []
+        done, self._ready = self._ready, []
         for key, bucket in list(self._open.items()):
-            if bucket.is_closed(now):
+            if bucket.is_closed(now - self.lateness_s):
                 del self._open[key]
-                out.append(self._finish(bucket, now))
+                done.append(bucket)
+        return self._emit(done, now)
+
+    def _emit(self, done: list[_Bucket], now: float) -> list[FusedEvent]:
+        """Build events from closed buckets, folding repaired copies home.
+
+        A damaged copy cannot join its message's bucket on arrival: its key
+        is wrong, and a *different hop's* copy is too far away in bits to
+        match by similarity (the hop field and the CRC differ, 16 on-air
+        symbols before any damage). So it gets a bucket of its own, and once
+        :func:`combine` has repaired it, its real key is that message's. Left
+        alone, that came out as a second event -- numbered as a
+        retransmission, heard by one receiver -- which is exactly the
+        inconsistency the mesh is meant to measure. Seen live 2026-09-23 on
+        the V4, whose soft copies are the ones most often repaired alone.
+
+        So buckets with no verified copy are built first, and a repaired one
+        is merged into a bucket for the same message that is still pending
+        or open, or, if that event has already gone, counted as late.
+        """
+        done = sorted(done, key=lambda b: b.opened)
+        pending = [b for b in done if b.has_good]
+        out: list[FusedEvent] = []
+        for b in done:
+            if b.has_good:
+                continue
+            event = b.build(self.allow_combine)
+            if event.combined:
+                key = message_key(event.packet)
+                home = next((g for g in pending if g.key == key and g.accepts(b.opened)), None)
+                if home is None:
+                    live = self._open.get(key)
+                    if live is not None and live.accepts(b.opened):
+                        home = live
+                if home is not None:
+                    for s in b.sightings:
+                        home.add(s)
+                    self.folded += 1
+                    continue
+                seen = self._closed.get(key)
+                if seen is not None and seen[2] - self.window_s <= b.opened <= seen[3] + self.window_s:
+                    for s in b.sightings:
+                        self.late[s.receiver] = self.late.get(s.receiver, 0) + 1
+                    self.folded += 1
+                    continue
+            out.append(self._finish(b, now, event))
+        out += [self._finish(b, now) for b in pending]
         out.sort(key=lambda e: e.first_seen)
         return out
 
@@ -497,22 +697,35 @@ class Fusion:
         """Close every open bucket (use at shutdown)."""
         if now is None:
             now = time.time()
-        out = [self._finish(b, now) for b in self._open.values()]
+        done = [*self._ready, *self._open.values()]
+        self._ready = []
         self._open.clear()
-        out.sort(key=lambda e: e.first_seen)
-        return out
+        return self._emit(done, now)
 
     def __len__(self) -> int:
-        return len(self._open)
+        return len(self._open) + len(self._ready)
+
+    def arrival_lag(self) -> dict[str, dict[str, int]]:
+        """Per receiver, how late its captures arrive: median, p95 and worst, ms."""
+        out = {}
+        for r, q in sorted(self._lag.items()):
+            v = sorted(q)
+            if v:
+                out[r] = {"median_ms": round(v[len(v) // 2] * 1000.0),
+                          "p95_ms": round(v[min(len(v) - 1, int(len(v) * 0.95))] * 1000.0),
+                          "max_ms": round(v[-1] * 1000.0)}
+        return out
 
     # -- internals --------------------------------------------------------
     def _forget_old(self, now: float) -> None:
-        for key, (when, _) in list(self._closed.items()):
+        for key, (when, *_rest) in list(self._closed.items()):
             if now - when > self.repeat_memory_s:
                 del self._closed[key]
 
-    def _finish(self, bucket: _Bucket, now: float) -> FusedEvent:
-        event = bucket.build(self.allow_combine)
+    def _finish(self, bucket: _Bucket, now: float,
+                event: FusedEvent | None = None) -> FusedEvent:
+        if event is None:
+            event = bucket.build(self.allow_combine)
         # A bucket opened by a damaged copy carries that copy's (wrong) key.
         # Once combining has recovered the real bytes, re-key the event so
         # repeat numbering counts the actual message.
@@ -520,7 +733,9 @@ class Fusion:
             event.key = message_key(event.packet)
         seen = self._closed.get(event.key)
         event.repeat_index = 0 if seen is None else seen[1] + 1
-        self._closed[event.key] = (now, event.repeat_index)
+        self._closed[event.key] = (now, event.repeat_index, event.first_seen, event.last_seen)
+        if self.skew is not None and not event.combined:
+            self.skew.learn(bucket.origins())
         return event
 
 
@@ -539,8 +754,28 @@ class _Bucket:
         self.has_good = False
         self.add(first)
 
+    def accepts(self, when: float) -> bool:
+        """Whether a copy on the air at ``when`` can belong to this bucket."""
+        return self.opened - self.cfg.window_s <= when <= self.deadline()
+
+    def origins(self) -> dict[str, float]:
+        """Per receiver with a verified copy, its uncorrected estimate of when
+        the message first went out: each copy's time less the hops it had
+        already used, earliest per receiver."""
+        out: dict[str, float] = {}
+        for s in self.sightings:
+            p = s.packet
+            if p.crc_ok is not True or not p.hops_ok:
+                continue
+            t = (s.raw_when if s.raw_when is not None else s.when) - \
+                (p.max_hops - p.hops_left) * SLOT_S
+            if s.receiver not in out or t < out[s.receiver]:
+                out[s.receiver] = t
+        return out
+
     def add(self, s: Sighting) -> None:
         self.sightings.append(s)
+        self.opened = min(self.opened, s.when)
         self.last = max(self.last, s.when)
         if len(s.bits) > len(self.ref_bits):
             self.ref_bits = s.bits
@@ -548,12 +783,15 @@ class _Bucket:
             self.has_good = True
             self.key = message_key(s.packet)
 
-    def is_closed(self, now: float) -> bool:
-        deadline = min(
+    def deadline(self) -> float:
+        """The latest on-air time a copy can have and still belong here."""
+        return min(
             self.last + self.cfg.window_s + self.cfg.extend_s * (len(self.sightings) - 1),
             self.opened + self.cfg.max_window_s,
         )
-        return now > deadline
+
+    def is_closed(self, now: float) -> bool:
+        return now > self.deadline()
 
     def build(self, allow_combine: bool) -> FusedEvent:
         views: dict[str, ReceiverView] = {}
@@ -627,7 +865,11 @@ def fuse_all(sightings: Iterable[Sighting], **kwargs: Any) -> Iterator[FusedEven
 
 
 __all__ = [
+    "BAUD",
     "EXTEND_S",
+    "LATENESS_S",
+    "SLOT_S",
+    "ClockSkew",
     "MAX_COMBINE_FLIPS",
     "MAX_DISAGREEMENTS",
     "MAX_WINDOW_S",

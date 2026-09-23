@@ -4,6 +4,92 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.8.0 — 2026-09-23
+
+Four receivers in one house disagreed about what was on the air far more
+than four radios should. Mostly they were not disagreeing: the mesh was
+miscounting them, and one of them could not keep up.
+
+- **Every receiver stamps the on-air time of its capture's first bit.** The
+  Heltec sent `time(nullptr) * 1000` -- whole seconds, 0-1 s early at random
+  (measured: 0.34-1.04 s before arrival); the dongle sent the USB arrival of
+  its 255-byte block, 224 ms after the sync; the V4 sent the moment its
+  buffer was handed to a backlogged demodulator (0.05-2.1 s late). Fusion
+  groups by time, so one transmission became up to three events: of 3,858
+  in a day, 367 were credited to all three receivers, 524 pairs of "different"
+  events were the same message under two seconds apart, and each receiver
+  looked as if it heard what the others missed (45% / 30% / 59%). Re-grouped
+  with the offsets removed the same day reads dongle 75%, Heltec 41%, V4 42%.
+  Now the board stamps at millisecond resolution less the time since RxDone
+  and the capture's own air time, the dongle subtracts its block's air time,
+  the V4 stamps each burst from its sample position (`SampleClock`), and
+  packets later in a capture get `pos / 9124` added.
+- **Fusion keeps two clocks apart.** Windows are on-air time; a bucket closes
+  `--lateness` (1.0 s) later by the wall clock, so a receiver that delivers
+  late still joins. A copy later than that is counted in `late_copies` and
+  dropped -- before, it opened a new bucket and came out as a
+  *retransmission*. The same bytes past a bucket's window start a new event
+  even while the old one is still open. `ClockSkew` learns each receiver's
+  constant offset from messages they share (hop copies normalised to the
+  first slot) and corrects before matching (`--no-clock-skew` to disable).
+- **The mesh reports what it needs to be checked.** The miss report ends with
+  *receiver coverage*: every receiver scored against the same set of device
+  messages, with how many it alone heard. The stats carry `late_copies`,
+  per-receiver `arrival_lag` and `clock_offsets`.
+- **The SDR demodulator keeps up.** It waited for the squelch to close, which
+  back-to-back 50 ms slots postpone for a whole exchange; then each of 11
+  symbol-rate hypotheses re-mixed the whole squelch run from each sync, and
+  `find_sync` stopped at four. 2.1 s of busy air took 37 s and yielded 12 of
+  40 packets; live, the pod dropped over a thousand I/Q chunks in 81 minutes.
+  Now it streams in overlapping passes (0.2 s new + 0.12 s carried, longer
+  than any packet), mixes once per sync and tries every rate on the sums,
+  demodulates one packet's extent read from the flags byte, has no sync cap,
+  correlates by FFT and computes the squelch envelope as a running sum: 40 of
+  40 in 0.5 s, about a third of a core live. A burst also stops at its own
+  packet (it used to run into the next slot, which was then parsed twice with
+  the wrong time), and a false sync inside an extended payload is ignored.
+- **The SDR finds weak and off-frequency packets.** Sync was found on the
+  full-rate phase discriminator, which at the SNR where the matched filter
+  still decodes is below the FM threshold -- so sync failed from ~15 dB
+  symbol SNR down, and the carrier offset (every device's crystal error)
+  tipped it over: at 23.7 dB a 9 kHz offset decoded 15%, 20 kHz 5-10%, and
+  near threshold anything off frequency decoded 0%. A packet at exactly zero
+  offset had been decoding by luck, through the no-sync fallback that
+  assumes zero. Now: sync on a discriminator taken after an 8-sample
+  low-pass; when that finds nothing in a run a packet long, a tone-energy
+  sync over a grid of offsets (±40 kHz, 8 kHz steps, half-symbol windows);
+  the offset measured by FFT of the known sync template multiplied out (the
+  matched filter needs it within ~2 kHz: a residual f rotates the symbol
+  integral by 2*pi*f*T); and the start searched ±1 block on the same tone
+  sums as the rate. Paired 200-trial runs near threshold: at 20 kHz offset
+  0% -> 20/73/88/96% at 7.2/8.5/9.7/10.7 dB (with repair); at zero offset
+  30/74/94/97% against 32/84/95/97% before, where the old path was being
+  told the right offset for free. 0 false accepts in 300 noise bursts; busy
+  air still demodulates at ~2x real time. `cfo_hz` is now in the V4's
+  packet records (and `snr_db`, which the monitor never set), which gives
+  every device's crystal offset.
+- **A repaired copy joins its message's event.** A damaged copy of another
+  hop is too far in bits from the good copy to match on arrival (hop field
+  and CRC differ), so it was repaired alone and emitted as a *second* event,
+  numbered as a retransmission and heard by one receiver -- seen live on the
+  V4 the first hour. Such buckets are now built first and merged into the
+  message's bucket (or counted late if it has gone): `repaired_copies_folded`.
+- **The dongle's RSSI stays out of the mesh.** It is a register snapshot taken
+  after a 224 ms block has ended, so it mostly reads the floor (-104 dBm for
+  a device decoded 96% of the time); in the mesh it sat beside the board's
+  per-packet RSSI, broke the "closest" tie and filled the miss table's RSSI
+  column. It stays in the pod's own log.
+- **Listener firmware: capture sized to the slot grid, and no re-arm.** The
+  next slot's 32-bit sync begins 424 bits after the FIFO starts, so a capture
+  must stop short of one: 128 bytes ended inside slot 2 -- where the ACK to a
+  one-hop message goes -- and the Heltec heard 36% of cleanup ACKs. 162 bytes
+  holds slots 0-2 and stops 40 bits before slot 3. The loop also re-issued
+  `SetRx` after every capture, restarting a continuous receiver that had
+  already re-armed itself and dropping whatever had begun to arrive; and it
+  now runs as a high-frequency loop so RxDone is seen within a millisecond.
+- `deploy/Containerfile` had fallen behind the one actually built: it lacked
+  the librtlsdr stage the V4 pod needs. Synced.
+
 ## 2.7.3 — 2026-09-23
 
 Version numbers that mean something, and the listener board brought current.

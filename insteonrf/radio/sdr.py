@@ -44,9 +44,49 @@ READ_SIZE = 1 << 16
 #: pipe holds ~14 ms of samples at 2.4 Msps, so without a reader that keeps
 #: draining the pipe, ``rtl_sdr`` silently loses samples during every burst.
 QUEUE_SECONDS = 4.0
-#: Give up waiting for the squelch to close after this much signal (a packet
-#: is ~56 ms; anything longer is noise or a mis-set squelch).
-MAX_BURST_S = 0.5
+#: New I/Q demodulated per pass. Bounds both latency and the work per pass.
+HOP_S = 0.2
+#: I/Q carried over from one pass into the next: at least the longest packet
+#: (an extended one is ~100 ms from its sync), so a packet whose sync lies in
+#: one pass is always wholly inside it. See :meth:`SdrReceiver._iter_numpy`.
+OVERLAP_S = 0.12
+#: How many recent reads to remember when estimating when a sample was on
+#: the air (see :class:`SampleClock`).
+CLOCK_ANCHORS = 256
+
+
+class SampleClock:
+    """Wall-clock time of any sample in the stream, from when reads returned.
+
+    The SDR produces samples at an exact rate, so the time of sample ``s`` is
+    ``offset + s / rate`` for one constant ``offset``. Each read gives a
+    bound on it: the read's last sample cannot have been on the air *after*
+    the read returned. Scheduling, pipe buffering and ``rtl_sdr``'s own block
+    size only ever make a read late, never early, so the tightest bound --
+    the smallest ``t_read - s_end / rate`` over recent reads -- is the best
+    estimate, and it is good to a few milliseconds.
+
+    What it replaces stamped a burst with the time the *buffer* holding it
+    was handed to the demodulator, after the squelch had closed and after any
+    backlog. Measured against the other receivers that was 0.05 to 2.1 s
+    late and never the same twice, and fusion, which groups sightings by
+    time, split the same message into separate events.
+    """
+
+    def __init__(self, rate: float, anchors: int = CLOCK_ANCHORS):
+        self.rate = rate
+        self._anchors: list[float] = []
+        self._max = anchors
+
+    def note(self, s_end: int, t_read: float) -> None:
+        self._anchors.append(t_read - s_end / self.rate)
+        if len(self._anchors) > self._max:
+            del self._anchors[0]
+
+    def at(self, sample: int) -> float | None:
+        if not self._anchors:
+            return None
+        return min(self._anchors) + sample / self.rate
 
 
 def find_demod(explicit: str | None = None) -> Path | None:
@@ -98,6 +138,8 @@ class SdrReceiver:
         self.dropped_chunks = 0
         #: True once the capture stream has ended (a live SDR never exhausts).
         self.exhausted = False
+        #: When each sample was on the air; set up by the reader thread.
+        self.clock = SampleClock(sample_rate)
 
     # ---- lifecycle ----
 
@@ -201,32 +243,73 @@ class SdrReceiver:
                 yield time.time(), line
 
     def _iter_numpy(self) -> Iterator[dsp.Burst]:
-        """Demodulate in numpy, one burst at a time.
+        """Demodulate in numpy as the samples stream in.
 
-        A packet is ~56 ms long — about 270 kB of I/Q at 2.4 Msps, several
-        reads' worth — so reads are accumulated while the squelch stays open
-        and demodulated once the burst ends. ``MAX_BURST_S`` caps the buffer if
-        the squelch never closes (a noisy band or too low a threshold).
+        Passes of ``HOP_S`` new I/Q plus ``OVERLAP_S`` carried over from the
+        pass before. A burst is kept by the pass in whose *first* ``HOP_S``
+        its sync lies, so every sync is judged exactly once, and always with
+        a whole packet after it in the buffer (the overlap is longer than any
+        packet). Nothing waits for the squelch to close.
+
+        That waiting is what the previous version did, and it is why this
+        receiver missed what followed another message: Insteon traffic comes
+        as back-to-back 50 ms slots (a message, its hop repeats, the ACK and
+        its repeats, then the next responder), so the squelch stayed open for
+        whole exchanges; the buffer grew to its cap, was demodulated in one
+        go -- slower than real time, then -- and the backlog grew until the
+        reader was throwing I/Q away.
         """
-        tail_bytes = 2 * int(4 * self.sample_rate / self.baud)
-        lead_bytes = 2 * int(2 * self.sample_rate / self.baud)
-        max_bytes = 2 * int(MAX_BURST_S * self.sample_rate)
         chunks = self._start_reader()
-        pending = b""
+        rate = self.sample_rate
+        hop = 2 * int(HOP_S * rate)
+        overlap = 2 * int(OVERLAP_S * rate)
+        buf = b""
+        base = 0  # sample index of buf[0]
         while True:
-            chunk = chunks.get()
-            if chunk is None:
-                yield from self._flush(pending)
+            item = chunks.get()
+            if item is None:
+                yield from self._pass(buf, base, final=True)
                 return
-            pending += chunk
-            busy = self._tail_is_busy(chunk[-tail_bytes:])
-            if busy and len(pending) < max_bytes:
-                continue  # burst still in progress: keep collecting
-            yield from self._flush(pending)
-            # Keep a little context so a burst split by the size cap continues.
-            pending = pending[-lead_bytes:] if busy else b""
+            chunk, first = item
+            if buf and first != base + len(buf) // 2:
+                # The reader dropped I/Q between these: what is buffered is
+                # all there will ever be of that stretch, so finish it, and
+                # start again at the new position.
+                yield from self._pass(buf, base, final=True)
+                buf = b""
+            if not buf:
+                base = first
+            buf += chunk
+            if len(buf) >= hop + overlap:
+                yield from self._pass(buf, base, final=False, keep=overlap)
+                cut = len(buf) - overlap
+                cut -= cut % 2
+                buf = buf[cut:]
+                base += cut // 2
 
-    def _start_reader(self) -> queue.Queue[bytes | None]:
+    def _pass(self, buf: bytes, base: int, *, final: bool,
+              keep: int = 0) -> Iterator[dsp.Burst]:
+        """Demodulate one pass; keep the bursts whose sync is this pass's to judge."""
+        if len(buf) < 2:
+            return
+        limit = (len(buf) if final else len(buf) - keep) // 2
+        n = len(buf) // 2
+        for b in dsp.demodulate_bursts(buf, sample_rate=self.sample_rate, baud=self.baud,
+                                       signed=self.signed, squelch=self.squelch,
+                                       method=self.method, t0=self.clock.at(base)):
+            if b.start >= limit:
+                continue  # the next pass sees this one with its whole packet
+            if b.header_index is None and not final and b.start + len(b.bits) * b.sps >= n:
+                # No sync, and the run runs off the end: it is still arriving.
+                # The next pass cannot claim it either (its start is behind
+                # that pass), which is the right answer for a headerless
+                # fragment anyway.
+                continue
+            if b.timestamp is None:
+                b.timestamp = time.time()
+            yield b
+
+    def _start_reader(self) -> queue.Queue[tuple[bytes, int] | None]:
         """Drain the capture pipe on a thread so demodulation never stalls it.
 
         The main loop demodulates between reads; while it does, the pipe
@@ -235,20 +318,37 @@ class SdrReceiver:
         queues chunks; if the demodulator falls behind by more than
         ``QUEUE_SECONDS`` the *newest* chunks are dropped here instead, where
         it is counted in ``dropped_chunks``.
+
+        Each chunk goes with the stream index of its first sample, counted
+        over everything read -- dropped chunks included -- so the consumer
+        can see a gap, and so :attr:`clock` can tell when any sample was on
+        the air.
         """
-        chunks: queue.Queue[bytes | None] = queue.Queue(
+        chunks: queue.Queue[tuple[bytes, int] | None] = queue.Queue(
             maxsize=max(1, int(QUEUE_SECONDS * 2 * self.sample_rate / READ_SIZE)))
         self.dropped_chunks = 0
+        self.clock = SampleClock(self.sample_rate)
         src = self._iq
 
         def pump() -> None:
+            pos = 0  # samples read so far
+            carry = b""  # an odd trailing byte: half an I/Q pair
             try:
                 while True:
                     chunk = src.read(READ_SIZE)
                     if not chunk:
                         break
+                    now = time.time()
+                    chunk = carry + chunk
+                    if len(chunk) % 2:
+                        chunk, carry = chunk[:-1], chunk[-1:]
+                    else:
+                        carry = b""
+                    first = pos
+                    pos += len(chunk) // 2
+                    self.clock.note(pos, now)
                     try:
-                        chunks.put_nowait(chunk)
+                        chunks.put_nowait((chunk, first))
                     except queue.Full:
                         self.dropped_chunks += 1
                         if self.dropped_chunks in (1, 10, 100, 1000):
@@ -262,22 +362,6 @@ class SdrReceiver:
         self._reader = threading.Thread(target=pump, name="sdr-reader", daemon=True)
         self._reader.start()
         return chunks
-
-    def _flush(self, buf: bytes) -> Iterator[dsp.Burst]:
-        if not buf:
-            return
-        yield from dsp.demodulate_bursts(buf, sample_rate=self.sample_rate, baud=self.baud,
-                                         signed=self.signed, squelch=self.squelch,
-                                         method=self.method, timestamp=time.time())
-
-    def _tail_is_busy(self, tail: bytes) -> bool:
-        """True when the end of a read still carries signal above the squelch."""
-        if not tail:
-            return False
-        a = np.frombuffer(tail, dtype=np.int8 if self.signed else np.uint8).astype(np.float32)
-        if not self.signed:
-            a -= 128.0
-        return bool(np.abs(a[0::2] + 1j * a[1::2]).mean() > self.squelch)
 
     def receive_bits(self, timeout_ms: int = 2000) -> tuple[float, str] | None:
         burst = self.receive_burst(timeout_ms)

@@ -475,3 +475,129 @@ def test_fusion_refuses_a_packet_with_impossible_hop_fields():
                         hops_left=1, max_hops=3)
     (event,) = fuse_all(sightings_from_capture(good.to_bits(), "v4", timestamp=1.0))
     assert event.receivers["v4"].crc_ok is True
+
+
+# --------------------------------------------------------------------------- time
+
+
+def test_packets_later_in_a_capture_are_stamped_later():
+    """A capture holds a message and its next hop 50 ms on; stamping both with
+    the capture's time would look like a second receiver's clock."""
+    from insteonrf.fusion import BAUD
+
+    first, second = capture(3), capture(2)
+    got = sightings_from_capture(first + "0" * 20 + second, "a", timestamp=100.0)
+    assert len(got) == 2
+    # to_bits() leads with preamble, so even the first header is a few
+    # symbols in; what matters is the spacing.
+    assert got[0].when == pytest.approx(100.0, abs=0.005)
+    assert got[1].when - got[0].when == pytest.approx((len(first) + 20) / BAUD)
+
+
+def test_a_late_delivering_receiver_still_joins_the_event():
+    """Buckets close on on-air time plus a lateness allowance in arrival
+    time: a receiver whose capture reaches the mesh a second after the
+    others' must still be in the same event."""
+    f = Fusion(lateness_s=1.0)
+    f.add(sight("fast", timestamp=100.00), arrived=100.05)
+    assert f.pop_ready(100.9) == []  # on-air deadline passed, lateness not
+    f.add(sight("slow", timestamp=100.01), arrived=101.2)
+    (e,) = f.pop_ready(102.0)
+    assert set(e.receivers) == {"fast", "slow"}
+    assert f.arrival_lag()["slow"]["median_ms"] == pytest.approx(1190, abs=5)
+
+
+def test_a_straggler_is_counted_not_emitted_as_a_repeat():
+    """Past the allowance a copy is too late to report, but it is not a
+    retransmission either: it must not become a second event."""
+    f = Fusion(lateness_s=0.5)
+    f.add(sight("fast", timestamp=100.0))
+    assert len(f.pop_ready(101.5)) == 1
+    f.add(sight("slow", timestamp=100.02))
+    assert f.pop_ready(105.0) == []
+    assert f.late == {"slow": 1}
+
+
+def test_the_same_bytes_past_the_window_are_a_new_event_even_while_open():
+    """With a lateness allowance the old bucket can still be open when a
+    retransmission arrives; the key alone must not merge them."""
+    f = Fusion(lateness_s=5.0)
+    f.add(sight("a", timestamp=100.0))
+    f.add(sight("a", timestamp=103.0))
+    events = f.pop_ready(110.0)
+    assert [e.repeat_index for e in events] == [0, 1]
+
+
+def test_clock_skew_learns_a_receiver_s_offset():
+    from insteonrf.fusion import ClockSkew
+
+    skew = ClockSkew(min_samples=5)
+    for i in range(10):
+        t = 100.0 + i * 10
+        skew.learn({"a": t, "b": t + 0.02, "slow": t + 0.9})
+    assert skew.offset("slow") - skew.offset("a") == pytest.approx(0.9, abs=0.01)
+    assert skew.offset("b") == pytest.approx(0.0, abs=0.01)  # the median receiver
+
+
+def test_clock_skew_normalises_hop_copies_to_the_first_slot():
+    """A receiver that only heard the last hop is not a slow clock."""
+    from insteonrf.fusion import SLOT_S, ClockSkew
+
+    f = Fusion(skew=ClockSkew(min_samples=3))
+    for i in range(6):
+        t = 100.0 + i * 10
+        f.add(sight("near", hops_left=3, timestamp=t))
+        f.add(sight("far", hops_left=0, timestamp=t + 3 * SLOT_S))
+        f.pop_ready(t + 5)
+    assert f.skew.offset("far") == pytest.approx(f.skew.offset("near"), abs=0.001)
+
+
+def test_a_learned_offset_brings_a_skewed_receiver_into_the_event():
+    """A receiver 1.5 s off would never share a 0.6 s window with the others;
+    once its offset has been learned from messages that did meet (inside the
+    2 s cap), it is corrected before matching."""
+    from insteonrf.fusion import ClockSkew
+
+    f = Fusion(skew=ClockSkew(min_samples=5))
+    t = 100.0
+    for i in range(8):  # distinct messages, each heard by all three
+        t += 10
+        for name, off in (("a", 0.0), ("b", 0.01), ("skewed", 0.5)):
+            f.add(sight(name, cmd2=i, timestamp=t + off))
+        f.pop_ready(t + 5)
+    assert f.skew.offset("skewed") == pytest.approx(0.49, abs=0.02)
+    t += 10
+    f.add(sight("a", cmd2=0x77, timestamp=t))
+    f.add(sight("skewed", cmd2=0x77, timestamp=t + 0.5))
+    (e,) = f.pop_ready(t + 5)
+    assert set(e.receivers) == {"a", "skewed"}
+
+
+def test_a_repaired_copy_of_another_hop_joins_its_message_s_event(monkeypatch):
+    """A damaged copy of another hop can be too far in bits from the good
+    copy to match on arrival (hop field and CRC differ), so it is repaired
+    on its own -- and must then land in that message's event, not come out
+    as a second event numbered as a retransmission. Live copies carry more
+    damage than these; a tighter similarity limit stands in for it."""
+    from insteonrf import fusion
+
+    monkeypatch.setattr(fusion, "MAX_DISAGREEMENTS", 6)
+    f = Fusion()
+    f.add(sight("a", hops_left=3, timestamp=100.0))
+    f.add(soft_sight("v4", hops_left=0, damage=[200, 230], timestamp=100.1))
+    (e,) = f.pop_ready(103.0)
+    assert set(e.receivers) == {"a", "v4"}
+    assert e.repeat_index == 0 and not e.combined
+    assert f.folded == 1
+
+
+def test_a_repaired_copy_after_its_event_has_gone_is_counted_late(monkeypatch):
+    from insteonrf import fusion
+
+    monkeypatch.setattr(fusion, "MAX_DISAGREEMENTS", 6)
+    f = Fusion()
+    f.add(sight("a", hops_left=3, timestamp=100.0))
+    assert len(f.pop_ready(101.0)) == 1
+    f.add(soft_sight("v4", hops_left=0, damage=[200, 230], timestamp=100.1))
+    assert f.pop_ready(103.0) == []
+    assert f.late == {"v4": 1}

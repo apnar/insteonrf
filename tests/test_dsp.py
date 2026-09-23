@@ -156,3 +156,116 @@ def test_iq_bursts_on_real_capture():
     assert len(bursts) == 1
     assert bursts[0].size >= 0.99 * CAPTURE.stat().st_size
     assert py_decode(bursts[0])
+
+
+# ---- the receive chain has to keep up with busy air ----
+
+
+def test_fft_correlation_matches_the_direct_form():
+    from insteonrf.dsp import _xcorr_valid
+
+    rng = np.random.default_rng(3)
+    d = rng.normal(size=40_000).astype(np.float32)
+    t = rng.normal(size=900).astype(np.float32)
+    assert np.allclose(_xcorr_valid(d, t), np.correlate(d, t, mode="valid"), atol=1e-2)
+
+
+def test_running_envelope_matches_the_convolution_it_replaced():
+    from insteonrf.dsp import _envelope
+
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=20_000) + 1j * rng.normal(size=20_000)
+    sps = 2_400_000 / 9124
+    win = int(round(sps))
+    want = np.convolve(np.abs(x), np.ones(win) / win, mode="same")
+    assert np.allclose(_envelope(x, sps), want, atol=1e-4)
+
+
+def test_every_packet_in_one_squelch_run_is_found():
+    """A run can hold a whole exchange; find_sync used to stop at four."""
+    from insteonrf.dsp import demodulate_bursts
+
+    pkts = [Packet.build("2B.93.07", "29.4E.52", cmd1=0x0F, cmd2=i) for i in range(8)]
+    # No gaps at all: one continuous run of carrier.
+    wave = np.concatenate([modulate_fsk2(p.to_bits(), trailer_s=0) for p in pkts])
+    got = [q.data for b in demodulate_bursts(wave) for q in parse_bits(b.bits) if q.crc_ok]
+    assert sorted(got) == sorted(p.data for p in pkts)
+
+
+def test_bursts_are_stamped_from_t0():
+    from insteonrf.dsp import demodulate_bursts
+
+    lead = np.zeros(2 * 24_000, dtype=np.int8)  # 10 ms of silence
+    (b,) = demodulate_bursts(np.concatenate([lead, modulate_fsk2(STD.to_bits())]), t0=50.0)
+    assert b.timestamp == pytest.approx(50.0 + b.start / 2_400_000)
+    assert 50.010 < b.timestamp < 50.015
+
+
+def test_an_extended_payload_does_not_yield_a_second_sync():
+    """Syncs are spaced by the shortest packet, and an extended payload is
+    long enough to hold a false one: nothing real starts inside a packet."""
+    from insteonrf.dsp import demodulate_bursts
+
+    bursts = demodulate_bursts(modulate_fsk2(EXT.to_bits()))
+    assert len(bursts) == 1
+    assert EXT.data in [p.data for p in parse_bits(bursts[0].bits)]
+
+
+def test_a_standard_burst_stops_at_its_own_packet():
+    """Running on into the next slot made the parser report that packet
+    twice, once with the wrong time."""
+    from insteonrf.dsp import demodulate_bursts
+
+    nxt = Packet.build("2B.93.07", "29.4E.52", cmd1=0x19)
+    wave = np.concatenate([modulate_fsk2(STD.to_bits(), trailer_s=0), modulate_fsk2(nxt.to_bits())])
+    per_burst = [[p.data for p in parse_bits(b.bits) if p.crc_ok] for b in demodulate_bursts(wave)]
+    assert per_burst == [[STD.data], [nxt.data]]
+
+
+@pytest.mark.parametrize("cfo_hz", [-20_000, 9_000, 20_000])
+def test_carrier_offset_does_not_hide_the_sync_under_noise(cfo_hz):
+    """Every cheap-crystal device is kilohertz off. With sync found on the
+    full-rate discriminator, a weak packet 9 kHz off decoded 15% of the time
+    at 23.7 dB symbol SNR (6 kHz: 100%) -- the discriminator is below the FM
+    threshold there. Low-pass first, then take the phase step."""
+    from insteonrf.dsp import demodulate_bursts
+
+    rng = np.random.default_rng(5)
+    clean = modulate_fsk2(STD.to_bits(), amplitude=40).astype(np.float64)
+    n = np.arange(clean.size // 2)
+    iq = (clean[0::2] + 1j * clean[1::2]) * np.exp(2j * np.pi * cfo_hz * n / 2_400_000)
+    ok = 0
+    for _ in range(10):
+        noisy = np.empty_like(clean)
+        noisy[0::2] = iq.real + rng.normal(0, 30, iq.size)
+        noisy[1::2] = iq.imag + rng.normal(0, 30, iq.size)
+        s = np.clip(np.rint(noisy), -127, 127).astype(np.int8)
+        bursts = demodulate_bursts(s)
+        ok += any(p.data == STD.data for b in bursts for p in parse_bits(b.bits) if p.crc_ok)
+        assert all(abs(b.cfo_hz - cfo_hz) < 3_000 for b in bursts if b.header_index is not None)
+    assert ok >= 9
+
+
+@pytest.mark.parametrize("cfo_hz", [0, 20_000, -35_000])
+def test_a_weak_packet_is_synced_and_decoded_whatever_its_offset(cfo_hz):
+    """At ~13 dB symbol SNR the phase discriminator finds no sync at all; a
+    weak packet at zero offset still decoded, by luck, through the no-sync
+    fallback (which assumes zero offset), and one 20 kHz off never did. The
+    tone-energy sync finds it, and the template gives its offset."""
+    from insteonrf.dsp import demodulate_bursts
+
+    rng = np.random.default_rng(9)
+    clean = modulate_fsk2(STD.to_bits(), amplitude=12).astype(np.float64)
+    n = np.arange(clean.size // 2)
+    iq = (clean[0::2] + 1j * clean[1::2]) * np.exp(2j * np.pi * cfo_hz * n / 2_400_000)
+    ok = 0
+    for _ in range(10):
+        noisy = np.empty_like(clean)
+        noisy[0::2] = iq.real + rng.normal(0, 30, iq.size)
+        noisy[1::2] = iq.imag + rng.normal(0, 30, iq.size)
+        bursts = demodulate_bursts(np.clip(np.rint(noisy), -127, 127).astype(np.int8))
+        synced = [b for b in bursts if b.header_index is not None]
+        assert synced, "no sync found"
+        assert abs(synced[0].cfo_hz - cfo_hz) < 1_000
+        ok += any(p.data == STD.data for b in synced for p in parse_bits(b.bits) if p.crc_ok)
+    assert ok >= 8

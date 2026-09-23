@@ -548,7 +548,16 @@ class RfcatRadio:
     # ---- I/O -------------------------------------------------------------
 
     def receive(self, timeout_ms: int = 2000) -> tuple[float, bytes] | None:
-        """Return ``(timestamp, raw bytes)`` for the next block, or None on timeout."""
+        """Return ``(timestamp, raw bytes)`` for the next block, or None on timeout.
+
+        The timestamp is when the block's *first* bit was on the air, not
+        when it reached the host. rflib stamps a block as it comes off USB,
+        which is after the radio has recorded the whole fixed-length block --
+        224 ms of air for the default 255 bytes. Every other receiver in the
+        mesh stamps the start of its capture, and fusion groups sightings by
+        time, so leaving that in put the dongle's copy of every message a
+        quarter of a second after everyone else's.
+        """
         try:
             data, ts = self.dev.RFrecv(timeout=timeout_ms)
         except self.rflib.ChipconUsbTimeoutException:
@@ -564,7 +573,7 @@ class RfcatRadio:
                 return None
             raise
         self._timeouts = 0
-        return ts, bytes(data)
+        return ts - len(data) * 8 / self.drate, bytes(data)
 
     def receive_bits(self, timeout_ms: int = 2000) -> tuple[float, str] | None:
         """Like :meth:`receive` but returns an ASCII bit string in on-air polarity."""

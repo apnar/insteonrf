@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <sys/time.h>
 
 namespace esphome {
 namespace insteon_rf {
@@ -113,6 +114,7 @@ void InsteonRF::setup() {
   }
   this->radio_ok_ = true;
   this->start_rx_();
+  this->high_freq_.start();
   this->last_minute_mark_ = millis();
 }
 
@@ -336,12 +338,20 @@ void InsteonRF::loop() {
   if (status == 0)
     return;
 
+  this->rx_done_ms_ = millis();
   uint8_t clear[2] = {irq[0], irq[1]};
   this->cmd_(SX_CLEAR_IRQ_STATUS, clear, 2);
 
   if (status & SX_IRQ_RX_DONE)
     this->handle_capture_();
-  this->start_rx_();
+  // Continuous RX re-arms itself after every packet: the chip is already
+  // hunting for the next sync word by the time we get here. Issuing SetRx
+  // again restarted it, and anything that had begun to arrive in the
+  // meantime -- a hop repeat or an ACK 50 ms behind the capture just read,
+  // with WiFi having held this loop up -- was thrown away. Only a timeout
+  // (which continuous mode should never raise) needs restarting.
+  if (!(status & SX_IRQ_RX_DONE))
+    this->start_rx_();
 }
 
 void InsteonRF::handle_capture_() {
@@ -416,9 +426,21 @@ void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi) {
     blob += (i + 2 < len) ? B64[v & 0x3F] : '=';
   }
 
-  // Epoch milliseconds when the clock is set, so the host can window
-  // captures from different boards together; it falls back to arrival time
-  // if this looks implausible, so an unsynced board is harmless.
+  // Epoch milliseconds of the capture's *first bit on the air*, so the host
+  // can window captures from different receivers together; it falls back to
+  // arrival time if this looks implausible, so an unsynced board is harmless.
+  //
+  // This used to be time(nullptr) * 1000 -- whole seconds, so up to a second
+  // early at random -- taken at publish time. Against the other receivers
+  // that alone split one transmission into several events. Now: the wall
+  // clock at millisecond resolution, less the time since RxDone, less the
+  // capture's own length on the air (RxDone fires when the last byte is in).
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  const uint64_t now_ms = (uint64_t) tv.tv_sec * 1000ULL + (uint64_t) (tv.tv_usec / 1000);
+  const uint64_t air_ms = ((uint64_t) len * 8ULL * 1000ULL) / INSTEON_BITRATE;
+  const uint64_t since_ms = (uint64_t) (millis() - this->rx_done_ms_);
+  const uint64_t t_ms = now_ms - since_ms - air_ms;
   // "sw" is the sync word this capture was matched on. The FIFO holds only
   // what follows it, so the host has to put the start header back before
   // parsing, and it needs to know which polarity to put back.
@@ -428,7 +450,7 @@ void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi) {
            "{\"n\":\"%s\",\"seq\":%u,\"t\":%llu,\"us\":%u,\"rssi\":%.1f,\"len\":%u,"
            "\"sw\":\"%08X\",\"b\":\"",
            App.get_name().c_str(), (unsigned) this->seq_,
-           (unsigned long long) ((uint64_t) time(nullptr) * 1000ULL), (unsigned) us, rssi,
+           (unsigned long long) t_ms, (unsigned) us, rssi,
            (unsigned) len, (unsigned) this->sync_word_);
 
   std::string payload(head);
