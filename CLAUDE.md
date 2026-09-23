@@ -241,8 +241,15 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   reader thread in `SdrReceiver._start_reader` is load-bearing — a pipe holds 14 ms of
   I/Q, so without it `rtl_sdr` drops samples silently. RTL-SDR Blog V4 needs the
   rtlsdrblog librtlsdr fork (installed in `/usr/local`) and
-  `/etc/modprobe.d/blacklist-rtlsdr.conf`; gain 37.2 with squelch 12 is right here (49.6
-  raises the floor to 6.8 and chatters).
+  `/etc/modprobe.d/blacklist-rtlsdr.conf`; gain 37.2 with squelch 12 (49.6 raises the
+  floor to 6.8 and chatters). At 37.2 the floor envelope is ~2.5, so squelch 12 looks
+  far too high — but lowering it to 4 added one message in 90 s of recorded traffic;
+  it is not the limit. **The V4's real problem is placement**: it sits beside the PLM,
+  whose transmissions arrive 40% clipped at 37.2 and still 14–29% at 28.0 (per-burst
+  `clipped` in its records). Move the antenna away or add an attenuator before tuning
+  anything else. It also sees the network 33–45 kHz high (the dongle's FREQEST ≈ 0):
+  its own tuning. Record raw I/Q with the pod stopped (`rtl_sdr -g 37.2 -n …`) and
+  replay it through `SdrReceiver` — file replay is lossless.
 - **The SDR demodulator has to beat real time on busy air, and until 2.8.0 it did not.**
   It waited for the squelch to close, but back-to-back 50 ms slots hold it open for a
   whole exchange; then every one of 11 symbol-rate hypotheses re-mixed the whole run
@@ -286,7 +293,9 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   ended inside slot 2 — where the ACK to a one-hop message goes; 162 holds slots 0–2 and
   stops 40 bits before slot 3's sync. The firmware also no longer re-issues `SetRx` after
   each capture: continuous RX re-arms itself, and restarting it aborted a packet already
-  arriving. The dongle's 255-byte block covers slots 0–3 and loses 4; left as it is (it is
+  arriving. The on-board Manchester gate tolerates `manchester_gate_errors` (2) bad
+  pairs: failing on the first rejected 99% of packets with one flipped bit, which the
+  host would have repaired. The dongle's 255-byte block covers slots 0–3 and loses 4; left as it is (it is
   the best receiver, and its firmware drops blocks it cannot ship, so more of them is not
   obviously better).
 - **Soft decisions travel in the capture payload** (2.6.0): `s` is one signed byte per

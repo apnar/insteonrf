@@ -11,4 +11,4 @@ and by 2.7.2 the two had drifted three releases apart: every pod reported
 unanswerable from the outside.
 """
 
-__version__ = "2.8.0"
+__version__ = "2.8.1"

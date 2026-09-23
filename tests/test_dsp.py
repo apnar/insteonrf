@@ -246,7 +246,7 @@ def test_carrier_offset_does_not_hide_the_sync_under_noise(cfo_hz):
     assert ok >= 9
 
 
-@pytest.mark.parametrize("cfo_hz", [0, 20_000, -35_000])
+@pytest.mark.parametrize("cfo_hz", [0, 20_000, -35_000, 52_000])
 def test_a_weak_packet_is_synced_and_decoded_whatever_its_offset(cfo_hz):
     """At ~13 dB symbol SNR the phase discriminator finds no sync at all; a
     weak packet at zero offset still decoded, by luck, through the no-sync
@@ -269,3 +269,15 @@ def test_a_weak_packet_is_synced_and_decoded_whatever_its_offset(cfo_hz):
         assert abs(synced[0].cfo_hz - cfo_hz) < 1_000
         ok += any(p.data == STD.data for b in synced for p in parse_bits(b.bits) if p.crc_ok)
     assert ok >= 8
+
+
+def test_a_burst_reports_how_much_of_it_was_clipped():
+    """Next to the PLM the V4 clipped 40% of samples; that has to be visible
+    per burst, or a bad placement looks like a bad demodulator."""
+    from insteonrf.dsp import demodulate_bursts
+
+    (clean,) = demodulate_bursts(modulate_fsk2(STD.to_bits(), amplitude=60))
+    assert clean.clipped == 0.0
+    loud = (modulate_fsk2(STD.to_bits(), amplitude=127).astype(np.int16) * 3).clip(-127, 127)
+    (hot,) = demodulate_bursts(loud.astype(np.int8))
+    assert hot.clipped > 0.5

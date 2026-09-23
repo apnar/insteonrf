@@ -779,3 +779,17 @@ def test_the_service_waits_for_late_receivers_by_default():
     svc = MeshService(FakeReceiver())
     assert svc.fusion.lateness_s == LATENESS_S
     assert svc.fusion.skew is not None
+
+
+def test_an_unknown_sender_is_not_a_device():
+    """A decode that passes its checks by luck invents its sender; counted,
+    it is a "device" one receiver heard alone, and it skews every
+    receiver's coverage."""
+    from insteonrf.packet import Address
+
+    t = MissTable(plm_addr=PLM, known_addrs={Address(DEV)})
+    t.note(fused(src=LEAK))
+    t.note(fused(src=DEV))
+    assert t.unknown_senders == 1
+    assert list(t.devices) == [DEV] and t.messages == 1
+    assert "1 from unknown addresses" in t.report()

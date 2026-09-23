@@ -182,6 +182,12 @@ class Burst:
     #: correlator located it — so the frame grid is known rather than searched.
     header_index: int | None = None
     timestamp: float | None = None
+    #: Fraction of this burst's samples at the ADC's rails (either rail, I or
+    #: Q). An 8-bit SDR next to the PLM clipped 40% of the PLM's own
+    #: transmissions (measured 2026-09-23), and clipping I and Q separately
+    #: distorts the phase the whole detector depends on; this is the number
+    #: that says whether gain or placement is to blame for a bad burst.
+    clipped: float = 0.0
 
     def __len__(self) -> int:
         return len(self.bits)
@@ -323,17 +329,20 @@ def _tone_sums(
     return np.concatenate((zero, yp)), np.concatenate((zero, ym))
 
 
-#: Carrier offsets searched by :func:`_template_cfo`. Measured devices sit
-#: within about 25 kHz (the capture in ``Dat/`` is 24 kHz off); the block
-#: discriminator stays unambiguous to ~70 kHz.
-MAX_CFO_HZ = 45_000
+#: Carrier offsets searched by :func:`_template_cfo`. The V4 sees the network
+#: 33-45 kHz high (see TONE_SYNC_CFOS) and the capture in ``Dat/`` is 29.5
+#: kHz off; the block discriminator stays unambiguous to ~70 kHz.
+MAX_CFO_HZ = 60_000
 
 
 #: Carrier-offset hypotheses for :func:`_tone_sync`, Hz. Half-symbol tone
 #: windows tolerate a few kHz of residual (the correlation falls off as
 #: sinc(f * T/2)), so an 8 kHz grid leaves at most 4 kHz -- a loss of about
-#: 1 dB -- across the whole range devices have been seen at.
-TONE_SYNC_CFOS = tuple(range(-40_000, 40_001, 8_000))
+#: 1 dB. The range is what the V4 actually sees, not just device crystals:
+#: measured 2026-09-23 it puts the whole network 33-45 kHz high (the PLM at
+#: +33.3 kHz) while the dongle's FREQEST reads about zero, so most of that is
+#: the SDR's own tuning. Keep margin on it.
+TONE_SYNC_CFOS = tuple(range(-56_000, 56_001, 8_000))
 
 
 def _tone_sync(
@@ -588,6 +597,12 @@ def demodulate_bursts(
     if t0 is not None:
         for b in out:
             b.timestamp = t0 + b.start / sample_rate
+    if out:
+        rail = (np.abs(x.real) >= 126.5) | (np.abs(x.imag) >= 126.5)
+        for b in out:
+            hi = min(rail.size, b.start + int(len(b.bits) * (b.sps or sps)))
+            if hi > b.start:
+                b.clipped = float(rail[b.start:hi].mean())
     return out
 
 

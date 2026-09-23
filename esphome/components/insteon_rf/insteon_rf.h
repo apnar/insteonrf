@@ -112,6 +112,7 @@ class InsteonRF : public Component,
   void set_capture_bytes(uint8_t n) { this->capture_bytes_ = n; }
   void set_rssi_floor(float dbm) { this->rssi_floor_ = dbm; }
   void set_manchester_gate(uint8_t frames) { this->manchester_gate_ = frames; }
+  void set_manchester_gate_errors(uint8_t n) { this->manchester_gate_errors_ = n; }
   void set_tcxo_voltage(uint8_t code) { this->tcxo_voltage_ = code; }
   void set_tcxo_delay_us(uint32_t us) { this->tcxo_delay_us_ = us; }
   void set_mqtt_topic(const std::string &topic) { this->mqtt_topic_ = topic; }
@@ -165,6 +166,7 @@ class InsteonRF : public Component,
   uint8_t capture_bytes_{162};
   float rssi_floor_{-110.0f};
   uint8_t manchester_gate_{4};
+  uint8_t manchester_gate_errors_{2};
   uint8_t tcxo_voltage_{0x02};  // 1.8 V; Heltec V3 drives the TCXO from DIO3
   uint32_t tcxo_delay_us_{5000};
   std::string mqtt_topic_{};

@@ -281,20 +281,29 @@ bool InsteonRF::manchester_gate_ok_(const uint8_t *buf, size_t len) const {
   // a single polarity-dependent bit and is not worth checking.)
   if (nbits < 17)
     return false;
+  // Count violations rather than failing on the first. Noise breaks about
+  // half of the ~50 pairs checked here, so allowing a couple costs nothing
+  // in selectivity (a noise capture passes with <= 2 about once in 10^12),
+  // while a real packet with one or two bad symbols in its first frames is
+  // exactly what the host repairs from hard bits: 94% of one-symbol and 85%
+  // of two-symbol errors. Measured 2026-09-23 the strict gate rejected 3 of
+  // 15 captures under test traffic -- the weak ones, which the dongle's
+  // captures (no gate at all) still delivered.
+  uint8_t bad = 0;
   for (uint8_t j = 0; j < 8; j++) {
     const size_t at = 1 + 2 * j;
-    if (bit(at) == bit(at + 1))
+    if (bit(at) == bit(at + 1) && ++bad > this->manchester_gate_errors_)
       return false;
   }
   for (uint8_t k = 0; k + 1 < this->manchester_gate_; k++) {
     const size_t base = 17 + (size_t) k * 28;
     if (base + 28 > nbits)
       break;
-    if (bit(base) != bit(base + 1))
+    if (bit(base) != bit(base + 1) && ++bad > this->manchester_gate_errors_)
       return false;  // the frame marker: two equal bits
     for (uint8_t j = 0; j < 13; j++) {
       const size_t at = base + 2 + 2 * j;
-      if (bit(at) == bit(at + 1))
+      if (bit(at) == bit(at + 1) && ++bad > this->manchester_gate_errors_)
         return false;
     }
   }
@@ -477,7 +486,8 @@ void InsteonRF::dump_config() {
   ESP_LOGCONFIG(TAG, "  Preamble detector: %s", this->preamble_detector_ ? "on" : "off");
   ESP_LOGCONFIG(TAG, "  Capture: %u bytes (%.0f ms of air)", (unsigned) this->capture_bytes_,
                 this->capture_bytes_ * 8.0f * 1000.0f / INSTEON_BITRATE);
-  ESP_LOGCONFIG(TAG, "  Manchester gate: %u frames", (unsigned) this->manchester_gate_);
+  ESP_LOGCONFIG(TAG, "  Manchester gate: %u frames, up to %u bad pairs",
+                (unsigned) this->manchester_gate_, (unsigned) this->manchester_gate_errors_);
   ESP_LOGCONFIG(TAG, "  RSSI floor: %.1f dBm", this->rssi_floor_);
   ESP_LOGCONFIG(TAG, "  MQTT topic: %s", this->mqtt_topic_.c_str());
   LOG_PIN("  CS Pin: ", this->cs_);

@@ -4,6 +4,35 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.8.1 — 2026-09-23
+
+What an hour of 2.8.0 and 150 s of raw I/Q from the V4 showed.
+
+- **The listener board keeps marginal packets.** Its Manchester gate failed a
+  capture on the first invalid pair in its first four frames -- 99% of
+  packets with a single flipped bit there -- while the host repairs one bad
+  symbol 94% of the time and two 85% (the dongle, which has no gate, gets
+  that). Under test traffic it rejected 3 of 15 captures. It now tolerates
+  `manchester_gate_errors` (default 2): every packet with one or two flips
+  passes, 0 of 10^6 noise captures do.
+- **Unknown senders stay out of the miss table and coverage.** A decode that
+  passes CRC, frame counters and hop checks by luck invents its sender
+  (`AE.4C.1E` turned up in the V4's recording within a minute); it is now
+  counted as `unknown_senders` against `--known-addrs` rather than as a device
+  one receiver heard alone.
+- **SDR bursts report their clipping** (`clipped`, the fraction of samples at
+  the ADC rails, in the V4's packet records). The V4 sits beside the PLM: at
+  gain 37.2 the PLM's own transmissions were 40% clipped and 9 dB less gain
+  still left 14-29%. Some of what the V4 misses is that, and it is a
+  placement problem -- the number is there so a move or an attenuator can be
+  judged.
+- **The SDR's offset search covers ±60 kHz.** The V4 sees the whole network
+  33-45 kHz high (the PLM at +33.3 kHz) while the dongle's FREQEST reads about
+  zero: the SDR's own tuning, not the devices. ±40 kHz was too close.
+- **Replaying an I/Q file is lossless.** The reader dropped chunks whenever
+  the demodulator fell behind, which is right live and wrong for a recording
+  read faster than real time: a 90 s capture lost 6,231 chunks.
+
 ## 2.8.0 — 2026-09-23
 
 Four receivers in one house disagreed about what was on the air far more

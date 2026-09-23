@@ -15,6 +15,7 @@ import argparse
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import queue
 import signal
@@ -189,7 +190,8 @@ def _keep(packets: list[Packet], show_all: bool) -> list[Packet]:
 
 
 def _receive(radio: Any, timeout_ms: int
-             ) -> tuple[float, str, Any, int | None, float | None, float | None] | None:
+             ) -> tuple[float, str, Any, int | None, float | None,
+                        tuple[float, float] | None] | None:
     """One burst from any backend, keeping soft decisions where they exist.
 
     A hardware demodulator (the rfcat dongle) can only give hard bits; the
@@ -202,8 +204,11 @@ def _receive(radio: Any, timeout_ms: int
         if burst is None:
             return None
         synced = burst.header_index is not None
+        # (carrier offset, clipped fraction): what the SDR can say about the
+        # signal besides its bits. The offset only means something when the
+        # template was found.
         return (burst.timestamp or time.time(), burst.bits, burst.soft, burst.header_index,
-                burst.snr_db, burst.cfo_hz if synced else None)
+                burst.snr_db, (burst.cfo_hz if synced else float("nan"), burst.clipped))
     got = radio.receive_bits(timeout_ms)
     if got is None:
         return None
@@ -362,7 +367,7 @@ def recv_main(argv: list[str] | None = None) -> int:
                     if getattr(radio, "exhausted", False):
                         break
                     continue  # nothing on the air within the timeout
-                ts, bits, soft, header_index, _snr, _cfo = got
+                ts, bits, soft, header_index, _snr, _meta = got
                 if a.decode:
                     pkts = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
                                    soft=soft, header_index=header_index, tracker=tracker)
@@ -881,7 +886,7 @@ def monitor_main(argv: list[str] | None = None) -> int:
         over nothing at all until something re-arms it.
         """
         nonlocal capture_seq
-        ts, bits, soft, header_index, snr_db, cfo_hz, rssi = item
+        ts, bits, soft, header_index, snr_db, sdr_meta, rssi = item
         if a.mesh_capture and mqtt is not None:
             capture_seq += 1
             # Not the dongle's RSSI: it is a register snapshot taken after a
@@ -905,8 +910,11 @@ def monitor_main(argv: list[str] | None = None) -> int:
             pkt.rssi_dbm = rssi
             if snr_db is not None:
                 pkt.snr_db = snr_db
-            if cfo_hz is not None:
-                pkt.cfo_hz = cfo_hz
+            if sdr_meta is not None:
+                cfo_hz, clipped = sdr_meta
+                if not math.isnan(cfo_hz):
+                    pkt.cfo_hz = cfo_hz
+                pkt.clipped = clipped
             if a.unknown_commands:
                 note_unknown(pkt)
             if watcher is not None:
@@ -1018,11 +1026,11 @@ def monitor_main(argv: list[str] | None = None) -> int:
                             else:
                                 log.error("re-arm failed: %r", err)
                 if got is not None:
-                    ts, bits, soft, header_index, snr_db, cfo_hz = got
+                    ts, bits, soft, header_index, snr_db, sdr_meta = got
                     rssi = None
                     if not a.no_rssi and hasattr(radio, "read_rssi"):
                         rssi = radio.read_rssi()
-                    item = (ts, bits, soft, header_index, snr_db, cfo_hz, rssi)
+                    item = (ts, bits, soft, header_index, snr_db, sdr_meta, rssi)
                     if lossless:
                         # Replay: waiting is free and the same file must
                         # always decode to the same packets.
@@ -1234,7 +1242,7 @@ def mesh_main(argv: list[str] | None = None) -> int:
     # 100% miss rate and every real device is buried under it.
     service = MeshService(receiver, injector=injector, plm=plm, fusion=fusion,
                           writer=writer, require_plm_link=not a.no_plm,
-                          on_event=echo, plm_addr=a.plm_addr)
+                          on_event=echo, plm_addr=a.plm_addr, known_addrs=known)
 
     if battery:
         log.info("%d battery devices treated as unpollable", len(battery))

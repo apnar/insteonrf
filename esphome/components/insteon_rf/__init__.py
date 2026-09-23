@@ -27,6 +27,7 @@ CONF_PREAMBLE_DETECTOR = "preamble_detector_bits"
 CONF_CAPTURE_BYTES = "capture_bytes"
 CONF_RSSI_FLOOR = "rssi_floor"
 CONF_MANCHESTER_GATE = "manchester_gate"
+CONF_MANCHESTER_GATE_ERRORS = "manchester_gate_errors"
 CONF_TCXO_VOLTAGE = "tcxo_voltage"
 CONF_TCXO_DELAY = "tcxo_delay"
 CONF_MQTT_TOPIC = "mqtt_topic"
@@ -97,6 +98,11 @@ CONFIG_SCHEMA = (
             # published. This is what makes running with the preamble
             # detector off viable in a crowded 915 MHz band.
             cv.Optional(CONF_MANCHESTER_GATE, default=4): cv.int_range(min=1, max=13),
+            # Invalid pairs tolerated within those frames. The host repairs
+            # one or two bad symbols from hard bits, so rejecting them here
+            # threw away exactly the marginal packets it could have saved;
+            # noise breaks ~25 of the ~50 pairs, so 2 is still airtight.
+            cv.Optional(CONF_MANCHESTER_GATE_ERRORS, default=2): cv.int_range(min=0, max=8),
             # Getting this wrong on a Heltec V3 gives a radio that never syncs
             # and never errors, which looks exactly like a quiet house.
             cv.Optional(CONF_TCXO_VOLTAGE, default="1.8V"): cv.enum(
@@ -132,6 +138,7 @@ async def to_code(config):
     cg.add(var.set_capture_bytes(config[CONF_CAPTURE_BYTES]))
     cg.add(var.set_rssi_floor(config[CONF_RSSI_FLOOR]))
     cg.add(var.set_manchester_gate(config[CONF_MANCHESTER_GATE]))
+    cg.add(var.set_manchester_gate_errors(config[CONF_MANCHESTER_GATE_ERRORS]))
     cg.add(var.set_tcxo_voltage(config[CONF_TCXO_VOLTAGE]))
     cg.add(var.set_tcxo_delay_us(int(config[CONF_TCXO_DELAY].total_microseconds)))
     cg.add(var.set_mqtt_topic(config[CONF_MQTT_TOPIC]))

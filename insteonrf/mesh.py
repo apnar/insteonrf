@@ -80,8 +80,17 @@ class DeviceMisses:
 class MissTable:
     """How often each device was heard on RF but not by the modem."""
 
-    def __init__(self, plm_addr: Address | str | None = None) -> None:
+    def __init__(self, plm_addr: Address | str | None = None,
+                 known_addrs: set[Address] | None = None) -> None:
         self.devices: dict[str, DeviceMisses] = {}
+        #: Every address the network has. A sender outside it is a decode
+        #: that passed its checks by luck -- one turned up within minutes of
+        #: the V4 recording its own clipped transmissions (AE.4C.1E, CRC,
+        #: frame counters and hops all valid) -- and counting it would add a
+        #: "device" that one receiver heard alone to every coverage figure.
+        self.known_addrs = known_addrs
+        #: Decodable messages from addresses not in ``known_addrs``.
+        self.unknown_senders = 0
         self.started = time.time()
         # The modem's own transmissions are heard on RF but never come back
         # as inbound messages (they are reported as 0x62 echoes), so counting
@@ -117,6 +126,9 @@ class MissTable:
         if self.plm_addr is not None and who == self.plm_addr:
             self.plm_own_transmissions += 1
             return
+        if self.known_addrs is not None and who not in self.known_addrs:
+            self.unknown_senders += 1
+            return
         self.messages += 1
         for name in event.receivers:
             self.heard[name] = self.heard.get(name, 0) + 1
@@ -151,7 +163,9 @@ class MissTable:
             f"# miss table over {hours:.1f}h, {len(rows)} devices heard on RF"
             + (f", {self.undecodable} undecodable" if self.undecodable else "")
             + (f", {self.plm_own_transmissions} from the modem itself"
-               if self.plm_own_transmissions else ""),
+               if self.plm_own_transmissions else "")
+            + (f", {self.unknown_senders} from unknown addresses"
+               if self.unknown_senders else ""),
             f"{'device':12} {'rf':>5} {'plm':>5} {'missed':>7} {'rate':>6} "
             f"{'rssi':>6}  receivers",
         ]
@@ -188,6 +202,7 @@ class MissTable:
             "hours": round((time.time() - self.started) / 3600.0, 3),
             "undecodable": self.undecodable,
             "plm_own_transmissions": self.plm_own_transmissions,
+            "unknown_senders": self.unknown_senders,
             "messages": self.messages,
             "coverage": self.coverage(),
             "devices": {a: d.to_dict() for a, d in self.devices.items()},
@@ -318,6 +333,7 @@ class MeshService:
         memory: PlmMemory | None = None,
         plm_addr: Address | str | None = None,
         plm_grace_s: float = PLM_GRACE_S,
+        known_addrs: set[Address] | None = None,
     ):
         self.receiver = receiver
         self.injector = injector
@@ -339,7 +355,9 @@ class MeshService:
         self._holding: list[tuple[float, FusedEvent]] = []
         self.misses = MissTable(
             plm_addr if plm_addr is not None
-            else (injector.plm_addr if injector is not None else None)
+            else (injector.plm_addr if injector is not None else None),
+            known_addrs if known_addrs is not None
+            else (injector.known_addrs if injector is not None else None),
         )
         self.captures = 0
         self.packets = 0

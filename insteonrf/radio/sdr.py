@@ -15,6 +15,7 @@ import logging
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -87,6 +88,14 @@ class SampleClock:
         if not self._anchors:
             return None
         return min(self._anchors) + sample / self.rate
+
+
+def _is_regular_file(src: object) -> bool:
+    """Whether ``src`` reads a regular file (a recording) rather than a pipe."""
+    try:
+        return stat.S_ISREG(os.fstat(src.fileno()).st_mode)  # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 def find_demod(explicit: str | None = None) -> Path | None:
@@ -329,6 +338,10 @@ class SdrReceiver:
         self.dropped_chunks = 0
         self.clock = SampleClock(self.sample_rate)
         src = self._iq
+        # A file is read far faster than real time, so dropping on a full
+        # queue -- right for a live receiver, which must never stall the
+        # capture tool -- would throw most of a recording away. Replay waits.
+        lossless = _is_regular_file(src)
 
         def pump() -> None:
             pos = 0  # samples read so far
@@ -347,6 +360,9 @@ class SdrReceiver:
                     first = pos
                     pos += len(chunk) // 2
                     self.clock.note(pos, now)
+                    if lossless:
+                        chunks.put((chunk, first))
+                        continue
                     try:
                         chunks.put_nowait((chunk, first))
                     except queue.Full:
