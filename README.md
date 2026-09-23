@@ -1,8 +1,14 @@
 # Tools for Insteon's RF protocol
 
 Receive, decode, build and transmit **Insteon 915 MHz RF** packets with an
-rfcat dongle (TI CC1111 — e.g. a Yard Stick One) or with any SDR that can
-stream 8-bit I/Q samples (rtl-sdr, HackRF).
+rfcat dongle (TI CC1111 — e.g. a Yard Stick One), with any SDR that can
+stream 8-bit I/Q samples (rtl-sdr, HackRF), or with an ESP32 + SX1262 board
+running the ESPHome component in `esphome/`.
+
+Several of those can run at once: `insteon-rf mesh` fuses what they each
+heard into one stream and compares it against what the PLM heard. Three
+radios have been on the air together since 2026-09-21 — see
+[the listener mesh](#more-ears-for-the-plm-the-listener-mesh).
 
 Protocol reference: [Doc/pkt_format.md](Doc/pkt_format.md).
 USB troubleshooting write-up: [Doc/usb-notes.md](Doc/usb-notes.md).
@@ -14,9 +20,9 @@ DEF CON 23 slides: [Doc/insteon_defcon23.pdf](Doc/insteon_defcon23.pdf).
 
 This fork starts from [evilpete/insteonrf](https://github.com/evilpete/insteonrf)
 at its 2016 state, which described itself as a proof of concept for encoding
-and decoding Insteon RF — and worked as one. Three releases since then turned
-it into something you can leave running. [CHANGELOG.md](CHANGELOG.md) has the
-detail; the short version:
+and decoding Insteon RF — and worked as one. What has happened since turned it
+into something you can leave running, and then into something several radios
+run at once. [CHANGELOG.md](CHANGELOG.md) has the detail; the short version:
 
 **2.0.0 — ported and repackaged.** Python 2 → 3, and the loose scripts became
 an installable `insteonrf` package with a single `insteon-rf <command>` entry
@@ -43,6 +49,27 @@ the redundancy the protocol already carries — Manchester pairs combined by
 their difference, the known frame-index counters as a checksum, and a bounded
 CRC-guided repair search. See [Sensitivity](#sensitivity) for the measurements.
 
+**2.5.x — more than one receiver.** `insteon-rf mesh` fuses captures from
+several radios into one event per transmission, compares each against what the
+PLM reported, and can hand the modem what it missed. A five-patch series for
+insteon-mqtt adds the two topics that makes possible. The SDR backends became
+usable live: `receive_burst()` had been spawning a fresh `rtl_sdr` per call,
+and demodulating inline between pipe reads silently dropped the tail of every
+packet.
+
+**2.6.0 — confidence travels.** An I/Q receiver's per-symbol confidence used
+to stop at the host that demodulated it. It now rides in the capture payload,
+so fusion votes with it and a single damaged copy from an SDR can be repaired
+where two hard copies could not.
+
+**2.7.x — three radios on the air, and the reliability to trust them.** The
+rfcat dongle had been wedging mid-run and spending three quarters of the day
+deaf; the cure is re-arming receive on a short timer, not the USB reset that
+had been assumed (see [Troubleshooting](#troubleshooting)). The monitor's
+per-block work moved off the receive thread, which is what caused it. The
+RTL-SDR V4 was deployed as a third listener. Two measurement bugs and two
+classes of phantom decode were fixed — below.
+
 ### Bugs fixed that change what you decode
 
 - **Extended-packet frame index.** Upstream emitted 31…1; the wire actually
@@ -57,9 +84,25 @@ CRC-guided repair search. See [Sensitivity](#sensitivity) for the measurements.
 - **The dongle "wedging" on USB.** rflib never releases the USB interface, so
   the next run hit `Resource busy` and then an endless `Error in resetup()`
   loop. Fixed, with a self-healing watchdog — see [Doc/usb-notes.md](Doc/usb-notes.md).
-- **Phantom packets.** A frame sequence whose index counters are impossible is
-  now rejected even when its 8-bit CRC happens to match, which removed bogus
-  decodes seen on live air.
+- **The dongle going deaf mid-run**, which is a different fault and was
+  diagnosed wrongly at first. The receiver stops delivering while the chip
+  still answers register reads and still reports `MARC_STATE_RX` with correct
+  modem registers and a normal noise floor. Measured against a second radio it
+  was deaf for three quarters of a day. **Re-arming receive recovers it; a USB
+  reset does not** — only 8 of 128 resets were followed by a decode inside a
+  minute, while the dongle was re-enumerated 200 times for nothing. The
+  threshold is now seconds rather than half an hour, and everything but
+  draining the radio moved off the receive thread, which is what starved it.
+- **Phantom packets, twice.** A frame sequence whose index counters are
+  impossible is rejected even when its 8-bit CRC matches. That was not enough:
+  a capture holds more than one packet and the parser tries every offset in
+  both polarities, so a false lock in the tail can produce counters *and* a
+  CRC that pass by luck, roughly one candidate in 256 against ~19,000 real
+  messages a day. One such family looked like a neighbour's device for eight
+  days. `Packet.hops_ok` now rejects a flags byte no transmitter can emit —
+  hops-left above max-hops — which costs none of 18,829 real messages and
+  removes 18% of the phantoms; an address allowlist covers the rest before
+  anything is injected.
 
 ### Removed
 
@@ -82,6 +125,13 @@ dependency. Then, depending on what you want to do:
 | Receive and transmit live | rfcat dongle: a CC1111 running rfcat firmware (e.g. a Yard Stick One) | `rflib`, from git |
 | Receive with an SDR | rtl-sdr dongle, or a HackRF | `rtl_sdr` or `hackrf_transfer` on `PATH` |
 | Transmit with an SDR | HackRF | `hackrf_transfer` |
+| Receive on a small board, anywhere in the house | Heltec LoRa 32 V3, or any ESP32 + SX1262 | ESPHome; see [`esphome/`](esphome/) |
+| Run several at once and compare | any two of the above | an MQTT broker |
+
+An **RTL-SDR Blog V4** needs that project's fork of librtlsdr, not Osmocom's:
+the stock library does not know the V4's R828D front end and mistunes it. It
+is also the only receiver here that produces per-symbol confidence, which is
+what lets a single damaged copy be repaired.
 
 Insteon RF is **915 MHz**, so this is US-band hardware. Nothing here needs a C
 compiler: the numpy demodulator is the default and is the more sensitive one.
@@ -106,7 +156,7 @@ the numpy default.
 ### 3. Check it works, with no radio at all
 
 ```bash
-pytest                                              # ~130 tests, no hardware
+pytest                                              # ~400 tests, no hardware
 insteon-rf demod -U Dat/41802513110D2711018C00.dat | insteon-rf print
 ```
 
@@ -219,12 +269,30 @@ and flips the least-confident bits looking for a CRC match.
     insteonrf/recover.py    soft-decision framing and CRC-guided repair
     insteonrf/context.py    remembers queries so replies name from the right table
     insteonrf/allon.py      phantom all-on triggers, context capture, attribution
-    insteonrf/radio/        rfcat, SDR and file backends behind one protocol
+    insteonrf/radio/        rfcat, SDR, file and MQTT backends behind one protocol
     insteonrf/monitor.py    JSON-lines logging, mesh-repeat dedupe, MQTT
     insteonrf/debug.py      frame-by-frame dump for demodulator debugging
+    insteonrf/_version.py   the one place the version number is written
     insteonrf/cli.py        the commands below
+
+  the mesh layer — several receivers, and the modem to compare against
+
+    insteonrf/fusion.py     folds every receiver's copies of one message into
+                            one event; votes across them, with confidence
+                            where a receiver measured it
+    insteonrf/plm.py        RF packet <-> the 02 50 / 02 51 frames a PLM hands
+                            its host; message_key() is the hop-insensitive
+                            identity both paths share
+    insteonrf/inject.py     what may be handed to insteon-mqtt: tiers, shadow
+                            mode, allowlist, suppression, rate limits
+    insteonrf/mesh.py       the service and the miss table
+
     Src/                    C demodulator / burst splitter (legacy fast path)
-    deploy/insteonrf.yaml   k8s Pod that logs all house RF to MQTT
+    esphome/                ESPHome component + node config for an SX1262 board
+    deploy/insteonrf.yaml   k8s Pod: the rfcat dongle, logging and mesh capture
+    deploy/insteonrf-v4.yaml    the same for an RTL-SDR Blog V4
+    deploy/insteonrf-mesh.yaml  the fusing service, no radio of its own
+    deploy/insteon-mqtt/    patch series giving insteon-mqtt its raw topics
     tools/usb_stress.py     USB robustness harness (not shipped)
     tools/dsp_bench.py      sensitivity / false-accept benchmarks (not shipped)
     tests/                  pytest suite with real captures as fixtures
@@ -366,33 +434,69 @@ boards / dongle ──MQTT──> insteon-rf mesh ──MQTT──> insteon-mqtt
                         miss table + insteon-rf-mesh.jsonl
 ```
 
-### It starts with no new hardware
+### It starts with no new hardware, and then it grew
 
-The rfcat dongle is a valid mesh receiver, and worth keeping next to the
-boards: on the first day it decoded whole packets the Heltec flipped bits in.
-(It gives hard bits like the SX1262 — soft decisions come only from the SDR
-path — despite what an earlier revision of this section claimed.)
+The rfcat dongle is a valid mesh receiver on its own, so the whole path — the
+insteon-mqtt patch, the wire-format conversion, the injector and its refusals,
+and the miss measurement that decides whether any of it is worth it — was
+built and proven before any new hardware existed.
 
 ```bash
-# Dongle publishes raw captures as a mesh member
+# Any receiver publishes raw captures as a mesh member
 insteon-rf monitor --mqtt=192.168.88.5 --mesh-capture=dongle ...
+insteon-rf monitor --mqtt=192.168.88.5 --mesh-capture=v4 --backend rtlsdr --gain 37.2 ...
 
 # Fuse them and compare against what the modem heard
-insteon-rf mesh --mqtt=192.168.88.5 --plm-addr=2B.93.07 --report-every=900
+insteon-rf mesh --mqtt=192.168.88.5 --plm-addr=2B.93.07 \
+  --known-addrs known.txt --report-every=3600
 ```
 
-That produces the number the whole project turns on:
+Three radios have run together since 2026-09-21. They are not redundant —
+they fail differently, which is the entire point. Over one day against the
+modem's own log (1,343 messages it reported, hop copies collapsed):
+
+| | of what the modem heard | best at | notes |
+|---|---|---|---|
+| rfcat dongle | 74% | the replies devices send back (64% of group cleanup ACKs) | hard bits |
+| Heltec / SX1262 | 37% | nothing in particular; steady and never absent | hard bits; ~⅓ of captures break a few bytes after sync |
+| RTL-SDR V4 | 29% | cleanups and broadcasts (75% / 67%), and anything weak | the only soft decisions |
+| any of the three | 82% | | |
+
+The 18% none of them heard is dominated by one keypad, which is almost
+certainly powerline-only traffic — something an RF listener cannot hear by
+definition, rather than a receiver failing.
+
+**Where it actually pays.** The 26 devices with no powerline path sent 389
+messages in that day. The modem saw **three**. Searching its whole log for
+four of those sensor addresses returns nothing at all.
+
+| heard those 389 | count | heard by nobody else |
+|---|---|---|
+| RTL-SDR V4 | 321 | 265 |
+| Heltec | 106 | 19 |
+| rfcat dongle | 100 | 13 |
+| the PLM | 3 | — |
+
+The V4 recovers 83% of that traffic, three times either hard-bit receiver,
+using the per-symbol confidence only it produces: 707 of the day's 758
+repaired messages were rebuilt from a single V4 copy no other receiver could
+vote on.
+
+The miss table is what the measurement phase produces:
 
 ```
 # miss table over 6.0h, 14 devices heard on RF
 device          rf   plm  missed   rate   rssi  receivers
-44.12.AB        23     4      19  82.6%    -97  dongle,up
+44.12.AB        23     4      19  82.6%    -97  dongle,v4
 2B.A0.AB       104    98       6   5.8%   -102  dongle
 ```
 
 If it turns out the modem misses almost nothing, that is a real answer and the
 right move is to stop — you are left with a useful diagnostic topic and no
-risk taken.
+risk taken. Two things had to be fixed before those numbers could be trusted:
+the modem's own transmissions were being counted as a device that misses
+everything, and the "did the modem hear this too" verdict was taken before the
+modem's copy could arrive, which was wrong about one mark in five.
 
 ### Handing messages back requires patching insteon-mqtt
 
@@ -435,9 +539,14 @@ wrong:
   not upstream's. insteon-mqtt's duplicate window is `hops_left × 0.087`
   seconds, which is **zero** at no hops left; measured live, it processed two
   copies of one ACK 87 ms apart.
-- **Unverified bytes are never injected.** CRC and the frame-index counters
-  both have to hold, and a packet recovered by voting across receivers needs
-  at least three of them to have voted.
+- **Addresses that are not on this network are never injected.** A decoder
+  that occasionally invents a packet invents its sender too, and insteon-mqtt
+  would create state for a device that does not exist. `--known-addrs FILE`
+  names the real ones; eight days of capture produced 61 addresses that are
+  not among them.
+- **Unverified bytes are never injected.** CRC, the frame-index counters and
+  the hop fields all have to hold, and a packet recovered by voting across
+  receivers needs at least three of them to have voted.
 - **Rate limits**, because every inbound message delays the modem's next
   transmit, so a flood would stall outbound commands.
 
@@ -457,10 +566,30 @@ gate**: 26 of every 28 on-air bits are Manchester pairs, and a valid pair is
 only `01` or `10`, so noise fails within a handful of bits. That is what makes
 running with the preamble detector off viable in a crowded 915 MHz band.
 
-> **Status:** the firmware compiles clean for esp32-s3 but has **never run on
-> hardware**, and whether an SX1262 can sync on Insteon at all is still
-> unproven. If it cannot, the fallback is a CC1101 module (~$3, same family as
-> the CC1111 dongle, with a true raw-bitstream mode) on the same ESP32.
+**Status: running.** First flashed 2026-09-19 a few feet from the PLM, and it
+received Insteon on the first probe — a CRC-valid Get Engine Version at
+-92.5 dBm. Packet-mode sync with the preamble detector off works, and the
+default polarity is right, which were the two assumptions the whole approach
+rested on. It has been publishing to the mesh since.
+
+Two things the first hour taught, both now handled: the radio *consumes* the
+sync word, so captures arrive without their start header and the host has to
+put it back; and `GetRssiInst` read after a capture measures whatever is on
+air next, which a few feet from the modem is its own hop repeat — the packet's
+own strength comes from `GetPacketStatus`.
+
+Still open: roughly a third of its captures break their Manchester stream
+120–170 bits after sync on packets the dongle decodes whole, and it is worst
+on last-hop copies, where 85% fail. The leading hypothesis is bit-clock
+tracking of transmitters a few tenths of a percent off nominal baud, which is
+why the SDR path grid-searches symbol rate. `preamble_detector_bits: 8` is the
+one-line A/B and has not been run. Fusion recovers most of those messages from
+another receiver's copy, which is why this is a known cost rather than a
+blocker.
+
+The board reports its own firmware version as a sensor, matching
+`insteonrf/_version.py`, because ESPHome's build timestamp only moves when the
+config hash changes — a reflash of unchanged config is otherwise invisible.
 
 ## Command coverage
 
@@ -659,6 +788,7 @@ for q in parse_bits(bits):
 | `msg_type`, `msg_type_name` | e.g. `DIRECT_ACK` / `"ACK of Direct"` |
 | `extended`, `ack`, `broadcast`, `group_msg` | flag bits |
 | `hops_left`, `max_hops` | hop counters from the flags byte |
+| `hops_ok` | false when hops-left exceeds max-hops, which no transmitter emits — the marker of a false header lock that passed the CRC by luck |
 | `to`, `from` | addresses as `16.3F.E5` (`from` is `null` on group broadcasts) |
 | `group` | all-link group number on group broadcasts, else `null` |
 | `cmd1`, `cmd2`, `command` | command bytes and the looked-up name |
@@ -676,13 +806,42 @@ for q in parse_bits(bits):
 `--window`) before writing it, so the logged `repeats`/`hops_seen` cover every
 copy of the message; `--no-dedupe` writes each repeat as it arrives instead.
 
+`insteon-rf mesh` writes the same object per *transmission* rather than per
+copy, with the fields above plus:
+
+| Field | Meaning |
+|---|---|
+| `heard_by` | one entry per receiver that heard it: `copies`, `crc_ok`, `rssi_dbm`, `snr_db`, `hops_left`. Each receiver's own figures, because they are not comparable between radios |
+| `receiver_count`, `closest` | how many heard it, and which was nearest the source — most hops left, RSSI breaking the tie |
+| `hops_left_min/max`, `hops_used` | across every copy from every receiver |
+| `combined`, `combined_from` | true when no single copy verified and the packet was rebuilt by voting, and how many receivers voted |
+| `plm_saw_it` | whether the modem reported the same message. Settled after a grace period, because the modem's copy travels the powerline, is parsed by insteon-mqtt and only then republished — it can arrive after the RF copy |
+| `first_seen`, `last_seen` | the window the copies spanned |
+| `repeat_index` | which retransmission of the message this event is |
+
 ## Troubleshooting
 
 - **Dongle stops answering** (`Error in resetup(): USBTimeoutError` once a
-  second): the backend now detects this and USB-resets and reopens the dongle
-  by itself (`--no-auto-reset` turns that off). `insteon-rf reset` does it by
+  second): the backend detects this and USB-resets and reopens the dongle by
+  itself (`--no-auto-reset` turns that off). `insteon-rf reset` does it by
   hand and gives up after 10 s instead of hanging. If a reset does not help,
   unplug and replug.
+- **Dongle goes quiet while still answering** — a different fault, and the
+  one that matters in a long run. Registers read fine, `MARC_STATE_RX` is set,
+  the noise floor is normal, and not one block arrives. **Re-arm; do not
+  reset.** `monitor --max-silence` is 20 s by default and re-arming is a few
+  register writes that can only lose a packet already in flight. A USB reset
+  was tried first and is nearly useless here: 8 of 128 were followed by a
+  decode inside a minute. If your host has a second receiver, use it as the
+  reference clock — silence is otherwise indistinguishable from a quiet house,
+  and that ambiguity is why this went undiagnosed for days.
+- **A capture decodes to a device you do not own.** Check the flags byte
+  before believing it: hops-left above max-hops is impossible on the air, and
+  it is the signature of a false header lock inside the tail of a real
+  capture, whose frame counters and CRC can both pass by luck. `hops_ok` is in
+  the JSON. If the flags look plausible too, compare the address against your
+  own device list — and see whether the decode landed within a second of one
+  of your own messages, which is what gives these away.
 - **`USBError(16, 'Resource busy')`**: something still holds the interface.
   rflib's `cleanup()` does not release it — this package's `close()` does, and
   `recv`/`monitor`/`send` install SIGTERM handlers so a `timeout`/`kill` still
@@ -698,8 +857,13 @@ copy of the message; `--no-dedupe` writes each repeat as it arrives instead.
   decodes with soft decisions, which is better than piping bits into `print`
   because the pipeline's string contract discards confidence. Add `-v` to see
   per-burst SNR, carrier offset and how many bits were repaired.
-- **`rssi_dbm` is a snapshot, not a latched measurement.** It reads the
-  CC1111's RSSI register just after a block arrives, while the radio is still
-  in RX, so it reflects the channel a moment later rather than that packet
-  exactly. It is good for ranking links and watching a device degrade over
-  weeks — not for calibrated per-packet numbers. `--no-rssi` skips it.
+- **`rssi_dbm` from the rfcat dongle is a snapshot, not a latched
+  measurement.** It reads the CC1111's RSSI register just after a block
+  arrives, while the radio is still in RX, so it reflects the channel a moment
+  later rather than that packet exactly. It is good for ranking links and
+  watching a device degrade over weeks — not for calibrated per-packet
+  numbers, and not comparable with another receiver's. `--no-rssi` skips it.
+  The SX1262 board reports the packet's own average, and the SDR path reports
+  a symbol SNR instead; in a fused event each receiver's figure is kept
+  separately under `heard_by`, because comparing receivers is the point of
+  having more than one.
