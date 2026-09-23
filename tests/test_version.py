@@ -12,17 +12,26 @@ from __future__ import annotations
 import pathlib
 import re
 
-import tomllib
-
 import insteonrf
 from insteonrf import _version
 
-PYPROJECT = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
+REPO = pathlib.Path(__file__).resolve().parent.parent
+PYPROJECT = REPO / "pyproject.toml"
 
 
-def _project() -> dict:
-    with PYPROJECT.open("rb") as fh:
-        return tomllib.load(fh)
+def _section(name: str) -> str:
+    """The body of one TOML table, read as text.
+
+    Text rather than :mod:`tomllib`, because this package supports Python
+    3.10 where that is not in the standard library -- CI's 3.10 job is
+    exactly what caught it -- and pulling in a TOML parser as a test
+    dependency to check four lines would be the wrong trade.
+    """
+    body = re.search(rf"^\[{re.escape(name)}\]\s*$(.*?)(?=^\[|\Z)",
+                     PYPROJECT.read_text(encoding="utf-8"),
+                     re.MULTILINE | re.DOTALL)
+    assert body, f"pyproject.toml has no [{name}] table"
+    return body.group(1)
 
 
 def test_the_package_exposes_the_version():
@@ -31,16 +40,19 @@ def test_the_package_exposes_the_version():
 
 
 def test_pyproject_does_not_carry_a_second_copy():
-    data = _project()
-    assert "version" not in data["project"], (
+    project = _section("project")
+    assert not re.search(r"^version\s*=", project, re.MULTILINE), (
         "a literal version here is the drift this module exists to prevent"
     )
-    assert "version" in data["project"]["dynamic"]
+    dynamic = re.search(r"^dynamic\s*=\s*\[([^\]]*)\]", project, re.MULTILINE)
+    assert dynamic and "version" in dynamic.group(1)
 
 
 def test_pyproject_points_at_the_one_source():
-    attr = _project()["tool"]["setuptools"]["dynamic"]["version"]["attr"]
-    assert attr == "insteonrf._version.__version__"
+    attr = re.search(r"^version\s*=\s*\{\s*attr\s*=\s*\"([^\"]+)\"",
+                     _section("tool.setuptools.dynamic"), re.MULTILINE)
+    assert attr, "[tool.setuptools.dynamic] should set version via attr"
+    assert attr.group(1) == "insteonrf._version.__version__"
 
 
 def test_the_version_module_imports_nothing():
@@ -60,7 +72,7 @@ def test_the_listener_firmware_declares_the_same_version():
     days earlier. The project version is the marker that answers "is this
     board running current code", so it has to track the package.
     """
-    yaml = (PYPROJECT.parent / "esphome" / "insteon-rf-main.yaml").read_text(encoding="utf-8")
+    yaml = (REPO / "esphome" / "insteon-rf-main.yaml").read_text(encoding="utf-8")
     m = re.search(r"^\s*project:\s*$\s*^\s*name:\s*\S+\s*$\s*^\s*version:\s*\"([^\"]+)\"",
                   yaml, re.MULTILINE)
     assert m, "the listener firmware should declare esphome.project.version"

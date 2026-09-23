@@ -23,6 +23,12 @@ Version numbers that mean something, and the listener board brought current.
   timestamp -- it now carries `esphome.project.version`, published as a
   *Firmware Version* sensor, matching the Python package and pinned to it by
   a test.
+- The first cut of that test read `pyproject.toml` with `tomllib`, which is
+  standard library only from 3.11, so CI's 3.10 job failed on it while every
+  other version passed. It parses the four lines it cares about as text now.
+  Worth remembering when checking locally: CI runs `ruff check .` and bare
+  `mypy` over the whole repo and tests on 3.10 through 3.14, all of which is
+  wider than `ruff check insteonrf tests` on one interpreter.
 
 ## 2.7.2 — 2026-09-23
 
