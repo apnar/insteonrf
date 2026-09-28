@@ -31,7 +31,8 @@ Every check is a refusal, in order of how badly it would go wrong:
    transmitter can actually emit. A combined packet (recovered by
    voting across receivers rather than heard intact by anyone) additionally
    needs enough receivers to have voted, because a two-way vote ties on every
-   disagreement and leaves the CRC doing all the work.
+   disagreement and leaves the CRC doing all the work. A copy one receiver
+   repaired by CRC search is not injected at all.
 7. **Rate limits.** Inbound messages push out insteon-mqtt's next allowed
    transmit (``set_wait_time``), so a flood of injections would stall outbound
    commands. Per-device and global caps, both deliberately low.
@@ -300,6 +301,11 @@ class Injector:
             return self._no("impossible hop fields")
         if packet.extended and packet.ext_crc_ok is False:
             return self._no("extended data CRC did not pass")
+        if packet.corrected:
+            # One receiver's copy, made to pass by flipping a bit the CRC
+            # pointed at. Good enough to count a message as heard; not good
+            # enough to put words in a device's mouth.
+            return self._no(f"{packet.corrected} bit(s) repaired by CRC search")
         if event.combined and event.combined_from < self.min_combined_receivers:
             return self._no(
                 f"combined from only {event.combined_from} receivers "

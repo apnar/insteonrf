@@ -35,6 +35,23 @@ def capture(hops_left: int = 3, **kw) -> str:
     return Packet.build(DEV, PLM, hops_left=hops_left, max_hops=3, **kw).to_bits()
 
 
+def pair(bit: int, hops_left: int = 3, **kw) -> list[int]:
+    """Both symbols of the Manchester pair holding capture position ``bit``.
+
+    Flipping one symbol makes an illegal pair, which a receiver repairs from
+    its own copy now; flipping both makes a legal pair carrying the wrong
+    bit, which only the CRC -- or another receiver -- can catch. That is the
+    damage the combining tests need.
+    """
+    from insteonrf.packet import FRAME_BITS, MARKER_OFFSET, find_headers
+
+    _, (head, *_) = find_headers(capture(hops_left, **kw))
+    first = head + MARKER_OFFSET
+    base = first + ((bit - first) // FRAME_BITS) * FRAME_BITS + 2
+    start = base + ((bit - base) // 2) * 2
+    return [start, start + 1]
+
+
 def pkt(hops_left: int = 3, **kw) -> Packet:
     out = parse_bits(capture(hops_left, **kw))
     assert out, "fixture packet must decode"
@@ -160,11 +177,27 @@ def test_damage_in_the_pad_is_not_damage():
 def test_per_receiver_view_records_rssi_and_crc():
     f = Fusion()
     f.add(sight("a", rssi_dbm=-70, timestamp=100.0))
-    f.add(sight("b", rssi_dbm=-101, timestamp=100.01, damage=[200]))
+    f.add(sight("b", rssi_dbm=-101, timestamp=100.01, damage=pair(200)))
     (e,) = f.pop_ready(103.0)
     assert e.receivers["a"].crc_ok is True
     assert e.receivers["a"].rssi_dbm == -70
     assert e.receivers["b"].crc_ok is False
+
+
+def test_one_bad_symbol_is_repaired_from_the_receiver_s_own_copy():
+    """An illegal Manchester pair says which bit is in doubt; the frame
+    counters and the CRC settle it. No second receiver needed -- the hard
+    decode used to stop at the damage and throw the copy away."""
+    s = sight("b", damage=[200])
+    assert s.packet.crc_ok is True
+    assert s.packet.corrected <= 1
+    assert message_key(s.packet) == message_key(pkt())
+
+
+def test_a_confident_wrong_bit_in_one_hard_copy_is_not_repaired():
+    """A legal pair carrying the wrong bit gives no clue where it is, so
+    there is nothing to try -- and nothing is invented."""
+    assert sight("b", damage=pair(200)).packet.crc_ok is not True
 
 
 # --------------------------------------------------------------------------- combining
@@ -172,9 +205,9 @@ def test_per_receiver_view_records_rssi_and_crc():
 
 def test_combine_recovers_a_packet_no_receiver_got():
     """Independent noise at different locations is the whole point."""
-    a = sight("a", damage=[200])   # byte 6
-    b = sight("b", damage=[230])   # byte 7
-    c = sight("c", damage=[260])   # byte 8
+    a = sight("a", damage=pair(200))   # byte 6
+    b = sight("b", damage=pair(230))   # byte 7
+    c = sight("c", damage=pair(260))   # byte 8
     assert a.packet.crc_ok is not True
     assert b.packet.crc_ok is not True
     assert c.packet.crc_ok is not True
@@ -189,7 +222,7 @@ def test_combine_recovers_a_packet_no_receiver_got():
 def test_fusion_uses_combining_end_to_end():
     f = Fusion()
     for i, bit in enumerate([200, 230, 260]):
-        f.add(sight(f"r{i}", timestamp=100.0 + i * 0.01, damage=[bit]))
+        f.add(sight(f"r{i}", timestamp=100.0 + i * 0.01, damage=pair(bit)))
     (e,) = f.pop_ready(103.0)
     assert e.combined is True
     assert e.combined_from == 3
@@ -201,17 +234,15 @@ def test_combine_needs_more_than_one_copy():
     assert combine([sight("a", damage=[200])]) is None
 
 
-def test_a_copy_damaged_in_its_first_bytes_cannot_contribute():
-    """Known limitation, kept explicit.
-
-    decode_frames stops at the damage, so a copy hit inside the first four
-    bytes does not clear the "this is probably a packet" gate and yields no
-    sighting at all. With three or more receivers only two usable copies are
-    needed, so this costs coverage rather than correctness.
-    """
+def test_a_copy_damaged_in_its_first_bytes_still_decodes():
+    """decode_frames stops at the damage, so a copy hit inside the first four
+    bytes used to yield no sighting at all. Framing the whole packet and
+    letting the counters and CRC judge it recovers it."""
     bits = list(capture())
     bits[120] = "0" if bits[120] == "1" else "1"
-    assert sightings_from_capture("".join(bits), "a") == []
+    (s,) = sightings_from_capture("".join(bits), "a")
+    assert s.packet.crc_ok is True
+    assert message_key(s.packet) == message_key(pkt())
 
 
 def test_combine_gives_up_on_wide_disagreement():
@@ -226,7 +257,7 @@ def test_combine_gives_up_on_wide_disagreement():
 def test_combining_is_disabled_when_asked():
     f = Fusion(allow_combine=False)
     for i, bit in enumerate([200, 230, 260]):
-        f.add(sight(f"r{i}", timestamp=100.0 + i * 0.01, damage=[bit]))
+        f.add(sight(f"r{i}", timestamp=100.0 + i * 0.01, damage=pair(bit)))
     events = f.pop_ready(103.0)
     # Without combining, damaged copies cannot be recognised as the same
     # message at all -- their bytes and therefore their keys differ.
@@ -367,8 +398,21 @@ def test_polarity_normalisation_flips_the_confidence_too():
     assert (a.soft[:400] == b.soft[:400]).all()
 
 
-def test_one_soft_copy_alone_can_be_repaired():
-    """The single-receiver case that hard bits cannot attempt."""
+def test_one_soft_copy_decodes_through_doubtful_symbols():
+    """Each pair is decided by the difference of its two symbols, so a wrong
+    symbol the detector doubted is outweighed by its confident partner."""
+    s = soft_sight(damage=[200, 230])
+    assert s.packet.crc_ok is True
+    assert s.packet.corrected == 0
+    assert message_key(s.packet) == message_key(pkt())
+
+
+def test_one_soft_copy_alone_can_be_combined(monkeypatch):
+    """combine() on a single soft copy, for a copy the framing did not
+    rescue (disabled here to reach it)."""
+    from insteonrf import fusion
+
+    monkeypatch.setattr(fusion, "recover_at", lambda *a, **k: None)
     s = soft_sight(damage=[200, 230])
     assert s.packet.crc_ok is not True
     got = combine([s])
@@ -413,7 +457,10 @@ def test_soft_suspects_are_tried_least_sure_first():
     assert got[0].crc_ok is True
 
 
-def test_fusion_repairs_a_lone_soft_sighting_end_to_end():
+def test_fusion_repairs_a_lone_soft_sighting_end_to_end(monkeypatch):
+    from insteonrf import fusion
+
+    monkeypatch.setattr(fusion, "recover_at", lambda *a, **k: None)
     f = Fusion()
     f.add(soft_sight(damage=[200, 230], timestamp=100.0))
     (e,) = f.pop_ready(103.0)
@@ -582,6 +629,7 @@ def test_a_repaired_copy_of_another_hop_joins_its_message_s_event(monkeypatch):
     from insteonrf import fusion
 
     monkeypatch.setattr(fusion, "MAX_DISAGREEMENTS", 6)
+    monkeypatch.setattr(fusion, "recover_at", lambda *a, **k: None)
     f = Fusion()
     f.add(sight("a", hops_left=3, timestamp=100.0))
     f.add(soft_sight("v4", hops_left=0, damage=[200, 230], timestamp=100.1))
@@ -595,6 +643,7 @@ def test_a_repaired_copy_after_its_event_has_gone_is_counted_late(monkeypatch):
     from insteonrf import fusion
 
     monkeypatch.setattr(fusion, "MAX_DISAGREEMENTS", 6)
+    monkeypatch.setattr(fusion, "recover_at", lambda *a, **k: None)
     f = Fusion()
     f.add(sight("a", hops_left=3, timestamp=100.0))
     assert len(f.pop_ready(101.0)) == 1

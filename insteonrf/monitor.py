@@ -118,6 +118,10 @@ class JsonlWriter:
         self._fh.close()
 
 
+#: How far from an SDR's ``header_index`` to look for an exact start header
+#: (see :meth:`MqttPublisher.publish_capture`): two preamble cells.
+HEADER_SNAP = 8
+
 class MqttPublisher:
     """Publish JSON to ``<topic>`` (and ``<topic>/<address>``).
 
@@ -197,7 +201,8 @@ class MqttPublisher:
     def publish_capture(self, bits: str, *, receiver: str, timestamp: float,
                         rssi_dbm: float | None = None, seq: int = 0,
                         topic: str | None = None, soft: Any = None,
-                        snr_db: float | None = None) -> None:
+                        snr_db: float | None = None,
+                        header_index: int | None = None) -> None:
         """Publish a raw burst in the listener-board capture format.
 
         This is what lets a host radio act as a member of the listener mesh:
@@ -219,11 +224,37 @@ class MqttPublisher:
         # and carries its header in either polarity; either way, ship from
         # just after the first header and say which one it was, so the
         # consumer restores the same bits in the same polarity.
+        #
+        # ``header_index`` is where an SDR's sync correlator put the header.
+        # It finds packets whose header has a wrong symbol in it, where an
+        # exact-match search over the whole burst either misses the header --
+        # the capture then went out from the preamble, the consumer put a
+        # header in front of that, and the packet decoded as junk -- or finds
+        # a later one. But the correlator can also sit off: by a symbol or
+        # two, or by a whole 4-symbol preamble cell, since the preamble
+        # repeats with that period (measured: 4 early on strong packets at
+        # low gain). So an exact header near it wins, and the index itself is
+        # the fallback, in whichever polarity its bits are nearer.
         header = START_HEADER_INV
-        pos = bits.find(START_HEADER_INV)
-        alt = bits.find(START_HEADER)
-        if alt != -1 and (pos == -1 or alt < pos):
-            header, pos = START_HEADER, alt
+        if header_index is not None and 0 <= header_index <= len(bits) - len(header):
+            pos = header_index
+            near = [(abs(i - header_index), i, h)
+                    for i in range(max(0, header_index - HEADER_SNAP),
+                                   min(len(bits) - len(header), header_index + HEADER_SNAP) + 1)
+                    for h in (START_HEADER_INV, START_HEADER)
+                    if bits.startswith(h, i)]
+            if near:
+                _, pos, header = min(near)
+            else:
+                seen = bits[pos:pos + len(header)]
+                wrong = sum(a != b for a, b in zip(seen, START_HEADER_INV, strict=True))
+                if wrong > len(header) // 2:
+                    header = START_HEADER
+        else:
+            pos = bits.find(START_HEADER_INV)
+            alt = bits.find(START_HEADER)
+            if alt != -1 and (pos == -1 or alt < pos):
+                header, pos = START_HEADER, alt
         if pos != -1:
             cut = pos + len(header)
             bits = bits[cut:]

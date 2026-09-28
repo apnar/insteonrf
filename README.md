@@ -578,14 +578,14 @@ put it back; and `GetRssiInst` read after a capture measures whatever is on
 air next, which a few feet from the modem is its own hop repeat — the packet's
 own strength comes from `GetPacketStatus`.
 
-Still open: roughly a third of its captures break their Manchester stream
-120–170 bits after sync on packets the dongle decodes whole, and it is worst
-on last-hop copies, where 85% fail. The leading hypothesis is bit-clock
-tracking of transmitters a few tenths of a percent off nominal baud, which is
-why the SDR path grid-searches symbol rate. `preamble_detector_bits: 8` is the
-one-line A/B and has not been run. Fusion recovers most of those messages from
-another receiver's copy, which is why this is a known cost rather than a
-blocker.
+Still open: it decodes about three quarters of what the dongle does under
+test traffic, and packets late in a capture fare worst (87%, 88% and 65% for
+the three slots of a 162-byte capture). The damage is scattered bit errors on
+packets it synced to at -59 to -65 dBm, not bit slips, and every transmitter
+is on nominal baud, so the old bit-clock hypothesis is out. Five firmware
+A/Bs on 2026-09-28 -- one-slot captures, the preamble detector, the gate off,
+a 16-bit sync word -- left it the same or worse (CHANGELOG 2.8.2). What is
+left is where it sits: beside the PLM, in the middle of the simulcast.
 
 The board reports its own firmware version as a sensor, matching
 `insteonrf/_version.py`, because ESPHome's build timestamp only moves when the

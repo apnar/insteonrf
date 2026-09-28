@@ -156,9 +156,11 @@ bool InsteonRF::configure_radio_() {
   // status reads as 0xFF, which looks like a chip. A register that reads
   // back what was written cannot be faked by a floating line, and it also
   // catches CS on the wrong pin, which is the likeliest wiring mistake.
+  // The low sync_bits_ of the word, most significant byte first: the chip
+  // matches the first sync_bits_ bits of the register block.
   uint8_t sync[8] = {0};
-  for (uint8_t i = 0; i < INSTEON_SYNC_BITS / 8; i++)
-    sync[i] = (this->sync_word_ >> (INSTEON_SYNC_BITS - 8 * (i + 1))) & 0xFF;
+  for (uint8_t i = 0; i < this->sync_bits_ / 8; i++)
+    sync[i] = (this->sync_word_ >> (this->sync_bits_ - 8 * (i + 1))) & 0xFF;
   this->write_register_(SX_REG_SYNC_WORD_0, sync, 8);
   uint8_t check[8] = {0};
   this->read_register_(SX_REG_SYNC_WORD_0, check, 8);
@@ -206,7 +208,7 @@ bool InsteonRF::configure_radio_() {
   // on may mean never syncing. The Manchester gate absorbs the extra false
   // syncs. Exposed in YAML so it can be tried without recompiling.
   buf[2] = this->preamble_detector_;
-  buf[3] = INSTEON_SYNC_BITS;  // sync word length, in bits
+  buf[3] = this->sync_bits_;   // sync word length, in bits
   buf[4] = 0x00;               // no address filtering: Insteon addresses are elsewhere
   buf[5] = 0x00;               // fixed length: Insteon has no length field the chip can read
   buf[6] = this->capture_bytes_;
@@ -480,8 +482,8 @@ void InsteonRF::dump_config() {
   ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz", this->frequency_hz_ / 1e6f);
   ESP_LOGCONFIG(TAG, "  Bitrate: %u baud, deviation %u Hz, RX bandwidth 234.3 kHz",
                 (unsigned) INSTEON_BITRATE, (unsigned) INSTEON_DEVIATION_HZ);
-  ESP_LOGCONFIG(TAG, "  Sync word: 0x%08X (%u bits)%s", (unsigned) this->sync_word_,
-                (unsigned) INSTEON_SYNC_BITS,
+  ESP_LOGCONFIG(TAG, "  Sync word: 0x%08X (low %u bits)%s", (unsigned) this->sync_word_,
+                (unsigned) this->sync_bits_,
                 this->sync_word_ == INSTEON_SYNC_WORD ? "" : "  [non-default]");
   ESP_LOGCONFIG(TAG, "  Preamble detector: %s", this->preamble_detector_ ? "on" : "off");
   ESP_LOGCONFIG(TAG, "  Capture: %u bytes (%.0f ms of air)", (unsigned) this->capture_bytes_,

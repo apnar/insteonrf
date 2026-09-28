@@ -653,6 +653,78 @@ def test_soft_round_trip_through_the_publisher(monkeypatch):
         assert (cap.soft[i] > 0) == (b == "1")
 
 
+def _publisher(monkeypatch):
+    """An MqttPublisher on a fake paho client; returns it and what it sent."""
+    import sys
+    import types
+
+    from insteonrf.monitor import MqttPublisher
+
+    sent: list[tuple[str, str]] = []
+
+    class FakeClient:
+        def __init__(self, client_id=None):
+            pass
+
+        def connect_async(self, host, port):
+            pass
+
+        def loop_start(self):
+            pass
+
+        def publish(self, topic, payload, qos=0, retain=False):
+            sent.append((topic, payload))
+
+    fake = types.ModuleType("paho.mqtt.client")
+    fake.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "paho", types.ModuleType("paho"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt", types.ModuleType("paho.mqtt"))
+    monkeypatch.setitem(sys.modules, "paho.mqtt.client", fake)
+    return MqttPublisher("broker", 1883, "insteon-rf"), sent
+
+
+def _sdr_burst(damage_header: bool = False, lead: str = "0110" * 3) -> tuple[str, int]:
+    """An SDR burst (preamble, header, packet) and where its header starts."""
+    p = Packet.build(DEV, group=1, bcast=True, cmd1=0x11, cmd2=0xFF)
+    bits = p.to_bits()
+    at = bits.find(START_HEADER_INV)
+    burst = lead + bits
+    hdr = len(lead) + at
+    if damage_header:
+        i = hdr + 6
+        burst = burst[:i] + ("0" if burst[i] == "1" else "1") + burst[i + 1:]
+    return burst, hdr
+
+
+def test_the_correlator_s_header_is_used_when_the_header_is_damaged(monkeypatch):
+    """One wrong symbol in the header: an exact search finds no header, the
+    capture used to go out from the preamble, and the consumer then decoded
+    junk behind the header it put back. The correlator knew where it was."""
+    pub, sent = _publisher(monkeypatch)
+    burst, hdr = _sdr_burst(damage_header=True)
+    assert START_HEADER_INV not in burst[hdr - 8: hdr + 24]
+    pub.publish_capture(burst, receiver="v4", timestamp=1789844000.5, header_index=hdr)
+    ((topic, body),) = sent
+    cap = Capture.from_payload(topic, body.encode())
+    assert cap is not None
+    assert parse_bits(cap.bits)[0].crc_ok is True
+
+
+def test_a_correlator_a_preamble_cell_off_is_snapped_to_the_real_header(monkeypatch):
+    """The preamble repeats every four symbols, so the correlator can lock a
+    whole cell early or late; an exact header nearby wins over its index."""
+    pub, sent = _publisher(monkeypatch)
+    burst, hdr = _sdr_burst()
+    for off in (-4, -1, 3, 4):
+        sent.clear()
+        pub.publish_capture(burst, receiver="v4", timestamp=1789844000.5,
+                            header_index=hdr + off)
+        ((topic, body),) = sent
+        cap = Capture.from_payload(topic, body.encode())
+        assert cap is not None
+        assert parse_bits(cap.bits)[0].crc_ok is True, off
+
+
 def test_a_modem_copy_arriving_after_the_fusion_window_still_counts():
     """The bug this grace period exists for.
 

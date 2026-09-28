@@ -898,7 +898,8 @@ def monitor_main(argv: list[str] | None = None) -> int:
             # it is.
             mqtt.publish_capture(bits, receiver=a.mesh_capture, timestamp=ts,
                                  rssi_dbm=None if a.backend == "rfcat" else rssi,
-                                 seq=capture_seq, soft=soft, snr_db=snr_db)
+                                 seq=capture_seq, soft=soft, snr_db=snr_db,
+                                 header_index=header_index)
         packets = _decode(bits, ts, repair=not a.no_repair, show_all=a.all,
                           soft=soft, header_index=header_index, tracker=tracker)
         if any(q.calc_crc is not None for q in packets):

@@ -23,6 +23,7 @@ InsteonRF = insteon_rf_ns.class_("InsteonRF", cg.Component, spi.SPIDevice)
 CONF_BUSY_PIN = "busy_pin"
 CONF_DIO1_PIN = "dio1_pin"
 CONF_SYNC_WORD = "sync_word"
+CONF_SYNC_WORD_BITS = "sync_word_bits"
 CONF_PREAMBLE_DETECTOR = "preamble_detector_bits"
 CONF_CAPTURE_BYTES = "capture_bytes"
 CONF_RSSI_FLOOR = "rssi_floor"
@@ -75,6 +76,10 @@ CONFIG_SCHEMA = (
                 cv.frequency, cv.Range(min=902e6, max=928e6)
             ),
             cv.Optional(CONF_SYNC_WORD, default=DEFAULT_SYNC_WORD): cv.hex_uint32_t,
+            # How many of its low bits the radio matches on: 16 is the start
+            # header alone, each further 8 is two more preamble cells the bit
+            # synchroniser must already be locked for.
+            cv.Optional(CONF_SYNC_WORD_BITS, default=32): cv.one_of(16, 24, 32, int=True),
             cv.Optional(CONF_PREAMBLE_DETECTOR, default=0): cv.enum(PREAMBLE_DETECTOR),
             # Sized to the slot grid, not to a packet. Insteon traffic sits
             # on 456-bit (50 ms) slots: a message, its hop repeats and then
@@ -134,6 +139,7 @@ async def to_code(config):
 
     cg.add(var.set_frequency(int(config[CONF_FREQUENCY])))
     cg.add(var.set_sync_word(config[CONF_SYNC_WORD]))
+    cg.add(var.set_sync_bits(config[CONF_SYNC_WORD_BITS]))
     cg.add(var.set_preamble_detector(config[CONF_PREAMBLE_DETECTOR]))
     cg.add(var.set_capture_bytes(config[CONF_CAPTURE_BYTES]))
     cg.add(var.set_rssi_floor(config[CONF_RSSI_FLOOR]))

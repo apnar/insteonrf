@@ -272,6 +272,28 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   known template multiplied out (`_template_cfo`; ML needs it within ~2 kHz), and a
   ±1 block timing search on the same sums as the rate. The real capture in `Dat/` is
   29.5 kHz off, not the ~24 kHz once quoted.
+- **The mesh decodes each copy the way the pods do** (2.8.2). It used to hard-decode
+  captures and stop at the first illegal Manchester pair, and to find an SDR burst's
+  header by exact search; together that threw away 1,977 device messages in 4.8 days
+  that the V4 pod itself had decoded (device-sent coverage 48% vs ~78%).
+  `sightings_from_capture` now falls back to `recover.recover_at` (soft pairs, frame
+  counters, one CRC-guided flip), and `publish_capture` takes the correlator's
+  `header_index`, snapped to an exact header within ±8 symbols -- the correlator can
+  lock a whole 4-symbol preamble cell off. Replay of a 10-min recording: V4 via mesh
+  87% -> 98%. A copy repaired by CRC search is counted, never injected.
+- **The V4 is saturated on every packet and it does not matter**: at gain 37.2 ~82% of
+  each burst's samples are on the rails (idle floor |x| 2.3), but 28.0 and 19.7 dB
+  decode the same. Below ~12.5 dB the fixed squelch (12) loses packets. To evaluate a
+  demod change, record with the pod stopped (`rtl_sdr -g 37.2 -n …`), replay through
+  `SdrReceiver` with `SampleClock.at` patched to file time, align by the ~1.1 s
+  rtl_sdr start-up lag, and score against dongle/Heltec captures recorded off MQTT
+  at the same time.
+- **Heltec A/B record** (2026-09-28, same test traffic each): baseline 75-77% of
+  messages; `capture_bytes: 50` 69%, `preamble_detector_bits: 8` 40%, gate off 73%,
+  `sync_word_bits: 16` 71%. Don't re-run these expecting a different answer. Build
+  and flash from the esphome sidecar: copy `esphome/` into
+  `/k8s/homeassistant/esphome/`, `esphome compile /config/insteon-rf-main.yaml`, then
+  `esphome upload … --device 192.168.88.138` (with the navien.md env vars).
 - **Every receiver stamps the on-air time of its capture's first bit**, and
   `sightings_from_capture` adds `pos / 9124` for packets further in. Before 2.8.0: the
   Heltec sent `time(nullptr)*1000` (whole seconds, 0–1 s early at random), the dongle the

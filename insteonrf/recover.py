@@ -273,6 +273,21 @@ def _recover_at(bits: str, sym: np.ndarray[Any, Any], pos: int, timestamp: float
                      min_confidence=float(min(all_conf)) if all_conf else 0.0)
 
 
+def recover_at(bits: str, soft: np.ndarray[Any, Any] | None, pos: int,
+               timestamp: float | None = None, *, max_flips: int = MAX_FLIPS,
+               candidates: int = CANDIDATES, max_index_errors: int = 1,
+               repair: bool = True) -> Recovered | None:
+    """Decode the one packet whose start header is at ``pos`` in ``bits``.
+
+    ``bits`` must already be in normal polarity (as
+    :func:`~insteonrf.packet.find_headers` returns it) with ``soft`` aligned
+    and following it; ``None`` means hard bits only.
+    """
+    return _recover_at(bits, _soft_for(bits, soft), pos, timestamp, max_flips=max_flips,
+                       candidates=candidates, max_index_errors=max_index_errors,
+                       repair=repair)
+
+
 def recover_from_burst(burst: Any, **kwargs: Any) -> list[Recovered]:
     """Convenience: recover packets from a :class:`insteonrf.dsp.Burst`."""
     out = recover_packets(burst.bits, burst.soft, burst.timestamp,
@@ -288,6 +303,7 @@ __all__ = [
     "Recovered",
     "expected_indexes",
     "invert_bits",
+    "recover_at",
     "recover_from_burst",
     "recover_packets",
 ]

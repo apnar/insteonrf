@@ -85,6 +85,7 @@ from .packet import (
     parse_bits,
 )
 from .plm import message_key
+from .recover import recover_at
 
 #: Copies of one transmission land inside this window.
 WINDOW_S = 0.6
@@ -105,6 +106,12 @@ BAUD = 9124
 #: Consecutive hop repeats start this far apart: 456 bits, six half-cycles of
 #: 60 Hz (measured 2026-09-15, see ``Doc/MESH-TRANSMIT.md``).
 SLOT_S = 456 / BAUD
+
+#: Repair limits for one receiver's own copy (see :func:`sightings_from_capture`).
+#: Tighter than :mod:`insteonrf.recover`'s defaults: a copy repaired here also
+#: gets to vote, and it is the only verdict for a message one receiver heard.
+RECOVER_MAX_FLIPS = 1
+RECOVER_CANDIDATES = 8
 
 #: Most bits to flip when combining copies that disagree.
 MAX_COMBINE_FLIPS = 2
@@ -198,19 +205,36 @@ def sightings_from_capture(
             conf = -conf
     out = []
     for pos in offsets:
-        data, idx = decode_frames(bits, pos + MARKER_OFFSET)
-        if len(data) < min_bytes:
-            continue
-        end = pos + MARKER_OFFSET + FRAME_BITS * len(data)
         # A capture's timestamp is its first bit; a packet further in went
         # out that much later. One capture routinely holds a message and its
         # next hop repeat 50 ms on, and stamping both with the capture's time
         # would make the second look like it came from a receiver with a
         # different clock.
         when = None if timestamp is None else timestamp + pos / BAUD
-        pkt = Packet(data, bits[pos:end], when,
-                     complete=bool(idx) and idx[-1] == 0)
-        pkt.index_ok = indexes_ok(data, idx)
+        data, idx = decode_frames(bits, pos + MARKER_OFFSET)
+        pkt: Packet | None = None
+        if len(data) >= min_bytes:
+            end = pos + MARKER_OFFSET + FRAME_BITS * len(data)
+            pkt = Packet(data, bits[pos:end], when,
+                         complete=bool(idx) and idx[-1] == 0)
+            pkt.index_ok = indexes_ok(data, idx)
+        if pkt is None or pkt.crc_ok is not True or pkt.index_ok is False:
+            # The hard decode stops at the first illegal Manchester pair, so
+            # one wrong symbol cost the whole packet here even when this
+            # receiver alone had enough to decode it. Frame it the way the
+            # receivers' own logs do: pairs decided by their difference (soft
+            # where there is soft, an illegal pair marked as the doubtful
+            # one where there is not), checked against the frame counters,
+            # then a bounded CRC search. Measured 2026-09-28: the V4 pod's own
+            # log had 1,977 device messages in 4.8 days that the mesh never
+            # credited to it, because its captures reached here with one or
+            # two bad symbols the pod had already decoded through.
+            rec = recover_at(bits, conf, pos, when, max_flips=RECOVER_MAX_FLIPS,
+                             candidates=RECOVER_CANDIDATES)
+            if rec is not None:
+                pkt = rec.packet
+            elif pkt is None:
+                continue
         pkt.rssi_dbm = rssi_dbm
         out.append(Sighting(pkt, receiver, rssi_dbm, when, bits[pos:],
                             snr_db=snr_db,
@@ -816,10 +840,12 @@ class _Bucket:
         combined_from = 0
 
         if good:
-            # Prefer the least-travelled copy, then the strongest.
+            # Prefer a copy nobody had to repair, then the least-travelled,
+            # then the strongest.
             best = max(
                 good,
-                key=lambda s: (s.packet.hops_left, s.rssi_dbm if s.rssi_dbm is not None else -999),
+                key=lambda s: (not s.packet.corrected, s.packet.hops_left,
+                               s.rssi_dbm if s.rssi_dbm is not None else -999),
             )
             packet = best.packet
         else:

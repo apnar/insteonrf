@@ -4,6 +4,70 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.8.2 — 2026-09-28
+
+Five days of four listeners, a 10-minute raw I/Q recording from the V4 under
+test traffic, recordings at four gains, and five firmware A/Bs on the Heltec.
+
+- **The mesh was throwing away most of what the V4 decoded.** The V4 pod's
+  own log held 1,977 device messages in 4.8 days that the mesh never credited
+  to it -- device-sent coverage read 48% when the pod was decoding about 78%.
+  Two causes, both in the capture path rather than the radio:
+  - The mesh hard-decoded every capture and stopped at the first illegal
+    Manchester pair, so a copy with one wrong symbol was lost even when the
+    receiver alone had enough to decode it -- which the pods' own logs, running
+    `recover`, always did. `sightings_from_capture` now falls back to
+    `recover.recover_at` for a copy that fails: pairs decided by their
+    difference (soft where there is soft, an illegal pair marked as the doubt
+    where there is not), the frame counters checked, then at most one bit
+    flipped at the CRC's direction. Hard receivers get this too: one bad
+    symbol is repaired from a single copy. 0 accepts over 20,000 hard and
+    20,000 soft noise captures.
+  - `publish_capture` found the header in an SDR burst by exact search. A
+    header with one wrong symbol was not found, the capture went out from the
+    preamble, and the mesh put a header in front of that and decoded junk. It
+    now takes the correlator's `header_index`, snapped to an exact header
+    within two preamble cells when there is one: the correlator can sit a
+    whole cell off (measured: 4 symbols early on strong packets at low gain),
+    since the preamble repeats with that period.
+  Replaying the recording through both paths: V4 via the mesh **87% -> 98%**
+  of what the dongle and Heltec heard. Live, first hour on 2.8.2 against the
+  115 hours before it: the V4's share of device-sent messages 48% -> 78%
+  (group cleanup ACKs 40% -> 74%), undecodable events 21% -> 14%; dongle
+  plus V4 together 95.5% -> 98.5%. (65 device messages so far -- the next
+  hourly miss report will firm it up.)
+- **A copy repaired by CRC search is never injected**, and an event prefers an
+  intact copy over a repaired one. One receiver's word, bit-flipped until the
+  CRC agreed, is good enough to count a message as heard, not to put words in
+  a device's mouth.
+- **The V4 is clipped on every packet, and it does not matter.** At gain 37.2
+  about 82% of the samples of every burst sit on the ADC rails, device ACKs
+  included (|x| ~142 against an idle floor of 2.3), so the front end works as
+  a hard limiter. Recorded at 28.0 and 19.7 dB it scored 88% and 90% against
+  94% at 37.2: within the noise of 42-125-message samples, so clipping is not
+  what limits it. At 12.5 dB the fixed squelch (12) starts losing packets.
+  Gain stays at 37.2.
+- **Transmitters are on nominal baud.** The V4's symbol-rate search picked
+  nominal (+/-0.1%) for all 282 synced bursts, so the Heltec's broken
+  captures are not bit-clock drift, which was the leading hypothesis.
+- **The Heltec's losses are not in its firmware settings.** Each A/B ran the
+  same 8 minutes of Get Engine Version traffic to 20 devices, scored against
+  the dongle (baseline 75-77% of all messages, 64-67% of device-sent):
+
+  | change | all | device-sent | |
+  |---|---|---|---|
+  | `capture_bytes: 50` (re-sync every slot) | 69% | 48% | misses the next slot's sync 24 bits after re-arming |
+  | `preamble_detector_bits: 8` | 40% | 48% | |
+  | Manchester gate off | 73% | 65% | every capture already passes it |
+  | `sync_word_bits: 16` (new option) | 71% | 65% | more captures, ~20% of them noise |
+
+  Its broken packets are scattered bit errors (28 of 36), not bit slips, on
+  packets it synced to at -59 to -65 dBm; decoding degrades with position in
+  a 162-byte capture (87%, 88%, 65% for slots 0-2). That points to where it
+  sits -- beside the PLM, in the middle of the simulcast -- rather than to
+  anything it can be configured out of. Config unchanged; `sync_word_bits`
+  (16/24/32, default 32) stays as an option.
+
 ## 2.8.1 — 2026-09-23
 
 What an hour of 2.8.0 and 150 s of raw I/Q from the V4 showed.

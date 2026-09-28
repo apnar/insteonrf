@@ -47,6 +47,12 @@ namespace insteon_rf {
 // 0xCCCCCEAA is the word to try -- a wrong polarity looks exactly like a
 // wiring fault (no captures, no errors), so it must be flippable over OTA.
 static const uint32_t INSTEON_SYNC_WORD = 0x33333155;
+// How much of it the radio matches on, from the low end: 16 is the start
+// header alone (what the CC1111 dongle uses), 24 adds two preamble cells, 32
+// adds four. Insteon sends only about five cells of preamble, and every cell
+// the sync word swallows is one the bit synchroniser no longer has to lock
+// on before matching starts. Measured 2026-09-28: at 32 the board synced on
+// about 10 transmissions a minute while the dongle decoded far more.
 static const uint8_t INSTEON_SYNC_BITS = 32;
 
 // Insteon on-air parameters.
@@ -108,6 +114,7 @@ class InsteonRF : public Component,
   void set_dio1_pin(GPIOPin *pin) { this->dio1_pin_ = pin; }
   void set_frequency(uint32_t hz) { this->frequency_hz_ = hz; }
   void set_sync_word(uint32_t word) { this->sync_word_ = word; }
+  void set_sync_bits(uint8_t bits) { this->sync_bits_ = bits; }
   void set_preamble_detector(uint8_t code) { this->preamble_detector_ = code; }
   void set_capture_bytes(uint8_t n) { this->capture_bytes_ = n; }
   void set_rssi_floor(float dbm) { this->rssi_floor_ = dbm; }
@@ -162,6 +169,7 @@ class InsteonRF : public Component,
 
   uint32_t frequency_hz_{914950000};
   uint32_t sync_word_{INSTEON_SYNC_WORD};
+  uint8_t sync_bits_{INSTEON_SYNC_BITS};
   uint8_t preamble_detector_{0x00};  // off; see __init__.py for the codes
   uint8_t capture_bytes_{162};
   float rssi_floor_{-110.0f};

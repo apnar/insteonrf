@@ -203,6 +203,17 @@ def test_refuses_rejected_frame_indexes():
     assert d.inject is False and d.reason == "frame-index counters rejected"
 
 
+def test_refuses_a_copy_repaired_by_crc_search():
+    """One receiver's copy with a bit flipped until the CRC matched counts
+    as heard, but is not put in a device's mouth."""
+    inj = injector()
+    ev = event(src=LEAK, group=1)
+    ev.packet.corrected = 1
+    d = inj.consider(ev, now=100.0)
+    assert d.inject is False
+    assert "repaired by CRC search" in d.reason
+
+
 def test_refuses_a_thinly_combined_packet():
     """A two-way vote ties on every disagreement; the CRC does all the work."""
     inj = injector(min_combined_receivers=3)
