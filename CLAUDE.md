@@ -227,6 +227,12 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   config hash changes, so a reflash of unchanged config keeps the original
   timestamp and cannot answer "is this board current". `tests/test_version.py`
   pins all three together. Bump them in one commit.
+- **The V4 is parked (2026-09-29)**: it was on loan and went back. Its manifest is in
+  `/k8s/yaml/notused/insteonrf-v4.yaml`, out of `all-up.sh`; the replacement is an
+  RTL-SDR Blog V3 (same RTL2832U, R820T2 tuner, same gain table, supported by the fork
+  the image builds). To bring it back: move the manifest back to `/k8s/yaml/`, change
+  `--mesh-capture=v4` (and the log name) to `v3` so its history stays separable, and
+  apply. Nothing else in the mesh needs to change.
 - **The V4 runs as a pod** (`insteonrf-v4`, receiver name `v4`), on the same image: it
   builds the *blog* fork of librtlsdr with `DETACH_KERNEL_DRIVER=ON`, because stock
   Osmocom librtlsdr does not know the V4's R828D front end and the kernel DVB driver
