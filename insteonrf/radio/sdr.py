@@ -90,6 +90,32 @@ class SampleClock:
         return min(self._anchors) + sample / self.rate
 
 
+#: Capture-tool stderr lines that mean something went wrong; the rest
+#: (device found, gain set, sample rate) is start-up chatter.
+_TOOL_TROUBLE = ("lost", "fail", "error", "no matching", "no supported", "usb_claim",
+                 "invalid", "unable")
+
+
+def _log_tool_stderr(kind: str, stream: object) -> None:
+    """Forward the capture tool's stderr to the log, a line at a time.
+
+    It used to go to /dev/null, which hid the two things worth knowing:
+    why the tool exited (``No matching devices found`` for a wrong
+    ``--device`` serial, a device busy in another pod) and ``rtl_sdr``'s
+    own ``Lost at least N bytes`` when samples are dropped before they
+    ever reach the reader thread.
+    """
+    try:
+        for raw in stream:  # type: ignore[attr-defined]
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            trouble = any(word in line.lower() for word in _TOOL_TROUBLE)
+            log.log(logging.WARNING if trouble else logging.INFO, "%s: %s", kind, line)
+    except (OSError, ValueError):
+        pass  # closed under us
+
+
 def _is_regular_file(src: object) -> bool:
     """Whether ``src`` reads a regular file (a recording) rather than a pipe."""
     try:
@@ -212,9 +238,11 @@ class SdrReceiver:
         if shutil.which(argv[0]) is None:
             raise RuntimeError(f"{argv[0]} not found on PATH")
         log.info("starting %s", " ".join(argv))
-        self._proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        assert self._proc.stdout is not None
+        self._proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert self._proc.stdout is not None and self._proc.stderr is not None
         self._iq = self._proc.stdout
+        threading.Thread(target=_log_tool_stderr, args=(self.kind, self._proc.stderr),
+                         name="sdr-stderr", daemon=True).start()
 
     def iter_bits(self, timeout_ms: int = 0) -> Iterator[tuple[float, str]]:
         """Yield ``(timestamp, bits)`` per demodulated burst."""

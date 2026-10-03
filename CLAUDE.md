@@ -237,12 +237,20 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   lists index + serial without opening anything. Gain 37.2 / squelch 12 carried over
   from the V4 (same R820T-family gain table) and has not been re-measured on the V3.
   First light: every hop of two Get-Engine exchanges at 16-34 dB symbol SNR, including
-  the marginal loft KPL `2B.A0.AB` at ~20 dB. Most of the V4 notes below apply to it;
-  the R828D/blog-fork ones do not, though the fork drives the V3 fine.
+  the marginal loft KPL `2B.A0.AB` at ~20 dB. Most of the V4 notes below apply to it.
+- **The network is at ~914.990 MHz, not 914.950** -- the "+33-45 kHz" the V4 saw was
+  the devices, not its tuner: the V3 (independent 1 ppm TCXO) measured the same
+  per-device offsets to within ~1 kHz. The SDR pod is tuned to `--freq=914990000`,
+  which moved its CFOs from +32..+48 kHz to -7.5..+1.5 kHz. The rfcat dongle stays at
+  914.950 (its FREQEST reads ~0 there, i.e. its own crystal is that far off).
+- **The image uses Debian's librtlsdr** (`rtl-sdr` 2.0.2, trixie), not a source build of
+  the rtlsdrblog fork: Osmocom 2.0.2 has the Blog V4/R828D support and the kernel-driver
+  detach compiled in. `rtl_sdr`'s stderr is forwarded to the pod log (`rtl_sdr: ...`
+  lines) -- a wrong serial shows as `No matching devices found`, dropped samples as
+  `Lost at least N bytes`, both at WARNING.
 - **The V4 ran as a pod** (`insteonrf-v4`, receiver name `v4`), on the same image: it
-  builds the *blog* fork of librtlsdr with `DETACH_KERNEL_DRIVER=ON`, because stock
-  Osmocom librtlsdr does not know the V4's R828D front end and the kernel DVB driver
-  claims the device on sight (the host blacklist in
+  needed a librtlsdr that knows the V4's R828D front end and detaches the kernel DVB
+  driver, which claims the device on sight -- then the blog fork, Debian's 2.0.2 now (the host blacklist in
   `/etc/modprobe.d/blacklist-rtlsdr.conf` only helps if those modules were not already
   loaded, which on 2026-09-19 they were). It is the only receiver with soft decisions,
   so `fusion` can repair a damaged copy from it alone; each receiver's symbol SNR is

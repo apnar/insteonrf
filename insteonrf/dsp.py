@@ -338,10 +338,13 @@ MAX_CFO_HZ = 60_000
 #: Carrier-offset hypotheses for :func:`_tone_sync`, Hz. Half-symbol tone
 #: windows tolerate a few kHz of residual (the correlation falls off as
 #: sinc(f * T/2)), so an 8 kHz grid leaves at most 4 kHz -- a loss of about
-#: 1 dB. The range is what the V4 actually sees, not just device crystals:
-#: measured 2026-09-23 it puts the whole network 33-45 kHz high (the PLM at
-#: +33.3 kHz) while the dongle's FREQEST reads about zero, so most of that is
-#: the SDR's own tuning. Keep margin on it.
+#: 1 dB. The range covers what the network actually does relative to the
+#: dongle's 914.950 MHz: devices sit 33-48 kHz high (the PLM about +36). That
+#: is the devices, not SDR tuning, as was first assumed -- a V4 and then a V3,
+#: each with its own 1 ppm TCXO, measured the same per-device offsets to
+#: within ~1 kHz (2026-10-03). The V3 pod is therefore tuned to 914.990 MHz,
+#: which centres the spread; the range keeps margin for an SDR tuned to the
+#: dongle's frequency.
 TONE_SYNC_CFOS = tuple(range(-56_000, 56_001, 8_000))
 
 

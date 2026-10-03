@@ -473,3 +473,19 @@ def test_sdr_bursts_are_stamped_by_their_own_position(tmp_path, monkeypatch):
     for b, at in zip(sorted(bursts, key=lambda b: b.timestamp), starts, strict=True):
         # The sync template begins in the preamble, a few symbols early.
         assert b.timestamp == pytest.approx(1000.0 + at / 2_400_000, abs=0.004)
+
+
+def test_sdr_tool_stderr_reaches_the_log(caplog):
+    """A wrong --device serial must say why, not just end the stream."""
+    import io
+    import logging
+
+    from insteonrf.radio.sdr import _log_tool_stderr
+
+    err = io.BytesIO(b"Found 3 device(s):\n\nNo matching devices found.\n")
+    with caplog.at_level(logging.INFO, logger="insteonrf.radio.sdr"):
+        _log_tool_stderr("rtl_sdr", err)
+    got = [(r.levelno, r.getMessage()) for r in caplog.records]
+    assert (logging.INFO, "rtl_sdr: Found 3 device(s):") in got
+    assert (logging.WARNING, "rtl_sdr: No matching devices found.") in got
+    assert len(got) == 2  # blank lines dropped

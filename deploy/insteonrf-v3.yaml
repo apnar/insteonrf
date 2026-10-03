@@ -59,6 +59,13 @@ spec:
         - monitor
         - --backend=rtlsdr
         - --device=INST915
+        # Tuned 40 kHz above the dongle's 914.950: this network sits there.
+        # Two SDRs with independent 1 ppm TCXOs (the V4, then this V3) put
+        # every device at the same offset to within ~1 kHz, +33..+48 kHz
+        # from 914.950 (median +40), so it is the devices, not the tuner.
+        # Centred, the spread is about +/-8 kHz, well inside the demod's
+        # +/-56 kHz search instead of 8 kHz from its edge.
+        - --freq=914990000
         - --gain=37.2
         # The C demodulator fails on real signals the numpy path decodes.
         - --demod=numpy

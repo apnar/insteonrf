@@ -11,6 +11,14 @@ contract and the legacy script names are treated as public API.
   follows USB enumeration order, so a serial is the only stable name.
 - **The SDR listener is an RTL-SDR Blog V3** (`deploy/insteonrf-v3.yaml`, receiver
   `v3`, opened as `--device=INST915`), replacing the loaned V4. Same gain, same image.
+- **The SDR listens at 914.990 MHz.** Two SDRs with independent TCXOs agree on every
+  device's offset to ~1 kHz, so the +40 kHz they both saw from 914.950 is the network,
+  not the tuner (the `TONE_SYNC_CFOS` comment said otherwise). Centred, CFOs are
+  -7.5..+1.5 kHz instead of +32..+48, well inside the demod's search.
+- **Debian's librtlsdr instead of building the rtlsdrblog fork from git HEAD.** Osmocom
+  2.0.2 (trixie) already has V4/R828D support and the kernel-driver detach.
+- **`rtl_sdr`/`hackrf_transfer` stderr goes to the log** instead of /dev/null, so a
+  wrong serial, a busy device or dropped samples say so.
 
 ## 2.8.2 — 2026-09-28
 
