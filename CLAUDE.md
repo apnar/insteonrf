@@ -71,7 +71,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `esphome/components/insteon_rf/` | ESPHome listener firmware (SX1262, receive only) |
 | `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/k8s/yaml/AGENTS.md` conventions) |
 | `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
-| `deploy/insteonrf-v4.yaml` | the RTL-SDR Blog V4 as a third listener (`--mesh-capture=v4`), the only one producing soft decisions |
+| `deploy/insteonrf-v3.yaml` | an RTL-SDR Blog V3 (serial `INST915`) as a third listener (`--mesh-capture=v3`), the only one producing soft decisions |
 | `deploy/insteon-mqtt/` | patch series + Containerfile adding `insteon/raw/rx` and `insteon/raw/inject` to insteon-mqtt |
 
 Pipeline contract: one burst per line of `0`/`1` characters; blank lines ignored; `#` lines are
@@ -227,13 +227,19 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   config hash changes, so a reflash of unchanged config keeps the original
   timestamp and cannot answer "is this board current". `tests/test_version.py`
   pins all three together. Bump them in one commit.
-- **The V4 is parked (2026-09-29)**: it was on loan and went back. Its manifest is in
-  `/k8s/yaml/notused/insteonrf-v4.yaml`, out of `all-up.sh`; the replacement is an
-  RTL-SDR Blog V3 (same RTL2832U, R820T2 tuner, same gain table, supported by the fork
-  the image builds). To bring it back: move the manifest back to `/k8s/yaml/`, change
-  `--mesh-capture=v4` (and the log name) to `v3` so its history stays separable, and
-  apply. Nothing else in the mesh needs to change.
-- **The V4 runs as a pod** (`insteonrf-v4`, receiver name `v4`), on the same image: it
+- **The SDR listener is a V3 now (2026-10-03)**: the V4 was on loan and went back
+  on 2026-09-29. Pod `insteonrf-v3`, receiver name `v3`, log `insteon-rf-v3.jsonl` on
+  dataset `nvme/churn/insteonrf-v3`; `v4` history stays under its own name. Three
+  identical V3s share the USB hub at 1-11 -- `GAS910` (rtlamr2mqtt), **`INST915`
+  (this project)**, `TPMS433` (spare) -- so the pod opens its dongle **by serial**:
+  `--device=INST915` becomes `rtl_sdr -d INST915`. Never select by index: it follows
+  enumeration order, so an index can land on the gas meter's or the TPMS dongle. `rtl_test -d 99`
+  lists index + serial without opening anything. Gain 37.2 / squelch 12 carried over
+  from the V4 (same R820T-family gain table) and has not been re-measured on the V3.
+  First light: every hop of two Get-Engine exchanges at 16-34 dB symbol SNR, including
+  the marginal loft KPL `2B.A0.AB` at ~20 dB. Most of the V4 notes below apply to it;
+  the R828D/blog-fork ones do not, though the fork drives the V3 fine.
+- **The V4 ran as a pod** (`insteonrf-v4`, receiver name `v4`), on the same image: it
   builds the *blog* fork of librtlsdr with `DETACH_KERNEL_DRIVER=ON`, because stock
   Osmocom librtlsdr does not know the V4's R828D front end and the kernel DVB driver
   claims the device on sight (the host blacklist in

@@ -4,6 +4,14 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## Unreleased
+
+- **`--device <serial>` for the SDR backends** (`rtl_sdr -d`, `hackrf_transfer -d`),
+  for hosts with more than one RTL-SDR. This one now has three V3s; the index
+  follows USB enumeration order, so a serial is the only stable name.
+- **The SDR listener is an RTL-SDR Blog V3** (`deploy/insteonrf-v3.yaml`, receiver
+  `v3`, opened as `--device=INST915`), replacing the loaned V4. Same gain, same image.
+
 ## 2.8.2 — 2026-09-28
 
 Five days of four listeners, a 10-minute raw I/Q recording from the V4 under

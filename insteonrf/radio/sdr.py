@@ -119,8 +119,12 @@ class SdrReceiver:
                  sample_rate: int = DEFAULT_SAMPLE_RATE, baud: float = DEFAULT_DRATE,
                  demod: str = "auto", demod_path: str | None = None,
                  signed: bool | None = None, gain: str | None = None,
-                 squelch: float = 12.0, stdin: bool = False, method: str = "ml"):
+                 squelch: float = 12.0, stdin: bool = False, method: str = "ml",
+                 device: str | None = None):
         self.freq = freq
+        #: Which SDR to open when several are attached: an rtl_sdr index or
+        #: EEPROM serial, a hackrf serial. ``None`` lets the tool pick its first.
+        self.device = device
         self.sample_rate = sample_rate
         self.baud = baud
         self.squelch = squelch
@@ -184,11 +188,17 @@ class SdrReceiver:
         argv = list(self.tool)
         if self.kind == "rtl_sdr":
             argv += ["-f", str(self.freq), "-s", str(self.sample_rate)]
+            if self.device:
+                # librtlsdr tries an all-digit value as an index first, then
+                # as a serial -- give dongles non-numeric serials (INST915).
+                argv += ["-d", self.device]
             if self.gain:
                 argv += ["-g", self.gain]
             argv += ["-"]
         elif self.kind.startswith("hackrf"):
             argv += ["-f", str(self.freq), "-s", str(self.sample_rate), "-a", "1"]
+            if self.device:
+                argv += ["-d", self.device]
             if self.gain:
                 argv += ["-l", self.gain]
             argv += ["-r", "-"]

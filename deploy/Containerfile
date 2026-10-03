@@ -1,5 +1,5 @@
 # insteon-rf RF listeners for the house: the rfcat dongle pod, the mesh pod
-# and the RTL-SDR V4 pod all run this one image.
+# and the RTL-SDR (V3, formerly V4) pod all run this one image.
 #
 # Built locally (buildah bud → ctr image import) so restarts do not re-download
 # anything and the pods work without internet:

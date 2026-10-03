@@ -1,24 +1,28 @@
-# insteon-rf V4 — RTL-SDR Blog V4 as a third listener, receive only.
+# insteon-rf V3 — an RTL-SDR Blog V3 as a third listener, receive only.
 #
 # Why this exists: the mesh is only worth having if its receivers fail
 # independently, and this one fails differently from the other two. It is the
 # only receiver that produces **soft decisions** — one signed byte of
 # confidence per bit — so `fusion` can repair a damaged copy from this radio
 # alone, where the dongle's and the Heltec's hard bits need two copies to vote
-# with. On the one 15 s comparison ever run at this spot (2026-09-19) it had
-# the most CRC-valid copies of the three, and missed only the two faintest
-# things the dongle heard at about -105 dBm.
+# with. It replaces the loaned RTL-SDR Blog V4 (2026-09-21 .. 09-29), which
+# ran from this same manifest as receiver `v4`; history for that one stays
+# under that name, this one publishes as `v3`.
 #
 # NEVER add a transmit path. There is exactly one transmitter on an Insteon
 # network and it is the PLM. This backend cannot transmit in any case:
 # SdrReceiver.transmit_bits raises.
 #
-# Hardware: RTL-SDR Blog V4 (0bda:2838, "Blog V4", R828D front end) on USB
-# bus 1 port 11. It needs the *blog* fork of librtlsdr, which the image
-# builds; stock Osmocom librtlsdr does not know the R828D and mistunes it.
+# Hardware: RTL-SDR Blog V3 (0bda:2838, R820T2) with EEPROM serial
+# **INST915**, on the 4-port hub at USB 1-11 alongside two more V3s --
+# GAS910 (owned by the rtlamr2mqtt pod) and TPMS433 (spare). With three
+# identical dongles the index is meaningless (it follows enumeration order),
+# so the pod opens its own by serial: --device=INST915 -> `rtl_sdr -d`.
+# Only that device is claimed; the others are opened just long enough to read
+# their serial strings. List them with `rtl_test -d 99` (opens nothing).
 #
-# Gain 37.2 with the default squelch of 12 is the setting measured here: at
-# 49.6 the noise floor rises from ~2.7 to 6.8 (|IQ|) and the squelch chatters.
+# Gain 37.2 with the default squelch of 12 is the V4's measured setting; the
+# V3 has the same R820T-family gain table, so it is the starting point here.
 #
 # Uses the same locally built image as the other two pods, so
 # imagePullPolicy MUST stay Never. See deploy/insteonrf.yaml for the build.
@@ -26,13 +30,13 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: insteonrf-v4
+  name: insteonrf-v3
   labels:
-    app: insteonrf-v4
+    app: insteonrf-v3
 spec:
   restartPolicy: Always
   containers:
-    - name: insteonrf-v4
+    - name: insteonrf-v3
       image: localhost/insteonrf:local
       imagePullPolicy: Never
       # privileged + /dev/bus/usb: librtlsdr drives the tuner over raw USB.
@@ -54,6 +58,7 @@ spec:
       args:
         - monitor
         - --backend=rtlsdr
+        - --device=INST915
         - --gain=37.2
         # The C demodulator fails on real signals the numpy path decodes.
         - --demod=numpy
@@ -62,10 +67,10 @@ spec:
         # Per-packet MQTT is off for the same reason as the dongle pod: the
         # broker logs a line per publish. Captures still go to the mesh.
         - --mqtt-alerts-only
-        - --mesh-capture=v4
+        - --mesh-capture=v3
         # The all-on watch lives in the dongle pod; this one is a receiver
         # for the mesh and its own record, nothing more.
-        - --out=/config/log/insteon-rf-v4.jsonl
+        - --out=/config/log/insteon-rf-v3.jsonl
         # No silence watchdog: re-arming means nothing to this backend
         # (SdrReceiver.configure_rx is a no-op) and if rtl_sdr dies the pod
         # exits on `exhausted` and Kubernetes restarts it, which is the
@@ -90,7 +95,7 @@ spec:
       hostPath:
         # On nvme/churn, not nvme/k8s: this is a rotating log, which is
         # exactly the churn that made nvme/k8s snapshots expensive.
-        path: /nvme/churn/insteonrf-v4
+        path: /nvme/churn/insteonrf-v3
         type: Directory
     - name: usb
       hostPath:

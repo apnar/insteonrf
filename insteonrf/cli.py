@@ -130,6 +130,11 @@ def _radio_args(p: argparse.ArgumentParser, *, transmit: bool = False) -> None:
                        help="SDR backends, numpy demodulator: matched-filter ML (default, more "
                             "sensitive and gives soft decisions) or phase discriminator")
         p.add_argument("--gain", help="SDR backends: receiver gain setting")
+        p.add_argument("--device", metavar="SERIAL",
+                       help="SDR backends: which SDR to open when several are attached -- its "
+                            "EEPROM serial (rtl_sdr/hackrf -d). Prefer the serial to an index: "
+                            "indices follow USB enumeration order and move when anything is "
+                            "plugged in")
 
 
 def _open_radio(a: argparse.Namespace, *, transmit: bool = False) -> Any:
@@ -141,7 +146,7 @@ def _open_radio(a: argparse.Namespace, *, transmit: bool = False) -> Any:
         if transmit:
             kw.update(tx_gain=a.tx_gain)
         else:
-            kw.update(demod=a.demod, gain=a.gain)
+            kw.update(demod=a.demod, gain=a.gain, device=a.device)
             if getattr(a, "method", None):
                 kw["method"] = a.method
     elif a.backend == "file":

@@ -129,9 +129,11 @@ dependency. Then, depending on what you want to do:
 | Run several at once and compare | any two of the above | an MQTT broker |
 
 An **RTL-SDR Blog V4** needs that project's fork of librtlsdr, not Osmocom's:
-the stock library does not know the V4's R828D front end and mistunes it. It
-is also the only receiver here that produces per-symbol confidence, which is
-what lets a single damaged copy be repaired.
+the stock library does not know the V4's R828D front end and mistunes it; a
+V3 works with either. An SDR is the only receiver here that produces
+per-symbol confidence, which is what lets a single damaged copy be repaired.
+With several RTL-SDRs on one host, give each a distinct EEPROM serial
+(`rtl_eeprom -s`) and pick yours with `--device <serial>`.
 
 Insteon RF is **915 MHz**, so this is US-band hardware. Nothing here needs a C
 compiler: the numpy demodulator is the default and is the more sensitive one.
@@ -290,7 +292,7 @@ and flips the least-confident bits looking for a CRC match.
     Src/                    C demodulator / burst splitter (legacy fast path)
     esphome/                ESPHome component + node config for an SX1262 board
     deploy/insteonrf.yaml   k8s Pod: the rfcat dongle, logging and mesh capture
-    deploy/insteonrf-v4.yaml    the same for an RTL-SDR Blog V4
+    deploy/insteonrf-v3.yaml    the same for an RTL-SDR Blog V3, picked by serial
     deploy/insteonrf-mesh.yaml  the fusing service, no radio of its own
     deploy/insteon-mqtt/    patch series giving insteon-mqtt its raw topics
     tools/usb_stress.py     USB robustness harness (not shipped)
@@ -444,7 +446,7 @@ built and proven before any new hardware existed.
 ```bash
 # Any receiver publishes raw captures as a mesh member
 insteon-rf monitor --mqtt=192.168.88.5 --mesh-capture=dongle ...
-insteon-rf monitor --mqtt=192.168.88.5 --mesh-capture=v4 --backend rtlsdr --gain 37.2 ...
+insteon-rf monitor --mqtt=192.168.88.5 --mesh-capture=v3 --backend rtlsdr --device INST915 --gain 37.2 ...
 
 # Fuse them and compare against what the modem heard
 insteon-rf mesh --mqtt=192.168.88.5 --plm-addr=2B.93.07 \

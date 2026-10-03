@@ -62,6 +62,9 @@ def test_sdr_receiver_builds_capture_command():
     argv = rx._capture_argv()
     assert argv[0] == "rtl_sdr" and "-f" in argv and "914950000" in argv and argv[-1] == "-"
     assert rx.signed is False  # rtl_sdr is unsigned
+    assert "-d" not in argv
+    one = SdrReceiver("rtl_sdr", demod="numpy", device="INST915")._capture_argv()
+    assert one[one.index("-d") + 1] == "INST915" and one[-1] == "-"
     hrf = SdrReceiver("hackrf_transfer", demod="numpy")
     assert hrf.signed is True and "-r" in hrf._capture_argv()
 

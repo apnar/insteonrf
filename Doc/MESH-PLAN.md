@@ -26,7 +26,7 @@ not proven on air**. What is deployed:
 | `insteon` sidecar | patched image `localhost/insteon-mqtt-raw:local`, publishing every inbound message to `insteon/raw/rx`. Injection compiled in but **disabled** in `config.yaml`. |
 | `insteonrf` pod | now also publishes raw captures to `insteon-rf/rx/dongle`, so the rfcat dongle is the mesh's first receiver. |
 | `insteonrf-mesh` pod | fuses captures, compares against `insteon/raw/rx`, writes `/nvme/churn/insteonrf-mesh/log/insteon-rf-mesh.jsonl` and an hourly miss table. **No `--inject`.** |
-| `insteonrf-v4` pod | the RTL-SDR Blog V4 on `insteon-rf/rx/v4` (2026-09-21). Three radios on the air, and the only one of them producing soft decisions. |
+| `insteonrf-v3` pod | an RTL-SDR Blog V3 (serial `INST915`) on `insteon-rf/rx/v3` (2026-10-03), replacing the loaned V4 that ran as `insteon-rf/rx/v4` from 2026-09-21 to 09-29. Three radios on the air, and the only one of them producing soft decisions. |
 
 Verified end to end on live traffic: a benign Get-Engine probe produced
 captures on `insteon-rf/rx/dongle`, matching frames on `insteon/raw/rx`, fused
