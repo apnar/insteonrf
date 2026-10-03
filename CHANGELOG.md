@@ -17,6 +17,10 @@ contract and the legacy script names are treated as public API.
   -7.5..+1.5 kHz instead of +32..+48, well inside the demod's search.
 - **Debian's librtlsdr instead of building the rtlsdrblog fork from git HEAD.** Osmocom
   2.0.2 (trixie) already has V4/R828D support and the kernel-driver detach.
+- **`tools/sdr_gain_sweep.py`**: records one I/Q file per gain under identical
+  Get-Engine traffic, replays each through the live receive path and scores it against
+  the mesh log's events from the other receivers. First result: the V3 runs at gain
+  28.0 (95.5% of messages vs 93.3% at 37.2 over three paired runs, 70% clipped vs 95%).
 - **`rtl_sdr`/`hackrf_transfer` stderr goes to the log** instead of /dev/null, so a
   wrong serial, a busy device or dropped samples say so.
 

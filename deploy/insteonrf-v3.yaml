@@ -21,8 +21,14 @@
 # Only that device is claimed; the others are opened just long enough to read
 # their serial strings. List them with `rtl_test -d 99` (opens nothing).
 #
-# Gain 37.2 with the default squelch of 12 is the V4's measured setting; the
-# V3 has the same R820T-family gain table, so it is the starting point here.
+# Gain 28.0, measured on this V3 where it sits (2026-10-03,
+# tools/sdr_gain_sweep.py: one recording per gain under the same 36
+# Get-Engine queries to 12 devices, scored against what the dongle and
+# Heltec heard). 19.7-37.2 form a plateau; 12.5 loses copies (82%), 42.1
+# and up lose messages (84-88%). 28.0 against 37.2 over three paired runs
+# each: 95.5% vs 93.3% of messages (213 vs 208 of 223), weak-device ACKs
+# 86% vs 83%, fewer syncs that fail to decode every time, and 70% of
+# samples clipped per burst instead of 95%. Small, but never the other way.
 #
 # Uses the same locally built image as the other two pods, so
 # imagePullPolicy MUST stay Never. See deploy/insteonrf.yaml for the build.
@@ -66,7 +72,7 @@ spec:
         # Centred, the spread is about +/-8 kHz, well inside the demod's
         # +/-56 kHz search instead of 8 kHz from its edge.
         - --freq=914990000
-        - --gain=37.2
+        - --gain=28.0
         # The C demodulator fails on real signals the numpy path decodes.
         - --demod=numpy
         - --mqtt=192.168.88.5:1883

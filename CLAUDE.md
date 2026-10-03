@@ -234,8 +234,11 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   (this project)**, `TPMS433` (spare) -- so the pod opens its dongle **by serial**:
   `--device=INST915` becomes `rtl_sdr -d INST915`. Never select by index: it follows
   enumeration order, so an index can land on the gas meter's or the TPMS dongle. `rtl_test -d 99`
-  lists index + serial without opening anything. Gain 37.2 / squelch 12 carried over
-  from the V4 (same R820T-family gain table) and has not been re-measured on the V3.
+  lists index + serial without opening anything. **Gain 28.0** (was the V4's 37.2),
+  from `tools/sdr_gain_sweep.py` on 2026-10-03: 19.7-37.2 is a plateau, 12.5 and >=42.1
+  lose messages; 28.0 beat 37.2 in three paired runs (95.5% vs 93.3% of 223 messages,
+  fewer failed syncs, 70% clipped instead of 95%). Re-run the sweep after moving the
+  antenna or changing dongles: record with the pod stopped, score against the mesh log.
   First light: every hop of two Get-Engine exchanges at 16-34 dB symbol SNR, including
   the marginal loft KPL `2B.A0.AB` at ~20 dB. Most of the V4 notes below apply to it.
 - **The network is at ~914.990 MHz, not 914.950** -- the "+33-45 kHz" the V4 saw was
