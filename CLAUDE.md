@@ -239,6 +239,12 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   lose messages; 28.0 beat 37.2 in three paired runs (95.5% vs 93.3% of 223 messages,
   fewer failed syncs, 70% clipped instead of 95%). Re-run the sweep after moving the
   antenna or changing dongles: record with the pod stopped, score against the mesh log.
+  **First day (2026-10-04): the V3 matches the V4.** Device-sent messages, scored
+  against dongle ∪ SDR so both eras share a reference: V3 79.2% vs V4 78.6% (weak
+  devices 71.9% vs 69.7%, others 86.1% vs 87.9%); each adds ~16% the dongle missed.
+  The retune + gain change did not show up as a gain beyond that noise. Score against a
+  *fixed* receiver set: "% of all fused events" moves whenever any receiver drops out
+  (the Heltec went near-deaf at 12:00 on 10-03, which made dongle+V3 read 99.9%).
   First light: every hop of two Get-Engine exchanges at 16-34 dB symbol SNR, including
   the marginal loft KPL `2B.A0.AB` at ~20 dB. Most of the V4 notes below apply to it.
 - **The network is at ~914.990 MHz, not 914.950** -- the "+33-45 kHz" the V4 saw was
