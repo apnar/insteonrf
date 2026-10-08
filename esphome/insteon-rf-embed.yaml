@@ -218,7 +218,9 @@ display:
       width: 170
       height: 320
       offset_width: 35
-    rotation: 90
+    # 270, not 90: at 90 the GUI is upside down with the knob on the right
+    # (confirmed on the board, 2026-10-08).
+    rotation: 270
     update_interval: 1s
     pages:
       # The placement survey: carry the board around and watch these.
@@ -323,6 +325,131 @@ binary_sensor:
     on_press:
       - light.toggle: backlight
 
+# ---------------------------------------------------------------- live tuning
+
+# For A/B tests from Home Assistant without a reflash: each change is staged
+# and the radio task reprograms the chip between captures. Not restored
+# across a reboot on purpose -- a reboot returns to the YAML above, which is
+# the setting that won. Record results in Doc/T-EMBED.md, then bake the
+# winner into the YAML.
+number:
+  - platform: template
+    id: tune_freq_offset
+    name: ${friendly_name} Tune Frequency Offset
+    entity_category: config
+    unit_of_measurement: kHz
+    min_value: -60
+    max_value: 60
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->tune_frequency(914990000 + (int32_t) (x * 1000));'
+  - platform: template
+    id: tune_bandwidth
+    name: ${friendly_name} Tune Bandwidth
+    entity_category: config
+    unit_of_measurement: kHz
+    min_value: 58
+    max_value: 812
+    step: 1
+    initial_value: 203
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->tune_bandwidth((uint32_t) (x * 1000));'
+  - platform: template
+    id: tune_lna
+    name: ${friendly_name} Tune LNA Gain Reduction
+    entity_category: config
+    min_value: 0
+    max_value: 7
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->tune_max_lna_gain((uint8_t) x);'
+  - platform: template
+    id: tune_cs
+    name: ${friendly_name} Tune Carrier Sense Threshold
+    entity_category: config
+    unit_of_measurement: dB
+    min_value: -8
+    max_value: 7
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->tune_carrier_sense_abs((int8_t) x);'
+
+  # Raw register override: value = address * 256 + byte, e.g. 0x1D91 =
+  # 7569 writes AGCCTRL0 = 0x91. 65535 clears every override. For trying
+  # modem settings that have no knob of their own.
+  - platform: template
+    id: tune_reg
+    name: ${friendly_name} Tune Register
+    entity_category: config
+    min_value: 0
+    max_value: 65535
+    step: 1
+    initial_value: 65535
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->tune_register(((uint32_t) x >> 8) & 0xFF, (uint32_t) x & 0xFF);'
+
+select:
+  - platform: template
+    id: tune_sync
+    name: ${friendly_name} Tune Sync Mode
+    entity_category: config
+    options: ["16/16 + carrier", "15/16 + carrier", "16/16", "15/16"]
+    initial_option: "16/16 + carrier"
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: |-
+          static const uint8_t modes[] = {6, 5, 2, 1};
+          auto idx = id(tune_sync).index_of(x);
+          if (idx.has_value()) id(rf)->tune_sync_mode(modes[*idx]);
+  - platform: template
+    id: tune_syncword
+    name: ${friendly_name} Tune Sync Word
+    entity_category: config
+    options: ["3155", "CEAA"]
+    initial_option: "3155"
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->tune_sync_word(x == "CEAA" ? 0xCEAA : 0x3155);'
+  - platform: template
+    id: tune_band
+    name: ${friendly_name} Tune Band Switch
+    entity_category: config
+    options: ["auto", "315", "433", "915"]
+    initial_option: "auto"
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: |-
+          auto idx = id(tune_band).index_of(x);
+          if (idx.has_value()) id(rf)->tune_band((uint8_t) *idx);
+  - platform: template
+    id: tune_atten
+    name: ${friendly_name} Tune RX Attenuation
+    entity_category: config
+    options: ["0dB", "6dB", "12dB", "18dB"]
+    initial_option: "0dB"
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: |-
+          auto idx = id(tune_atten).index_of(x);
+          if (idx.has_value()) id(rf)->tune_rx_attenuation((uint8_t) *idx);
+
 # ---------------------------------------------------------------- battery
 
 # BQ27220 fuel gauge, read directly: StateOfCharge 0x2C (%), Voltage 0x08
@@ -406,6 +533,18 @@ text_sensor:
     lambda: 'return {ESPHOME_PROJECT_VERSION};'
 
 button:
+  # Peak RSSI per frequency step, logged at INFO. Captures stop while it
+  # runs; generate traffic (get_engine to a nearby device) meanwhile.
+  - platform: template
+    name: ${friendly_name} Scan Wide
+    entity_category: diagnostic
+    on_press:
+      - lambda: 'id(rf)->request_scan(860000000, 960000000, 500000, 150);'
+  - platform: template
+    name: ${friendly_name} Scan Narrow
+    entity_category: diagnostic
+    on_press:
+      - lambda: 'id(rf)->request_scan(914500000, 915500000, 25000, 600);'
   - platform: restart
     name: ${friendly_name} Restart
     entity_category: diagnostic

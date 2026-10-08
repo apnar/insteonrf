@@ -125,7 +125,7 @@ dependency. Then, depending on what you want to do:
 | Receive and transmit live | rfcat dongle: a CC1111 running rfcat firmware (e.g. a Yard Stick One) | `rflib`, from git |
 | Receive with an SDR | rtl-sdr dongle, or a HackRF | `rtl_sdr` or `hackrf_transfer` on `PATH` |
 | Transmit with an SDR | HackRF | `hackrf_transfer` |
-| Receive on a small board, anywhere in the house | Heltec LoRa 32 V3, or any ESP32 + SX1262 | ESPHome; see [`esphome/`](esphome/) |
+| Receive on a small board, anywhere in the house | LilyGO T-Embed CC1101 (or any ESP32 + CC1101); an ESP32 + SX1262 also works | ESPHome; see [`esphome/`](esphome/) and [`Doc/T-EMBED.md`](Doc/T-EMBED.md) |
 | Run several at once and compare | any two of the above | an MQTT broker |
 
 An **RTL-SDR Blog V4** needs that project's fork of librtlsdr, not Osmocom's:
@@ -557,22 +557,32 @@ and highest value), then `group`, then `state`.
 
 ### The ESPHome listener boards
 
-`esphome/components/insteon_rf/` is an external component for the Heltec LoRa
-32 V3 (ESP32-S3 + SX1262), receive only, no external library, building under
-esp-idf. The SX1262 has no continuous-bitstream mode — the SX127x family
-exposes DATA and DCLK pins for that and SX126x dropped it — so GFSK packet
-mode is used as a raw bit recorder: sync word set to the invariant start of
-every Insteon packet, preamble detector off, CRC off, whitening off, fixed
-162-byte payload (sized to the 50 ms slot grid so no slot is cut in half). On-board, each capture must pass a **Manchester-validity
-gate**: 26 of every 28 on-air bits are Manchester pairs, and a valid pair is
-only `01` or `10`, so noise fails within a handful of bits. That is what makes
-running with the preamble detector off viable in a crowded 915 MHz band.
+`esphome/components/insteon_rf/` is an external component for ESPHome
+listener boards, receive only, no external library, building under esp-idf.
+Two radios, chosen with `radio:`:
 
-**Status: running.** First flashed 2026-09-19 a few feet from the PLM, and it
-received Insteon on the first probe — a CRC-valid Get Engine Version at
--92.5 dBm. Packet-mode sync with the preamble detector off works, and the
-default polarity is right, which were the two assumptions the whole approach
-rested on. It has been publishing to the mesh since.
+- **`cc1101`, the LilyGO T-Embed CC1101** (live since 2026-10-08,
+  [`Doc/T-EMBED.md`](Doc/T-EMBED.md)). The CC1101 is the radio half of the
+  CC1111 in the rfcat dongle, so it runs the dongle's own modem registers.
+  Its 64-byte FIFO is shorter than a capture, so a FreeRTOS task drains it
+  while the packet arrives and hands whole captures to the main loop.
+- **`sx1262`, the Heltec LoRa 32 V3** (2026-09-19 to 2026-10-08, retired;
+  its config is in `esphome/retired/`). The SX1262 has no
+  continuous-bitstream mode, so GFSK packet mode is used as a raw bit
+  recorder.
+
+Either way the radio syncs on the invariant start of every Insteon packet
+and records a fixed 162 bytes after it -- sized to the 50 ms slot grid so no
+slot is cut in half -- with CRC, whitening and address filtering off. On-board,
+each capture must pass a **Manchester-validity gate**: 26 of every 28 on-air
+bits are Manchester pairs, and a valid pair is only `01` or `10`, so noise
+fails within a handful of bits. That is what makes syncing on a short word
+viable in a crowded 915 MHz band.
+
+#### The Heltec, for the record
+
+First flashed 2026-09-19 a few feet from the PLM, it received Insteon on the
+first probe -- a CRC-valid Get Engine Version at -92.5 dBm.
 
 Two things the first hour taught, both now handled: the radio *consumes* the
 sync word, so captures arrive without their start header and the host has to
@@ -589,7 +599,7 @@ A/Bs on 2026-09-28 -- one-slot captures, the preamble detector, the gate off,
 a 16-bit sync word -- left it the same or worse (CHANGELOG 2.8.2). What is
 left is where it sits: beside the PLM, in the middle of the simulcast.
 
-The board reports its own firmware version as a sensor, matching
+Every board reports its own firmware version as a sensor, matching
 `insteonrf/_version.py`, because ESPHome's build timestamp only moves when the
 config hash changes — a reflash of unchanged config is otherwise invisible.
 

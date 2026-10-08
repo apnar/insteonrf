@@ -156,6 +156,51 @@ class InsteonRFCC1101 : public InsteonRF,
   void set_sync_mode(uint8_t mode) { this->sync_mode_ = mode; }
   void set_rx_attenuation(uint8_t code) { this->rx_attenuation_ = code; }
   void set_max_lna_gain(uint8_t code) { this->max_lna_gain_ = code; }
+  void set_carrier_sense_abs(int8_t thr) { this->carrier_sense_abs_ = thr; }
+
+  // -- live tuning, from loop() (template numbers/selects in YAML). The
+  // values are staged here and the radio task reprograms the chip between
+  // captures, so an A/B test needs no reflash.
+  void tune_frequency(uint32_t hz) { this->frequency_hz_ = hz; this->request_reconfig_(); }
+  void tune_bandwidth(uint32_t hz) { this->bandwidth_hz_ = hz; this->request_reconfig_(); }
+  void tune_sync_mode(uint8_t mode) { this->sync_mode_ = mode; this->request_reconfig_(); }
+  void tune_rx_attenuation(uint8_t code) { this->rx_attenuation_ = code; this->request_reconfig_(); }
+  void tune_max_lna_gain(uint8_t code) { this->max_lna_gain_ = code; this->request_reconfig_(); }
+  void tune_carrier_sense_abs(int8_t thr) { this->carrier_sense_abs_ = thr; this->request_reconfig_(); }
+  void tune_sync_word(uint16_t word) { this->sync_word_ = word; this->request_reconfig_(); }
+  /// Drive the band switch directly: 0 = from the frequency (normal),
+  /// 1 = 315 MHz path, 2 = 433 MHz path, 3 = 868/915 MHz path.
+  void tune_band(uint8_t band) { this->band_override_ = band; this->request_reconfig_(); }
+  /// Sweep [start, stop] in `step` Hz, dwelling `dwell_ms` per step, and log
+  /// the peak RSSI per step at INFO. Generate traffic while it runs.
+  void request_scan(uint32_t start, uint32_t stop, uint32_t step, uint32_t dwell_ms) {
+    this->scan_start_ = start;
+    this->scan_stop_ = stop;
+    this->scan_step_ = step;
+    this->scan_dwell_ms_ = dwell_ms;
+    this->scan_requested_ = true;
+  }
+  /// Override one configuration register (0x00-0x2E) on top of the
+  /// computed configuration, until reboot; addr 0xFF clears all overrides.
+  void tune_register(uint8_t addr, uint8_t value) {
+    if (addr == 0xFF) {
+      this->overrides_n_ = 0;
+    } else if (addr <= 0x2E) {
+      uint8_t i = 0;
+      while (i < this->overrides_n_ && this->overrides_[i][0] != addr)
+        i++;
+      if (i < sizeof(this->overrides_) / sizeof(this->overrides_[0])) {
+        this->overrides_[i][0] = addr;
+        this->overrides_[i][1] = value;
+        if (i == this->overrides_n_)
+          this->overrides_n_++;
+      }
+    }
+    this->request_reconfig_();
+  }
+  uint32_t get_frequency() const { return this->frequency_hz_; }
+  uint32_t get_bandwidth() const { return this->bandwidth_hz_; }
+  uint8_t get_sync_mode() const { return this->sync_mode_; }
 
  protected:
   // -- SPI plumbing. After setup() only the radio task calls these.
@@ -167,6 +212,11 @@ class InsteonRFCC1101 : public InsteonRF,
   void read_fifo_(uint8_t *out, size_t n);
 
   bool configure_radio_();
+  void request_reconfig_() { this->reconfig_requested_ = true; }
+  bool verify_registers_();
+  void apply_band_switch_();
+  void program_frequency_(uint32_t hz);
+  void run_scan_();
   void restart_rx_();
   static float rssi_dbm_(uint8_t raw) { return (float) (int8_t) raw / 2.0f - 74.0f; }
 
@@ -186,6 +236,9 @@ class InsteonRFCC1101 : public InsteonRF,
   uint8_t sync_mode_{6};  // 16/16 + carrier sense, as the dongle
   uint8_t rx_attenuation_{0};
   uint8_t max_lna_gain_{0};
+  // AGCCTRL1.CARRIER_SENSE_ABS_THR, signed dB relative to MAGN_TARGET;
+  // -8 disables the absolute threshold. 0 is the dongle's setting.
+  int8_t carrier_sense_abs_{0};
 
   // What configure_radio_() actually programmed, for dump_config().
   float actual_bitrate_{0};
@@ -212,6 +265,28 @@ class InsteonRFCC1101 : public InsteonRF,
   std::atomic<uint32_t> stalls_{0};
   std::atomic<uint32_t> recoveries_{0};
   std::atomic<uint8_t> last_bad_state_{0};
+  std::atomic<uint32_t> syncs_{0};        // GDO0 rising edges: sync words matched
+  std::atomic<uint32_t> reconfigs_{0};    // chip found with lost settings, reprogrammed
+  std::atomic<uint8_t> diag_state_{0};    // MARCSTATE at the last health check
+  std::atomic<uint8_t> diag_rssi_{0};     // raw RSSI at the last health check
+  std::atomic<uint8_t> diag_rxbytes_{0};
+  std::atomic<bool> reconfig_requested_{false};
+  std::atomic<bool> scan_requested_{false};
+  std::atomic<bool> hard_reset_requested_{false};
+  std::atomic<uint32_t> hard_resets_{0};
+  uint8_t deaf_minutes_{0};
+  uint32_t accepted_at_diag_{0};
+  std::atomic<uint8_t> diag_rssi_max_{0x80};  // peak raw RSSI since the last status line
+  std::atomic<bool> diag_rssi_reset_{false};
+  uint8_t band_override_{0};
+  uint8_t overrides_[12][2]{};
+  uint8_t overrides_n_{0};
+  uint32_t scan_start_{0}, scan_stop_{0}, scan_step_{0}, scan_dwell_ms_{0};
+  bool gdo0_was_high_{false};
+  uint32_t last_verify_ms_{0};
+  uint32_t last_diag_log_ms_{0};
+  uint32_t syncs_at_diag_{0};
+  uint32_t captures_at_diag_{0};
   // loop()'s view of the above, to report changes.
   uint32_t overflows_seen_{0};
   uint32_t queue_drops_seen_{0};

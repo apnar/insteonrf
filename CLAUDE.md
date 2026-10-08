@@ -68,8 +68,9 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/inject.py` | what may be handed to insteon-mqtt: tiers, shadow mode, PLM-heard suppression, rate limits |
 | `insteonrf/mesh.py` | the mesh service and the miss table (`insteon-rf mesh`) |
 | `insteonrf/radio/mqtt.py` | listener-board captures over MQTT, also a `RadioBackend` |
-| `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, publish, counters), radios `sx1262.cpp` (Heltec) and `cc1101.cpp` (T-Embed), chosen by `radio:` |
-| `esphome/insteon-rf-main.yaml`, `esphome/insteon-rf-embed.yaml` | the Heltec LoRa 32 V3 and the LilyGO T-Embed CC1101 (`Doc/T-EMBED.md`) |
+| `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, publish, counters), radios `cc1101.cpp` (T-Embed, live) and `sx1262.cpp` (Heltec, retired 2026-10-08), chosen by `radio:` |
+| `esphome/insteon-rf-embed.yaml` | the LilyGO T-Embed CC1101 listener (`Doc/T-EMBED.md`); the Heltec's config is in `esphome/retired/` |
+| `tools/score_receivers.py` | score one receiver against a fixed reference set from the mesh event log, per time window (the A/B yardstick) |
 | `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/k8s/yaml/AGENTS.md` conventions) |
 | `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
 | `deploy/insteonrf-v3.yaml` | an RTL-SDR Blog V3 (serial `INST915`) as a third listener (`--mesh-capture=v3`), the only one producing soft decisions |
@@ -202,8 +203,8 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   `diagnostics()` (MARCSTATE, RSSI, firmware trace codes, SFRs, modem registers) is
   logged at start, on the `--diag-after` timer and on `SIGUSR1` —
   `kill -USR1 $(pgrep -f 'insteon-rf monitor')` from the host. To tell quiet air from a
-  deaf dongle, compare against the Heltec's per-minute `Captures` sensor or
-  `insteon-rf/rx/insteon-rf-main` on MQTT. **Never let a test or tool reset the dongle
+  deaf dongle, compare against the T-Embed's per-minute `Captures` sensor or
+  `insteon-rf/rx/insteon-rf-embed` on MQTT (the Heltec did this job until 2026-10-08). **Never let a test or tool reset the dongle
   while the pod holds it**: `tests/test_radio.py`'s `fake_radio` stubs both `usb_reset`
   and `external_usb_reset` because, for one afternoon, every `make check` knocked the
   pod's receiver over and looked like a flaky dongle. `bpftrace -e

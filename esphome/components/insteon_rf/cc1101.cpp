@@ -30,6 +30,17 @@ static const uint32_t STALL_US = 20000;
 // often to track temperature.
 static const uint32_t RECAL_MS = 15 * 60 * 1000;
 static const uint32_t HEALTH_MS = 1000;
+static const uint32_t VERIFY_MS = 60 * 1000;
+// A status line at INFO this often: the first thing to read when the board
+// is quiet and the other receivers are not.
+static const uint32_t DIAG_LOG_MS = 60 * 1000;
+// Strong signal on the air, yet nothing passes the gate, for this many
+// status lines running: the radio is deaf, whatever the reason. On the
+// first day the board sat for ~20 minutes syncing only on noise while the
+// dongle and the V3 decoded 20-90 packets a minute beside it, and the cause
+// was never found; this is the cure for any version of that.
+static const uint8_t DEAF_MINUTES = 5;
+static const float DEAF_PEAK_DBM = -80.0f;
 
 // --------------------------------------------------------------------- SPI plumbing
 
@@ -101,15 +112,11 @@ void InsteonRFCC1101::setup() {
   // nothing, which looks like a quiet house -- so it is set here, from the
   // frequency, rather than left to a YAML switch someone might forget.
   // LilyGO: SW1=1 SW0=0 315 MHz, SW1=1 SW0=1 433 MHz, SW1=0 SW0=1 868/915.
-  const bool sub_ghz_high = this->frequency_hz_ >= 779000000UL;
-  if (this->sw1_pin_ != nullptr) {
+  if (this->sw1_pin_ != nullptr)
     this->sw1_pin_->setup();
-    this->sw1_pin_->digital_write(!sub_ghz_high);
-  }
-  if (this->sw0_pin_ != nullptr) {
+  if (this->sw0_pin_ != nullptr)
     this->sw0_pin_->setup();
-    this->sw0_pin_->digital_write(this->frequency_hz_ >= 400000000UL);
-  }
+  this->apply_band_switch_();
 
   // The chip is on a switched supply (BOARD_PWR_EN), turned on at HARDWARE
   // priority; give the crystal time to start before the reset.
@@ -130,6 +137,13 @@ void InsteonRFCC1101::setup() {
   }
 
   this->restart_rx_();
+  // At INFO, not CONFIG: dump_config() is invisible at the INFO log level
+  // this board runs at, and this is the line bring-up needs.
+  ESP_LOGI(TAG, "CC1101 v0x%02X: %.3f MHz, %.1f baud, dev %.1f kHz, BW %.1f kHz, sync 0x%04X mode %u, "
+                "MARCSTATE 0x%02X",
+           this->chip_version_, this->frequency_hz_ / 1e6f, this->actual_bitrate_, this->actual_deviation_hz_ / 1000.0f,
+           this->actual_bandwidth_hz_ / 1000.0f, (unsigned) this->sync_word_, (unsigned) this->sync_mode_,
+           (unsigned) (this->read_status_(CC_MARCSTATE) & 0x1F));
   this->radio_ok_ = true;
   this->last_minute_mark_ = millis();
   this->last_recal_ms_ = millis();
@@ -145,6 +159,61 @@ void InsteonRFCC1101::setup() {
     this->radio_ok_ = false;
     this->mark_failed();
   }
+}
+
+void InsteonRFCC1101::apply_band_switch_() {
+  // LilyGO: SW1=1 SW0=0 315 MHz, SW1=1 SW0=1 433 MHz, SW1=0 SW0=1 868/915.
+  uint8_t band = this->band_override_;
+  if (band == 0)
+    band = this->frequency_hz_ >= 779000000UL ? 3 : this->frequency_hz_ >= 400000000UL ? 2 : 1;
+  const bool sw1 = band == 1 || band == 2;
+  const bool sw0 = band == 2 || band == 3;
+  if (this->sw1_pin_ != nullptr)
+    this->sw1_pin_->digital_write(sw1);
+  if (this->sw0_pin_ != nullptr)
+    this->sw0_pin_->digital_write(sw0);
+}
+
+void InsteonRFCC1101::program_frequency_(uint32_t hz) {
+  const uint32_t freq = (uint32_t) llround((double) hz * 65536.0 / CC1101_XTAL_HZ);
+  this->write_reg_(CC_FREQ2, (freq >> 16) & 0xFF);
+  this->write_reg_(CC_FREQ1, (freq >> 8) & 0xFF);
+  this->write_reg_(CC_FREQ0, freq & 0xFF);
+}
+
+void InsteonRFCC1101::run_scan_() {
+  // Runs on the radio task: captures stop for the duration. Each step is
+  // IDLE -> program -> RX (autocalibrates) -> sample RSSI every ms.
+  ESP_LOGI(TAG, "scan %.3f-%.3f MHz step %.1f kHz dwell %u ms", this->scan_start_ / 1e6f, this->scan_stop_ / 1e6f,
+           this->scan_step_ / 1000.0f, (unsigned) this->scan_dwell_ms_);
+  char line[160];
+  size_t pos = 0;
+  for (uint32_t f = this->scan_start_; f <= this->scan_stop_; f += this->scan_step_) {
+    this->strobe_(CC_SIDLE);
+    delayMicroseconds(200);
+    this->program_frequency_(f);
+    this->strobe_(CC_SFRX);
+    this->strobe_(CC_SRX);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    uint8_t peak = 0x80;  // most negative
+    const uint32_t t0 = millis();
+    while (millis() - t0 < this->scan_dwell_ms_) {
+      const uint8_t r = this->read_status_(CC_RSSI);
+      if ((int8_t) r > (int8_t) peak)
+        peak = r;
+      vTaskDelay(1);
+    }
+    pos += snprintf(line + pos, sizeof(line) - pos, " %.3f:%.0f", f / 1e6f, rssi_dbm_(peak));
+    if (pos > sizeof(line) - 20) {
+      ESP_LOGI(TAG, "scan%s", line);
+      pos = 0;
+    }
+  }
+  if (pos)
+    ESP_LOGI(TAG, "scan%s", line);
+  ESP_LOGI(TAG, "scan done");
+  this->program_frequency_(this->frequency_hz_);
+  this->restart_rx_();
 }
 
 bool InsteonRFCC1101::configure_radio_() {
@@ -199,10 +268,8 @@ bool InsteonRFCC1101::configure_radio_() {
   this->write_reg_(CC_FSCTRL1, 0x06);
   this->write_reg_(CC_FSCTRL0, 0x00);
 
-  const uint32_t freq = (uint32_t) llround((double) this->frequency_hz_ * 65536.0 / CC1101_XTAL_HZ);
-  this->write_reg_(CC_FREQ2, (freq >> 16) & 0xFF);
-  this->write_reg_(CC_FREQ1, (freq >> 8) & 0xFF);
-  this->write_reg_(CC_FREQ0, freq & 0xFF);
+  this->program_frequency_(this->frequency_hz_);
+  this->apply_band_switch_();
 
   // Channel filter: the smallest step at or above the request.
   // BW = f_xtal / (8 * (4 + M) * 2^E).
@@ -271,7 +338,9 @@ bool InsteonRFCC1101::configure_radio_() {
   this->write_reg_(CC_FOCCFG, 0x17);
   this->write_reg_(CC_BSCFG, 0x6E);
   this->write_reg_(CC_AGCCTRL2, ((this->max_lna_gain_ & 0x07) << 3) | 0x03);
-  this->write_reg_(CC_AGCCTRL1, 0x40);
+  // AGC_LNA_PRIORITY 1, relative carrier sense off, absolute threshold
+  // from YAML (0 = at MAGN_TARGET, the dongle's setting; -8 = disabled).
+  this->write_reg_(CC_AGCCTRL1, 0x40 | ((uint8_t) this->carrier_sense_abs_ & 0x0F));
   this->write_reg_(CC_AGCCTRL0, 0x91);
 
   // Front end: SmartRF's low-data-rate RX current settings; PA unused.
@@ -286,6 +355,12 @@ bool InsteonRFCC1101::configure_radio_() {
   this->write_reg_(CC_TEST2, 0x81);
   this->write_reg_(CC_TEST1, 0x35);
   this->write_reg_(CC_TEST0, 0x09);
+
+  // Live-tuning overrides (tune_register), applied last so they win.
+  for (uint8_t i = 0; i < this->overrides_n_; i++) {
+    this->write_reg_(this->overrides_[i][0], this->overrides_[i][1]);
+    ESP_LOGI(TAG, "register 0x%02X overridden to 0x%02X", this->overrides_[i][0], this->overrides_[i][1]);
+  }
 
   this->strobe_(CC_SCAL);
   delay(2);
@@ -311,13 +386,37 @@ void InsteonRFCC1101::task_loop_() {
   const bool have_gdo = this->gdo0_pin_ != nullptr && this->gdo2_pin_ != nullptr;
   for (;;) {
     const uint32_t now_ms = millis();
+    if (this->scan_requested_.exchange(false))
+      this->run_scan_();
+    if (this->hard_reset_requested_.exchange(false)) {
+      this->strobe_(CC_SRES);
+      vTaskDelay(pdMS_TO_TICKS(5));
+      this->configure_radio_();
+      this->restart_rx_();
+      this->hard_resets_++;
+    }
+    if (this->reconfig_requested_.exchange(false)) {
+      this->configure_radio_();
+      this->restart_rx_();
+    }
     bool want = !have_gdo;
     if (have_gdo) {
+      const bool sync = this->gdo0_pin_->digital_read();
+      if (sync && !this->gdo0_was_high_)
+        this->syncs_++;
+      this->gdo0_was_high_ = sync;
       // GDO2 high: at least 8 bytes waiting. GDO0 low with a capture under
       // way: it has ended and its tail (< 8 bytes) is waiting.
       want = this->gdo2_pin_->digital_read() || (this->got_ > 0 && !this->gdo0_pin_->digital_read());
       if (now_ms - this->last_drain_ms_ >= SPI_FALLBACK_POLL_MS)
         want = true;
+    }
+    if (this->diag_rssi_reset_.exchange(false))
+      this->diag_rssi_max_ = 0x80;
+    {
+      const uint8_t r = this->read_status_(CC_RSSI);
+      if ((int8_t) r > (int8_t) this->diag_rssi_max_.load())
+        this->diag_rssi_max_ = r;
     }
     if (want) {
       this->drain_();
@@ -326,6 +425,17 @@ void InsteonRFCC1101::task_loop_() {
     if (now_ms - this->last_health_ms_ >= HEALTH_MS) {
       this->health_check_();
       this->last_health_ms_ = now_ms;
+    }
+    if (now_ms - this->last_verify_ms_ >= VERIFY_MS) {
+      // A brown-out or a glitch on the switched rail resets the chip to its
+      // defaults -- 433 MHz-ish, a different sync word -- and it then sits
+      // happily in RX hearing nothing. Only a readback can tell.
+      if (!this->verify_registers_()) {
+        this->reconfigs_++;
+        this->configure_radio_();
+        this->restart_rx_();
+      }
+      this->last_verify_ms_ = now_ms;
     }
     vTaskDelay(pdMS_TO_TICKS(have_gdo ? 1 : SPI_POLL_MS));
   }
@@ -395,8 +505,20 @@ void InsteonRFCC1101::drain_() {
   this->last_seen_ = (uint32_t) this->got_ + avail;
 }
 
+bool InsteonRFCC1101::verify_registers_() {
+  const uint8_t sync1 = (this->sync_word_ >> 8) & 0xFF;
+  const uint8_t sync0 = this->sync_word_ & 0xFF;
+  return this->read_reg_(CC_SYNC1) == sync1 && this->read_reg_(CC_SYNC0) == sync0 &&
+         this->read_reg_(CC_PKTLEN) == this->capture_bytes_ &&
+         (this->read_reg_(CC_MDMCFG2) & 0x07) == (this->sync_mode_ & 0x07) &&
+         this->read_reg_(CC_TEST2) == 0x81;
+}
+
 void InsteonRFCC1101::health_check_() {
   const uint8_t state = this->read_status_(CC_MARCSTATE) & 0x1F;
+  this->diag_state_ = state;
+  this->diag_rssi_ = this->read_status_(CC_RSSI);
+  this->diag_rxbytes_ = this->read_status_(CC_RXBYTES);
   if (state == CC_MARC_RXFIFO_OVERFLOW) {
     this->overflows_++;
     this->restart_rx_();
@@ -461,6 +583,34 @@ void InsteonRFCC1101::loop() {
     ESP_LOGW(TAG, "radio left RX (MARCSTATE 0x%02X); re-armed (%u total)", (unsigned) this->last_bad_state_.load(),
              (unsigned) recoveries);
     this->recoveries_seen_ = recoveries;
+  }
+
+  const uint32_t now_ms = millis();
+  if (now_ms - this->last_diag_log_ms_ >= DIAG_LOG_MS) {
+    const uint32_t syncs = this->syncs_.load();
+    ESP_LOGI(TAG,
+             "radio: MARCSTATE 0x%02X, RSSI %.1f dBm (peak %.1f), RXBYTES 0x%02X; last %us: %u syncs, %u captures, "
+             "%u accepted total; overflows %u, stalls %u, re-arms %u, reprogrammed %u, deaf resets %u",
+             (unsigned) this->diag_state_.load(), rssi_dbm_(this->diag_rssi_.load()),
+             rssi_dbm_(this->diag_rssi_max_.load()),
+             (unsigned) this->diag_rxbytes_.load(), (unsigned) ((now_ms - this->last_diag_log_ms_) / 1000),
+             (unsigned) (syncs - this->syncs_at_diag_), (unsigned) (this->captures_ - this->captures_at_diag_),
+             (unsigned) this->accepted_, (unsigned) overflows, (unsigned) stalls, (unsigned) recoveries,
+             (unsigned) this->reconfigs_.load(), (unsigned) this->hard_resets_.load());
+    const bool loud = rssi_dbm_(this->diag_rssi_max_.load()) >= DEAF_PEAK_DBM;
+    const bool none = this->accepted_ == this->accepted_at_diag_;
+    this->deaf_minutes_ = (loud && none) ? this->deaf_minutes_ + 1 : 0;
+    if (this->deaf_minutes_ >= DEAF_MINUTES) {
+      ESP_LOGW(TAG, "deaf: signal up to %.0f dBm for %u minutes and nothing passed the gate; resetting the CC1101",
+               rssi_dbm_(this->diag_rssi_max_.load()), (unsigned) this->deaf_minutes_);
+      this->hard_reset_requested_ = true;
+      this->deaf_minutes_ = 0;
+    }
+    this->accepted_at_diag_ = this->accepted_;
+    this->syncs_at_diag_ = syncs;
+    this->diag_rssi_reset_ = true;
+    this->captures_at_diag_ = this->captures_;
+    this->last_diag_log_ms_ = now_ms;
   }
 
   // FREQEST is in steps of f_xtal / 2^14 = 1.587 kHz.

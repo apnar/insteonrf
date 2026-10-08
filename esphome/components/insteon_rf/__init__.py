@@ -43,6 +43,7 @@ CONF_BANDWIDTH = "bandwidth"
 CONF_SYNC_MODE = "sync_mode"
 CONF_RX_ATTENUATION = "rx_attenuation"
 CONF_MAX_LNA_GAIN_REDUCTION = "max_lna_gain_reduction"
+CONF_CARRIER_SENSE_THRESHOLD = "carrier_sense_threshold"
 CONF_SYNC_WORD = "sync_word"
 CONF_SYNC_WORD_BITS = "sync_word_bits"
 CONF_PREAMBLE_DETECTOR = "preamble_detector_bits"
@@ -201,6 +202,10 @@ CC1101_SCHEMA = (
             ),
             # AGCCTRL2.MAX_LNA_GAIN: 0 = full LNA gain, each step backs it off.
             cv.Optional(CONF_MAX_LNA_GAIN_REDUCTION, default=0): cv.int_range(min=0, max=7),
+            # AGCCTRL1.CARRIER_SENSE_ABS_THR in dB relative to MAGN_TARGET,
+            # used by the "+ carrier" sync modes; -8 disables it. 0 is the
+            # dongle's setting.
+            cv.Optional(CONF_CARRIER_SENSE_THRESHOLD, default=0): cv.int_range(min=-8, max=7),
         }
     )
     .extend(spi.spi_device_schema(cs_pin_required=True))
@@ -244,6 +249,7 @@ async def to_code(config):
         cg.add(var.set_sync_mode(config[CONF_SYNC_MODE]))
         cg.add(var.set_rx_attenuation(config[CONF_RX_ATTENUATION]))
         cg.add(var.set_max_lna_gain(config[CONF_MAX_LNA_GAIN_REDUCTION]))
+        cg.add(var.set_carrier_sense_abs(config[CONF_CARRIER_SENSE_THRESHOLD]))
         return
 
     reset = await cg.gpio_pin_expression(config[CONF_RESET_PIN])
