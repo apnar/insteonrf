@@ -4,7 +4,33 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
-## Unreleased
+## 2.9.0 — 2026-10-08
+
+- **A fourth listener: the LilyGO T-Embed CC1101 / CC1101 Plus**
+  (`esphome/insteon-rf-embed.yaml`, receiver `insteon-rf-embed`; `Doc/T-EMBED.md`).
+  The CC1101 is the CC1111 dongle's modem, so it runs the dongle's own registers
+  (sync `0x3155` 16/16 + carrier sense, 76.2 kHz deviation, FOCCFG/BSCFG/AGC/TEST
+  verbatim), rescaled to a 26 MHz crystal and tuned to 914.990 MHz. Its 64-byte FIFO
+  is 56 ms of air and a capture is 162 bytes, so a FreeRTOS task drains it while the
+  packet arrives, on GDO2/GDO0 edges, and hands whole captures to `loop()` through a
+  queue -- the display shares the SPI bus and must not be able to starve it. Captures
+  are stamped from the FIFO byte count (< 0.9 ms), RSSI and the carrier offset are
+  sampled while the synced packet is still on the air, and overflows, stalls and
+  radios found outside RX are re-armed and counted.
+- **`insteon_rf` takes `radio: sx1262 | cc1101`**, default `sx1262`, so the Heltec's
+  config is unchanged. The gate, RSSI floor, MQTT payload, counters and display
+  read-outs moved into a shared base class (`insteon_rf.cpp`); the SX1262 driver is
+  `sx1262.cpp`. Its captures are stamped in microseconds now, and `us` in the payload
+  is the board clock at the capture's first bit rather than at publish.
+- **New sensors**: `lost_per_minute` (captures the radio lost before the gate) and
+  `frequency_offset` (CC1101 FREQEST, averaged over the minute's accepted packets).
+- **`tests/test_listener_firmware.py`**: the gate's bit layout checked against
+  `Packet.to_bits()` (strictly, for direct, broadcast and extended packets; 0 of 2000
+  noise captures pass), a three-slot CC1101 capture decoding message, hop and ACK,
+  `capture_bytes` pinned to the slot grid for 16- and 32-bit sync words, and the
+  T-Embed's pin map against LilyGO's. The version test covers every listener firmware.
+
+Also in this release:
 
 - **`--device <serial>` for the SDR backends** (`rtl_sdr -d`, `hackrf_transfer -d`),
   for hosts with more than one RTL-SDR. This one now has three V3s; the index

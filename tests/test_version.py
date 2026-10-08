@@ -12,6 +12,8 @@ from __future__ import annotations
 import pathlib
 import re
 
+import pytest
+
 import insteonrf
 from insteonrf import _version
 
@@ -63,19 +65,28 @@ def test_the_version_module_imports_nothing():
     assert not re.search(r"^\s*(import|from)\s", src, re.MULTILINE)
 
 
-def test_the_listener_firmware_declares_the_same_version():
-    """The Heltec's firmware carries the repo version too.
+LISTENER_FIRMWARE = sorted((REPO / "esphome").glob("insteon-rf-*.yaml"))
+
+
+def test_there_is_listener_firmware_to_check():
+    assert LISTENER_FIRMWARE, "esphome/insteon-rf-*.yaml went missing"
+
+
+@pytest.mark.parametrize("path", LISTENER_FIRMWARE, ids=lambda p: p.name)
+def test_the_listener_firmware_declares_the_same_version(path):
+    """Every listener board's firmware carries the repo version too.
 
     ESPHome's own build_time_str only moves when the config hash changes, so
     a reflash of unchanged config keeps the original timestamp -- after an
-    OTA on 2026-09-23 the board was still announcing a build time from four
+    OTA on 2026-09-23 the Heltec was still announcing a build time from four
     days earlier. The project version is the marker that answers "is this
-    board running current code", so it has to track the package.
+    board running current code", so it has to track the package -- on every
+    board, the T-Embed included.
     """
-    yaml = (REPO / "esphome" / "insteon-rf-main.yaml").read_text(encoding="utf-8")
+    yaml = path.read_text(encoding="utf-8")
     m = re.search(r"^\s*project:\s*$\s*^\s*name:\s*\S+\s*$\s*^\s*version:\s*\"([^\"]+)\"",
                   yaml, re.MULTILINE)
-    assert m, "the listener firmware should declare esphome.project.version"
+    assert m, f"{path.name} should declare esphome.project.version"
     assert m.group(1) == insteonrf.__version__, (
-        "bump insteonrf/_version.py and the firmware's project version together"
+        "bump insteonrf/_version.py and every firmware's project version together"
     )

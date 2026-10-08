@@ -1,34 +1,30 @@
-// Insteon 915 MHz RF listener for the SX1262 (Heltec LoRa 32 V3).
+// Insteon 915 MHz RF listener: what every listener board shares.
 //
 // Receive only. There is exactly one transmitter on an Insteon network and it
-// is the PLM; a second one would collide with it. This component has no
+// is the PLM; a second one would collide with it. No radio driver here has a
 // transmit path at all, deliberately.
 //
-// How it works, and why it is unusual: the SX1262 has no continuous or
-// raw-bitstream mode (the SX127x family exposes DATA and DCLK pins for that;
-// SX126x dropped it). So GFSK packet mode is used as a raw bit recorder --
-// sync word set to the invariant start of every Insteon packet, preamble
-// detector off, CRC off, whitening off, address filtering off, fixed payload
-// length. The packet engine is just a shift register feeding the FIFO, so it
-// happily records a Manchester-coded payload with interleaved frame counters
-// that it understands nothing about. The host decodes it.
+// A radio driver's whole job is to hand process_capture_() the bytes that
+// followed the Insteon start header, plus the RSSI and the moment the first
+// of those bits was on the air. Everything after that -- the Manchester gate,
+// the RSSI floor, the MQTT payload and its timestamp, the counters, the
+// sensors and the read-outs for an on-board display -- lives here, so two
+// boards with different radios publish captures the host cannot tell apart
+// except by name.
 //
-// Insteon parameters: 914.95 MHz, 9124 baud, 75 kHz deviation, and 234.3 kHz
-// receive bandwidth (the nearest step above 2*75 + 9.1 kHz).
-//
-// Pins verified 2026-09-19 against Meshtastic's heltec_v3 variant: SCK 9,
-// MISO 11, MOSI 10, CS 8, RESET 12, BUSY 13, DIO1 14; TCXO on DIO3 at 1.8 V;
-// DIO2 drives the RF switch; DC-DC regulator.
+// Drivers:
+//   sx1262.h  Heltec LoRa 32 V3 (SX1262), GFSK packet mode as a bit recorder
+//   cc1101.h  LilyGO T-Embed CC1101 (CC1101), the CC1111 dongle's own modem
 
 #pragma once
 
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/helpers.h"
-#include "esphome/components/spi/spi.h"
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 #ifdef USE_SENSOR
 #include "esphome/components/sensor/sensor.h"
@@ -58,79 +54,33 @@ static const uint8_t INSTEON_SYNC_BITS = 32;
 // Insteon on-air parameters.
 static const uint32_t INSTEON_BITRATE = 9124;
 static const uint32_t INSTEON_DEVIATION_HZ = 75000;
-static const uint32_t SX126X_XTAL_HZ = 32000000;
 
-// SX126x opcodes (datasheet chapter 13).
-enum : uint8_t {
-  SX_SET_STANDBY = 0x80,
-  SX_SET_RX = 0x82,
-  SX_SET_RF_FREQUENCY = 0x86,
-  SX_SET_PACKET_TYPE = 0x8A,
-  SX_SET_MODULATION_PARAMS = 0x8B,
-  SX_SET_PACKET_PARAMS = 0x8C,
-  SX_SET_BUFFER_BASE = 0x8F,
-  SX_SET_DIO_IRQ_PARAMS = 0x08,
-  SX_GET_IRQ_STATUS = 0x12,
-  SX_GET_RX_BUFFER_STATUS = 0x13,
-  SX_CLEAR_IRQ_STATUS = 0x02,
-  SX_READ_BUFFER = 0x1E,
-  SX_WRITE_REGISTER = 0x0D,
-  SX_READ_REGISTER = 0x1D,
-  SX_GET_PACKET_STATUS = 0x14,
-  SX_GET_RSSI_INST = 0x15,
-  SX_SET_DIO2_RF_SWITCH = 0x9D,
-  SX_SET_DIO3_TCXO = 0x97,
-  SX_SET_REGULATOR_MODE = 0x96,
-  SX_CALIBRATE = 0x89,
-  SX_CALIBRATE_IMAGE = 0x98,
-  SX_GET_STATUS = 0xC0,
-};
+/// Microseconds of air for n bytes at the Insteon bit rate.
+inline uint32_t air_us(uint32_t nbytes) {
+  return (uint32_t) (((uint64_t) nbytes * 8ULL * 1000000ULL) / INSTEON_BITRATE);
+}
 
-// Sync word register block, 8 bytes.
-static const uint16_t SX_REG_SYNC_WORD_0 = 0x06C0;
-// RX gain: 0x94 power-saving (default), 0x96 boosted. A mains-powered
-// listener wants the boost.
-static const uint16_t SX_REG_RX_GAIN = 0x08AC;
-
-// GFSK receive bandwidth codes. 0x0A is 234.3 kHz.
-static const uint8_t SX_GFSK_BW_234_3 = 0x0A;
-
-// IRQ bits.
-static const uint16_t SX_IRQ_RX_DONE = 0x0002;
-static const uint16_t SX_IRQ_TIMEOUT = 0x0200;
-static const uint16_t SX_IRQ_ALL = 0xFFFF;
-
-class InsteonRF : public Component,
-                  public spi::SPIDevice<spi::BIT_ORDER_MSB_FIRST, spi::CLOCK_POLARITY_LOW,
-                                        spi::CLOCK_PHASE_LEADING, spi::DATA_RATE_8MHZ> {
+class InsteonRF : public Component {
  public:
-  void setup() override;
-  void loop() override;
-  void dump_config() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
-  void set_reset_pin(GPIOPin *pin) { this->reset_pin_ = pin; }
-  void set_busy_pin(GPIOPin *pin) { this->busy_pin_ = pin; }
-  void set_dio1_pin(GPIOPin *pin) { this->dio1_pin_ = pin; }
-  void set_frequency(uint32_t hz) { this->frequency_hz_ = hz; }
   void set_sync_word(uint32_t word) { this->sync_word_ = word; }
-  void set_sync_bits(uint8_t bits) { this->sync_bits_ = bits; }
-  void set_preamble_detector(uint8_t code) { this->preamble_detector_ = code; }
   void set_capture_bytes(uint8_t n) { this->capture_bytes_ = n; }
   void set_rssi_floor(float dbm) { this->rssi_floor_ = dbm; }
   void set_manchester_gate(uint8_t frames) { this->manchester_gate_ = frames; }
   void set_manchester_gate_errors(uint8_t n) { this->manchester_gate_errors_ = n; }
-  void set_tcxo_voltage(uint8_t code) { this->tcxo_voltage_ = code; }
-  void set_tcxo_delay_us(uint32_t us) { this->tcxo_delay_us_ = us; }
   void set_mqtt_topic(const std::string &topic) { this->mqtt_topic_ = topic; }
 
 #ifdef USE_SENSOR
   void set_last_rssi_sensor(sensor::Sensor *s) { this->last_rssi_sensor_ = s; }
   void set_captures_sensor(sensor::Sensor *s) { this->captures_sensor_ = s; }
   void set_accepted_sensor(sensor::Sensor *s) { this->accepted_sensor_ = s; }
+  // Only radios that measure these publish them (the CC1101 does).
+  void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
+  void set_lost_sensor(sensor::Sensor *s) { this->lost_sensor_ = s; }
 #endif
 
-  // -- read-outs for the on-board display (placement survey)
+  // -- read-outs for an on-board display (placement survey)
   bool radio_ok() const { return this->radio_ok_; }
   float last_rssi() const { return this->last_rssi_; }
   /// RSSI of the last capture that passed the gate, i.e. the last real
@@ -141,73 +91,67 @@ class InsteonRF : public Component,
   /// Counts over the previous whole minute, refreshed once a minute.
   uint32_t captures_last_minute() const { return this->captures_last_minute_; }
   uint32_t accepted_last_minute() const { return this->accepted_last_minute_; }
+  /// Captures the radio lost before the gate saw them, previous minute.
+  uint32_t lost_last_minute() const { return this->lost_last_minute_; }
+  /// Mean carrier offset of the previous minute's accepted packets, kHz;
+  /// NAN when the radio cannot measure it or nothing was accepted.
+  float frequency_offset_khz() const { return this->freq_offset_last_minute_; }
   /// Milliseconds since the last accepted capture, or UINT32_MAX if none.
   uint32_t ms_since_accepted() const {
     return this->last_accepted_ms_ ? millis() - this->last_accepted_ms_ : UINT32_MAX;
   }
 
  protected:
-  // -- SX126x plumbing
-  void wait_busy_(uint32_t timeout_ms = 100);
-  void cmd_(uint8_t opcode, const uint8_t *data, size_t len);
-  void read_cmd_(uint8_t opcode, uint8_t *out, size_t len);
-  void write_register_(uint16_t addr, const uint8_t *data, size_t len);
-  void read_register_(uint16_t addr, uint8_t *out, size_t len);
-  void read_buffer_(uint8_t offset, uint8_t *out, size_t len);
-  bool configure_radio_();
-  void start_rx_();
-  float read_rssi_();
+  /// Gate, filter and publish one capture. `buf` starts with the first bit
+  /// after the start header; `first_bit_us` is micros() when that bit was on
+  /// the air; `offset_khz` is the radio's carrier-offset estimate, or NAN.
+  void process_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us,
+                        float offset_khz = NAN);
+  /// Roll the per-minute counters and publish the rate sensors.
+  void tick_minute_();
+  /// The radio lost a capture (FIFO overflow, full hand-off queue, ...).
+  void count_lost_(uint32_t n = 1) { this->lost_ += n; }
+  void dump_common_config_();
 
-  // -- capture handling
-  void handle_capture_();
   bool manchester_gate_ok_(const uint8_t *buf, size_t len) const;
-  void publish_capture_(const uint8_t *buf, size_t len, float rssi);
+  void publish_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us);
 
-  GPIOPin *reset_pin_{nullptr};
-  GPIOPin *busy_pin_{nullptr};
-  GPIOPin *dio1_pin_{nullptr};
-
-  uint32_t frequency_hz_{914950000};
   uint32_t sync_word_{INSTEON_SYNC_WORD};
-  uint8_t sync_bits_{INSTEON_SYNC_BITS};
-  uint8_t preamble_detector_{0x00};  // off; see __init__.py for the codes
   uint8_t capture_bytes_{162};
   float rssi_floor_{-110.0f};
   uint8_t manchester_gate_{4};
   uint8_t manchester_gate_errors_{2};
-  uint8_t tcxo_voltage_{0x02};  // 1.8 V; Heltec V3 drives the TCXO from DIO3
-  uint32_t tcxo_delay_us_{5000};
   std::string mqtt_topic_{};
 
   bool radio_ok_{false};
   uint32_t seq_{0};
   uint32_t captures_{0};
   uint32_t accepted_{0};
+  uint32_t lost_{0};
   uint32_t last_minute_mark_{0};
   uint32_t captures_at_mark_{0};
   uint32_t accepted_at_mark_{0};
+  uint32_t lost_at_mark_{0};
   uint32_t captures_last_minute_{0};
   uint32_t accepted_last_minute_{0};
+  uint32_t lost_last_minute_{0};
+  float freq_offset_sum_{0.0f};
+  uint32_t freq_offset_n_{0};
+  float freq_offset_last_minute_{NAN};
   float last_rssi_{NAN};
   float last_accepted_rssi_{NAN};
   uint32_t last_accepted_ms_{0};
-  //: millis() when the last RxDone was seen, for stamping the capture with
-  //: when it was on the air rather than when it was published.
-  uint32_t rx_done_ms_{0};
-  //: Keeps loop() running flat out instead of every 16 ms, so RxDone is
-  //: noticed within a millisecond and the timestamp does not wander by a
-  //: loop period.
-  HighFrequencyLoopRequester high_freq_;
   //: The first few captures are logged at INFO with their leading bytes, so
   //: bring-up can be judged from the log alone: are captures arriving, does
   //: the gate pass them, does the polarity look right.
   uint8_t bringup_logged_{0};
-  uint8_t buffer_[256]{};
 
 #ifdef USE_SENSOR
   sensor::Sensor *last_rssi_sensor_{nullptr};
   sensor::Sensor *captures_sensor_{nullptr};
   sensor::Sensor *accepted_sensor_{nullptr};
+  sensor::Sensor *frequency_offset_sensor_{nullptr};
+  sensor::Sensor *lost_sensor_{nullptr};
 #endif
 };
 

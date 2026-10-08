@@ -1,0 +1,411 @@
+# Insteon RF listener node on a LilyGO T-Embed CC1101 / CC1101 Plus.
+# Receive only -- see Doc/MESH-PLAN.md and Doc/T-EMBED.md.
+#
+# Board: ESP32-S3-WROOM-1 (16 MB flash, 8 MB octal PSRAM) + CC1101, ST7789
+# 170x320 LCD, rotary encoder, PN532 NFC, BQ25896 charger + BQ27220 gauge,
+# 8 WS2812s; the Plus adds an nRF24L01 on the expansion header. Pins from
+# LilyGO's examples/utilities.h and docs/pinmap_cn.md (hardware
+# v1.0-240729/241103), checked 2026-10-08:
+#
+#   shared SPI   SCK 11, MOSI 9, MISO 10
+#   CC1101       CS 12, GDO0 3, GDO2 38; band switch SW1 47, SW0 48
+#   LCD          CS 41, DC 16, no reset, backlight 21 (AW9364)
+#   SD           CS 13            nRF24 (Plus)  CS 44, CE 43
+#   I2C          SDA 8, SCL 18 (PN532 0x24, BQ27220 0x55, BQ25896 0x6B)
+#   PN532        RSTPDN 45, IRQ 17
+#   encoder      A 4, B 5, push 0 (= BOOT)      user key 6
+#   BOARD_PWR_EN 15 -- switched 3.3 V rail: the CC1101 and the LEDs
+#
+# The radio is the CC1111 dongle's modem, configured as the dongle is, so
+# the sync word, bit polarity and modem settings are already proven on this
+# network -- unlike the Heltec bring-up, there should be nothing to flip.
+#
+# Bring-up: the first ten captures after boot are logged at INFO with their
+# leading bytes, the gate verdict and the carrier offset:
+#   - "CC1101 not responding" at boot -> PWR_EN, or CS/MISO
+#   - no captures at all while the dongle hears traffic -> check the log for
+#     "RF switch" pins, then try `sync_mode: 16/16` (carrier sense off)
+#   - captures arriving but "gate fail" on all of them -> send me the bytes
+#   - "gate PASS" -> it works; watch insteon-rf/rx/insteon-rf-embed
+#   - "RX FIFO overflow" warnings -> the radio task is being starved; raise
+#     the display's update_interval first
+#
+# Deliberately NOT including common/ble-proxy.yaml, for the same reason as
+# the Heltec: nothing that adds interrupt latency to the receive path.
+
+substitutions:
+  name: insteon-rf-embed
+  friendly_name: Insteon RF Embed
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  # Keep equal to insteonrf/_version.py; tests/test_version.py checks every
+  # listener firmware in esphome/. See insteon-rf-main.yaml for why.
+  project:
+    name: insteonrf.listener
+    version: "2.9.0"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+packages:
+  wifi: !include common/wifi.yaml
+
+# USB-Serial-JTAG, explicitly: GPIO43/44 (UART0) are the nRF24's CE/CS on
+# the Plus, and must stay ours.
+logger:
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  platform: esphome
+  password: !secret ota_pass
+
+# The mesh service consumes MQTT directly, not the HA API, so this node needs
+# both. Topic prefix is insteon-rf/ so it cannot collide with insteon-mqtt's
+# insteon/ prefix.
+mqtt:
+  broker: 192.168.88.5
+  username: !secret mqtt_user
+  password: !secret mqtt_pass
+  discovery: false
+  topic_prefix: insteon-rf/${name}
+
+time:
+  - platform: sntp
+    id: sntp_time
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [insteon_rf]
+
+# ---------------------------------------------------------------- board power
+
+# Pins that must be in a known state before anything touches the shared bus.
+# gpio switches set up at HARDWARE priority, ahead of the radio and display.
+switch:
+  # BOARD_PWR_EN: the CC1101's supply. Off = a radio that is not there.
+  - platform: gpio
+    id: pwr_en
+    internal: true
+    pin: GPIO15
+    restore_mode: ALWAYS_ON
+  # Chip selects of the other devices on the shared SPI bus, held inactive.
+  # A floating CS lets the SD card or the nRF24 drive MISO during a radio
+  # read, which corrupts it in ways that look like a bad radio.
+  - platform: gpio
+    id: sd_cs_idle
+    internal: true
+    pin: GPIO13
+    restore_mode: ALWAYS_ON
+  - platform: gpio
+    id: nrf24_cs_idle
+    internal: true
+    pin: GPIO44
+    restore_mode: ALWAYS_ON
+  # nRF24 CE low: standby, receiver off. Harmless on a board without one.
+  - platform: gpio
+    id: nrf24_ce_idle
+    internal: true
+    pin: GPIO43
+    restore_mode: ALWAYS_OFF
+  # PN532 RSTPDN low: held in power-down. Nothing here uses NFC.
+  - platform: gpio
+    id: pn532_off
+    internal: true
+    # Strapping pin (VDD_SPI), sampled only at reset; driving it after boot
+    # is what LilyGO's own firmware does.
+    pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_OFF
+
+# ---------------------------------------------------------------- the radio
+
+spi:
+  clk_pin: GPIO11
+  mosi_pin: GPIO9
+  miso_pin: GPIO10
+
+insteon_rf:
+  id: rf
+  radio: cc1101
+  cs_pin: GPIO12
+  # GPIO3 is a strapping pin (JTAG source), sampled only at reset; the
+  # CC1101 drives it low while idle, which is the default state anyway.
+  gdo0_pin:
+    number: GPIO3
+    ignore_strapping_warning: true
+  gdo2_pin: GPIO38
+  sw0_pin: GPIO48
+  sw1_pin: GPIO47
+  # Where the V3 measured the network. Adjust by the Frequency Offset sensor.
+  frequency: 914.99MHz
+  bandwidth: 203kHz
+  sync_word: 0x3155
+  sync_mode: 16/16 + carrier
+  rx_attenuation: 0dB
+  capture_bytes: 162
+  rssi_floor: -110
+  manchester_gate: 4
+  mqtt_topic: insteon-rf/rx/${name}
+
+# ---------------------------------------------------------------- display
+
+output:
+  - platform: gpio
+    id: backlight_pin
+    pin: GPIO21
+
+# On/off only: the AW9364 dims by counting pulses, which PWM would garble.
+light:
+  - platform: binary
+    id: backlight
+    name: ${friendly_name} Backlight
+    output: backlight_pin
+    restore_mode: ALWAYS_ON
+    entity_category: config
+
+font:
+  - file: "gfonts://Roboto"
+    id: f_small
+    size: 16
+  - file: "gfonts://Roboto"
+    id: f_mid
+    size: 22
+  - file: "gfonts://Roboto"
+    id: f_big
+    size: 48
+
+color:
+  - id: c_dim
+    hex: "808080"
+  - id: c_ok
+    hex: "30D158"
+  - id: c_bad
+    hex: "FF453A"
+  - id: c_bar
+    hex: "0A84FF"
+
+display:
+  - platform: mipi_spi
+    id: lcd
+    model: ST7789V
+    cs_pin: GPIO41
+    dc_pin: GPIO16
+    # Same bus as the radio. 40 MHz makes a full frame ~22 ms; the radio
+    # task has 49 ms of FIFO headroom, and once a second keeps the bus free
+    # nearly all the time.
+    data_rate: 40MHz
+    invert_colors: true
+    color_order: BGR
+    dimensions:
+      width: 170
+      height: 320
+      offset_width: 35
+    rotation: 90
+    update_interval: 1s
+    pages:
+      # The placement survey: carry the board around and watch these.
+      - id: page_survey
+        lambda: |-
+          // Not `rf`: a local of that name would shadow the id() lookup.
+          auto *node = id(rf);
+          const bool wifi_ok = wifi::global_wifi_component != nullptr &&
+                               wifi::global_wifi_component->is_connected();
+          const bool mqtt_ok = mqtt::global_mqtt_client != nullptr &&
+                               mqtt::global_mqtt_client->is_connected();
+          const int W = it.get_width();
+
+          it.print(0, 0, id(f_small), "${friendly_name}");
+          it.print(W - 30, 0, id(f_small), wifi_ok ? id(c_ok) : id(c_bad), TextAlign::TOP_RIGHT, "WiFi");
+          it.print(W, 0, id(f_small), mqtt_ok ? id(c_ok) : id(c_bad), TextAlign::TOP_RIGHT, "M");
+
+          if (!node->radio_ok()) {
+            it.print(W / 2, 70, id(f_mid), id(c_bad), TextAlign::CENTER, "RADIO FAULT");
+            it.print(W / 2, 100, id(f_small), TextAlign::CENTER, "check PWR_EN / SPI");
+            return;
+          }
+
+          // RSSI of the last real Insteon packet, big, with a bar from the
+          // -110 dBm floor to -50 dBm (next to the transmitter).
+          const float rssi = node->last_accepted_rssi();
+          if (std::isnan(rssi)) {
+            it.print(0, 22, id(f_big), "--- dBm");
+          } else {
+            it.printf(0, 22, id(f_big), "%.0f dBm", rssi);
+            int w = (int) ((rssi + 110.0f) / 60.0f * W);
+            if (w < 0) w = 0;
+            if (w > W) w = W;
+            it.filled_rectangle(0, 80, w, 8, id(c_bar));
+          }
+
+          // Captures without accepts = noise or a framing problem; accepts
+          // = real packets; lost = the receive path is being starved.
+          it.printf(0, 96, id(f_mid), "%u cap  %u ok  /min",
+                    (unsigned) node->captures_last_minute(),
+                    (unsigned) node->accepted_last_minute());
+          if (node->lost_last_minute())
+            it.printf(W, 96, id(f_mid), id(c_bad), TextAlign::TOP_RIGHT, "%u lost",
+                      (unsigned) node->lost_last_minute());
+
+          const uint32_t age = node->ms_since_accepted();
+          if (age == UINT32_MAX) {
+            it.print(0, 128, id(f_mid), id(c_dim), "no packet yet");
+          } else if (age < 60000) {
+            it.printf(0, 128, id(f_mid), "last %us ago", (unsigned) (age / 1000));
+          } else {
+            it.printf(0, 128, id(f_mid), "last %um ago", (unsigned) (age / 60000));
+          }
+          it.printf(W, 128, id(f_mid), TextAlign::TOP_RIGHT, "n=%u",
+                    (unsigned) node->total_accepted());
+
+      # Board health: tuning, battery, network.
+      - id: page_health
+        lambda: |-
+          auto *node = id(rf);
+          const int W = it.get_width();
+          it.print(0, 0, id(f_small), "${friendly_name}  " ESPHOME_PROJECT_VERSION);
+
+          const float off = node->frequency_offset_khz();
+          if (std::isnan(off))
+            it.print(0, 24, id(f_mid), id(c_dim), "offset: no packets");
+          else
+            it.printf(0, 24, id(f_mid), "offset %+.1f kHz", off);
+          it.printf(0, 52, id(f_mid), "lost %u/min", (unsigned) node->lost_last_minute());
+
+          const float soc = id(battery_level).state;
+          const float mv = id(battery_voltage).state;
+          if (std::isnan(soc))
+            it.print(0, 80, id(f_mid), id(c_dim), "battery: --");
+          else
+            it.printf(0, 80, id(f_mid), "battery %.0f%%  %.2f V", soc, mv / 1000.0f);
+
+          const float wifi_db = id(wifi_rssi).state;
+          if (!std::isnan(wifi_db))
+            it.printf(0, 108, id(f_mid), "WiFi %.0f dBm", wifi_db);
+          it.printf(0, 136, id(f_small), id(c_dim), "up %.0f h",
+                    id(uptime_s).state / 3600.0f);
+          it.print(W, 136, id(f_small), id(c_dim), TextAlign::TOP_RIGHT, "turn knob: page");
+
+# ---------------------------------------------------------------- controls
+
+# Turn: change page. Press: backlight on/off (it is also BOOT, harmless
+# once running).
+binary_sensor:
+  - platform: gpio
+    id: knob_press
+    internal: true
+    pin:
+      number: GPIO0
+      ignore_strapping_warning: true
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 20ms
+    on_press:
+      - light.toggle: backlight
+
+# ---------------------------------------------------------------- battery
+
+# BQ27220 fuel gauge, read directly: StateOfCharge 0x2C (%), Voltage 0x08
+# (mV), little-endian. The BQ25896's charge current is capped by its ILIM
+# resistor, which LilyGO fits for the 1300 mAh cell, so nothing is written
+# to the charger.
+i2c:
+  id: i2c_bus
+  sda: GPIO8
+  scl: GPIO18
+  frequency: 100kHz
+  scan: false
+
+sensor:
+  - platform: insteon_rf
+    insteon_rf_id: rf
+    last_rssi:
+      name: ${friendly_name} Last RSSI
+    captures_per_minute:
+      name: ${friendly_name} Captures
+    accepted_per_minute:
+      name: ${friendly_name} Accepted
+    lost_per_minute:
+      name: ${friendly_name} Lost
+    frequency_offset:
+      name: ${friendly_name} Frequency Offset
+  - platform: rotary_encoder
+    id: knob
+    internal: true
+    pin_a: GPIO4
+    pin_b: GPIO5
+    on_clockwise:
+      - display.page.show_next: lcd
+      - component.update: lcd
+    on_anticlockwise:
+      - display.page.show_previous: lcd
+      - component.update: lcd
+  - platform: template
+    id: battery_level
+    name: ${friendly_name} Battery
+    device_class: battery
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x2C, b[2];
+      if (id(i2c_bus)->write_readv(0x55, &reg, 1, b, 2) != i2c::ERROR_OK)
+        return NAN;
+      return (float) (b[0] | (b[1] << 8));
+  - platform: template
+    id: battery_voltage
+    name: ${friendly_name} Battery Voltage
+    device_class: voltage
+    unit_of_measurement: mV
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      uint8_t reg = 0x08, b[2];
+      if (id(i2c_bus)->write_readv(0x55, &reg, 1, b, 2) != i2c::ERROR_OK)
+        return NAN;
+      return (float) (b[0] | (b[1] << 8));
+  - platform: wifi_signal
+    id: wifi_rssi
+    internal: true
+    update_interval: 30s
+  - platform: uptime
+    id: uptime_s
+    name: ${friendly_name} Uptime
+    update_interval: 60s
+
+text_sensor:
+  - platform: version
+    name: ${friendly_name} ESPHome Version
+  # The repo version this firmware was built from; see insteon-rf-main.yaml.
+  - platform: template
+    name: ${friendly_name} Firmware Version
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return {ESPHOME_PROJECT_VERSION};'
+
+button:
+  - platform: restart
+    name: ${friendly_name} Restart
+    entity_category: diagnostic

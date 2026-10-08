@@ -6,7 +6,6 @@
 #include "esphome/components/mqtt/mqtt_client.h"
 #endif
 
-#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -20,243 +19,6 @@ static const char *const TAG = "insteon_rf";
 // How many captures to describe at INFO after boot.
 static const uint8_t BRINGUP_CAPTURES = 10;
 
-// --------------------------------------------------------------------- SPI plumbing
-
-void InsteonRF::wait_busy_(uint32_t timeout_ms) {
-  if (this->busy_pin_ == nullptr)
-    return;
-  const uint32_t start = millis();
-  while (this->busy_pin_->digital_read()) {
-    if (millis() - start > timeout_ms) {
-      ESP_LOGW(TAG, "BUSY stuck high for %ums", (unsigned) timeout_ms);
-      return;
-    }
-    delayMicroseconds(50);
-  }
-}
-
-void InsteonRF::cmd_(uint8_t opcode, const uint8_t *data, size_t len) {
-  this->wait_busy_();
-  this->enable();
-  this->write_byte(opcode);
-  for (size_t i = 0; i < len; i++)
-    this->write_byte(data[i]);
-  this->disable();
-}
-
-void InsteonRF::read_cmd_(uint8_t opcode, uint8_t *out, size_t len) {
-  this->wait_busy_();
-  this->enable();
-  this->write_byte(opcode);
-  this->write_byte(0x00);  // status byte
-  for (size_t i = 0; i < len; i++)
-    out[i] = this->transfer_byte(0x00);
-  this->disable();
-}
-
-void InsteonRF::write_register_(uint16_t addr, const uint8_t *data, size_t len) {
-  this->wait_busy_();
-  this->enable();
-  this->write_byte(SX_WRITE_REGISTER);
-  this->write_byte(addr >> 8);
-  this->write_byte(addr & 0xFF);
-  for (size_t i = 0; i < len; i++)
-    this->write_byte(data[i]);
-  this->disable();
-}
-
-void InsteonRF::read_register_(uint16_t addr, uint8_t *out, size_t len) {
-  this->wait_busy_();
-  this->enable();
-  this->write_byte(SX_READ_REGISTER);
-  this->write_byte(addr >> 8);
-  this->write_byte(addr & 0xFF);
-  this->write_byte(0x00);  // status byte
-  for (size_t i = 0; i < len; i++)
-    out[i] = this->transfer_byte(0x00);
-  this->disable();
-}
-
-void InsteonRF::read_buffer_(uint8_t offset, uint8_t *out, size_t len) {
-  this->wait_busy_();
-  this->enable();
-  this->write_byte(SX_READ_BUFFER);
-  this->write_byte(offset);
-  this->write_byte(0x00);  // status byte
-  for (size_t i = 0; i < len; i++)
-    out[i] = this->transfer_byte(0x00);
-  this->disable();
-}
-
-// --------------------------------------------------------------------- setup
-
-void InsteonRF::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up Insteon RF listener...");
-  this->spi_setup();
-
-  if (this->busy_pin_ != nullptr)
-    this->busy_pin_->setup();
-  if (this->dio1_pin_ != nullptr)
-    this->dio1_pin_->setup();
-
-  if (this->reset_pin_ != nullptr) {
-    this->reset_pin_->setup();
-    this->reset_pin_->digital_write(false);
-    delay(10);
-    this->reset_pin_->digital_write(true);
-    delay(20);
-  }
-
-  if (!this->configure_radio_()) {
-    ESP_LOGE(TAG, "SX1262 not responding: check CS/MISO/MOSI/BUSY wiring and the TCXO setting");
-    this->mark_failed();
-    return;
-  }
-  this->radio_ok_ = true;
-  this->start_rx_();
-  this->high_freq_.start();
-  this->last_minute_mark_ = millis();
-}
-
-bool InsteonRF::configure_radio_() {
-  uint8_t buf[9];
-
-  buf[0] = 0x00;  // STDBY_RC
-  this->cmd_(SX_SET_STANDBY, buf, 1);
-
-  // A radio that never syncs and never errors is almost always a wrong TCXO
-  // setting: without it the crystal never starts and calibration silently
-  // produces a deaf receiver. The Heltec V3 drives its TCXO from DIO3.
-  // The start-up delay is in units of 15.625 us.
-  buf[0] = this->tcxo_voltage_;
-  const uint32_t delay_ticks =
-      (uint32_t) (((uint64_t) this->tcxo_delay_us_ * 1000ULL) / 15625ULL);
-  buf[1] = (delay_ticks >> 16) & 0xFF;
-  buf[2] = (delay_ticks >> 8) & 0xFF;
-  buf[3] = delay_ticks & 0xFF;
-  this->cmd_(SX_SET_DIO3_TCXO, buf, 4);
-
-  buf[0] = 0x7F;  // recalibrate everything after enabling the TCXO
-  this->cmd_(SX_CALIBRATE, buf, 1);
-  delay(5);
-  this->wait_busy_();
-
-  buf[0] = 0x01;  // DC-DC; the Heltec boards are wired for it
-  this->cmd_(SX_SET_REGULATOR_MODE, buf, 1);
-  buf[0] = 0x01;  // DIO2 drives the RF switch
-  this->cmd_(SX_SET_DIO2_RF_SWITCH, buf, 1);
-
-  // SetPacketType must precede every other modem setting; it resets them.
-  buf[0] = 0x00;  // GFSK
-  this->cmd_(SX_SET_PACKET_TYPE, buf, 1);
-
-  // Sync word, most significant byte first in the register block. Written
-  // and then read back: this is the presence check. A status byte is
-  // useless for that -- with no chip on the bus MISO floats high and the
-  // status reads as 0xFF, which looks like a chip. A register that reads
-  // back what was written cannot be faked by a floating line, and it also
-  // catches CS on the wrong pin, which is the likeliest wiring mistake.
-  // The low sync_bits_ of the word, most significant byte first: the chip
-  // matches the first sync_bits_ bits of the register block.
-  uint8_t sync[8] = {0};
-  for (uint8_t i = 0; i < this->sync_bits_ / 8; i++)
-    sync[i] = (this->sync_word_ >> (this->sync_bits_ - 8 * (i + 1))) & 0xFF;
-  this->write_register_(SX_REG_SYNC_WORD_0, sync, 8);
-  uint8_t check[8] = {0};
-  this->read_register_(SX_REG_SYNC_WORD_0, check, 8);
-  if (memcmp(sync, check, sizeof(sync)) != 0) {
-    ESP_LOGE(TAG, "sync word readback mismatch: wrote %02X%02X%02X%02X, read %02X%02X%02X%02X",
-             sync[0], sync[1], sync[2], sync[3], check[0], check[1], check[2], check[3]);
-    return false;
-  }
-
-  // 902-928 MHz image calibration.
-  buf[0] = 0xE1;
-  buf[1] = 0xE9;
-  this->cmd_(SX_CALIBRATE_IMAGE, buf, 2);
-
-  const uint64_t frf = ((uint64_t) this->frequency_hz_ << 25) / SX126X_XTAL_HZ;
-  buf[0] = (frf >> 24) & 0xFF;
-  buf[1] = (frf >> 16) & 0xFF;
-  buf[2] = (frf >> 8) & 0xFF;
-  buf[3] = frf & 0xFF;
-  this->cmd_(SX_SET_RF_FREQUENCY, buf, 4);
-
-  // br = 32 * F_XTAL / bitrate, fdev = deviation * 2^25 / F_XTAL.
-  const uint32_t br = (uint32_t) ((32ULL * SX126X_XTAL_HZ) / INSTEON_BITRATE);
-  const uint32_t fdev = (uint32_t) (((uint64_t) INSTEON_DEVIATION_HZ << 25) / SX126X_XTAL_HZ);
-  buf[0] = (br >> 16) & 0xFF;
-  buf[1] = (br >> 8) & 0xFF;
-  buf[2] = br & 0xFF;
-  buf[3] = 0x00;  // no pulse shaping: Insteon is plain 2-FSK
-  buf[4] = SX_GFSK_BW_234_3;
-  buf[5] = (fdev >> 16) & 0xFF;
-  buf[6] = (fdev >> 8) & 0xFF;
-  buf[7] = fdev & 0xFF;
-  this->cmd_(SX_SET_MODULATION_PARAMS, buf, 8);
-
-  // GFSK packet parameters. NINE bytes -- the ninth is whitening, and an
-  // earlier revision sent eight, leaving whitening undefined. Enabled
-  // whitening XORs every captured byte with a PN9 sequence, which fails the
-  // Manchester gate on every capture and makes a perfectly wired board look
-  // dead. (Register 0x06B8, which that revision then poked, is the whitening
-  // *seed*, not an enable.)
-  buf[0] = 0x00;  // TX preamble length, unused here
-  buf[1] = 0x10;
-  // Preamble detector default OFF. Insteon's preamble is a repeating 0110
-  // cell, not the 0x55/0xAA alternation the detector expects, so leaving it
-  // on may mean never syncing. The Manchester gate absorbs the extra false
-  // syncs. Exposed in YAML so it can be tried without recompiling.
-  buf[2] = this->preamble_detector_;
-  buf[3] = this->sync_bits_;   // sync word length, in bits
-  buf[4] = 0x00;               // no address filtering: Insteon addresses are elsewhere
-  buf[5] = 0x00;               // fixed length: Insteon has no length field the chip can read
-  buf[6] = this->capture_bytes_;
-  buf[7] = 0x01;  // CRC off: Insteon's CRC is its own algorithm
-  buf[8] = 0x00;  // whitening off: it would destroy the payload
-  this->cmd_(SX_SET_PACKET_PARAMS, buf, 9);
-
-  // Boosted RX gain: about 2 dB more sensitivity for about 2 mA, which a
-  // mains-powered listener should always take.
-  buf[0] = 0x96;
-  this->write_register_(SX_REG_RX_GAIN, buf, 1);
-
-  buf[0] = 0x00;
-  buf[1] = 0x00;
-  this->cmd_(SX_SET_BUFFER_BASE, buf, 2);
-
-  buf[0] = (SX_IRQ_RX_DONE | SX_IRQ_TIMEOUT) >> 8;
-  buf[1] = (SX_IRQ_RX_DONE | SX_IRQ_TIMEOUT) & 0xFF;
-  buf[2] = buf[0];  // DIO1 mask
-  buf[3] = buf[1];
-  buf[4] = 0x00;
-  buf[5] = 0x00;
-  buf[6] = 0x00;
-  buf[7] = 0x00;
-  this->cmd_(SX_SET_DIO_IRQ_PARAMS, buf, 8);
-
-  return true;
-}
-
-void InsteonRF::start_rx_() {
-  uint8_t clear[2] = {SX_IRQ_ALL >> 8, SX_IRQ_ALL & 0xFF};
-  this->cmd_(SX_CLEAR_IRQ_STATUS, clear, 2);
-  uint8_t rx[3] = {0xFF, 0xFF, 0xFF};  // continuous
-  this->cmd_(SX_SET_RX, rx, 3);
-}
-
-float InsteonRF::read_rssi_() {
-  // GetPacketStatus for GFSK returns RxStatus, RssiSync, RssiAvg; RssiAvg is
-  // averaged over the packet just received. GetRssiInst is instantaneous,
-  // and read after a capture it mostly measured whatever was on air *next* --
-  // a few feet from the PLM that was its hop repeat, which is how a distant
-  // device's ACK came to report -46 dBm on the first bring-up. RSSI is the
-  // whole point of the placement survey, so it has to be the packet's own.
-  uint8_t ps[3] = {0, 0, 0};
-  this->read_cmd_(SX_GET_PACKET_STATUS, ps, 3);
-  return -((float) ps[2]) / 2.0f;
-}
-
 // --------------------------------------------------------------------- the gate
 
 bool InsteonRF::manchester_gate_ok_(const uint8_t *buf, size_t len) const {
@@ -267,9 +29,10 @@ bool InsteonRF::manchester_gate_ok_(const uint8_t *buf, size_t len) const {
   // of bits, which is what makes this cheap check enough to run with the
   // preamble detector off in a crowded 915 MHz band.
   //
-  // Layout after the sync word. The sync word swallowed the preamble, the
-  // literal '11' frame marker and the first 9 bits of the Manchester-coded
-  // frame index 31, so the FIFO starts one bit into that index:
+  // Layout after the sync word. Every radio here syncs on a word that ends
+  // with the 16-bit start header, which swallows the preamble, the literal
+  // '11' frame marker and the first 9 bits of the Manchester-coded frame
+  // index 31, so the FIFO starts one bit into that index:
   //
   //   bit 0        the last bit of Manchester(index 31)
   //   bits 1..16   Manchester(data byte 0), 8 pairs
@@ -312,93 +75,66 @@ bool InsteonRF::manchester_gate_ok_(const uint8_t *buf, size_t len) const {
   return true;
 }
 
-// --------------------------------------------------------------------- loop
+// --------------------------------------------------------------------- counters
 
-void InsteonRF::loop() {
-  if (!this->radio_ok_)
-    return;
-
+void InsteonRF::tick_minute_() {
   const uint32_t now = millis();
-  if (now - this->last_minute_mark_ >= 60000) {
+  if (now - this->last_minute_mark_ < 60000)
+    return;
+  // Kept for the display: the previous whole minute, not a rolling window.
+  this->captures_last_minute_ = this->captures_ - this->captures_at_mark_;
+  this->accepted_last_minute_ = this->accepted_ - this->accepted_at_mark_;
+  this->lost_last_minute_ = this->lost_ - this->lost_at_mark_;
+  this->freq_offset_last_minute_ =
+      this->freq_offset_n_ ? this->freq_offset_sum_ / (float) this->freq_offset_n_ : NAN;
 #ifdef USE_SENSOR
-    if (this->captures_sensor_ != nullptr)
-      this->captures_sensor_->publish_state(this->captures_ - this->captures_at_mark_);
-    if (this->accepted_sensor_ != nullptr)
-      this->accepted_sensor_->publish_state(this->accepted_ - this->accepted_at_mark_);
+  if (this->captures_sensor_ != nullptr)
+    this->captures_sensor_->publish_state(this->captures_last_minute_);
+  if (this->accepted_sensor_ != nullptr)
+    this->accepted_sensor_->publish_state(this->accepted_last_minute_);
+  if (this->lost_sensor_ != nullptr)
+    this->lost_sensor_->publish_state(this->lost_last_minute_);
+  // A minute with no packets says nothing about the offset; keep the last
+  // value rather than publishing a gap.
+  if (this->frequency_offset_sensor_ != nullptr && this->freq_offset_n_)
+    this->frequency_offset_sensor_->publish_state(this->freq_offset_last_minute_);
 #endif
-    // Kept for the display: the previous whole minute, not a rolling window.
-    this->captures_last_minute_ = this->captures_ - this->captures_at_mark_;
-    this->accepted_last_minute_ = this->accepted_ - this->accepted_at_mark_;
-    this->captures_at_mark_ = this->captures_;
-    this->accepted_at_mark_ = this->accepted_;
-    this->last_minute_mark_ = now;
-  }
-
-  // DIO1 is mapped to RxDone|Timeout, so its level answers "anything to do?"
-  // for free. Without this, polling the IRQ register is a 4-byte SPI
-  // transaction on every loop iteration -- roughly 1 kHz -- competing with
-  // WiFi and MQTT for the core. Polling (rather than an ISR) is still right:
-  // a capture is 112 ms of air and the FIFO holds it, so there is nothing to
-  // race, and it keeps SPI on the main task where ESPHome expects it.
-  if (this->dio1_pin_ != nullptr && !this->dio1_pin_->digital_read())
-    return;
-
-  uint8_t irq[2] = {0, 0};
-  this->read_cmd_(SX_GET_IRQ_STATUS, irq, 2);
-  const uint16_t status = ((uint16_t) irq[0] << 8) | irq[1];
-  if (status == 0)
-    return;
-
-  this->rx_done_ms_ = millis();
-  uint8_t clear[2] = {irq[0], irq[1]};
-  this->cmd_(SX_CLEAR_IRQ_STATUS, clear, 2);
-
-  if (status & SX_IRQ_RX_DONE)
-    this->handle_capture_();
-  // Continuous RX re-arms itself after every packet: the chip is already
-  // hunting for the next sync word by the time we get here. Issuing SetRx
-  // again restarted it, and anything that had begun to arrive in the
-  // meantime -- a hop repeat or an ACK 50 ms behind the capture just read,
-  // with WiFi having held this loop up -- was thrown away. Only a timeout
-  // (which continuous mode should never raise) needs restarting.
-  if (!(status & SX_IRQ_RX_DONE))
-    this->start_rx_();
+  if (this->lost_last_minute_)
+    ESP_LOGW(TAG, "%u capture(s) lost by the radio in the last minute",
+             (unsigned) this->lost_last_minute_);
+  this->captures_at_mark_ = this->captures_;
+  this->accepted_at_mark_ = this->accepted_;
+  this->lost_at_mark_ = this->lost_;
+  this->freq_offset_sum_ = 0.0f;
+  this->freq_offset_n_ = 0;
+  this->last_minute_mark_ = now;
 }
 
-void InsteonRF::handle_capture_() {
+// --------------------------------------------------------------------- one capture
+
+void InsteonRF::process_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us,
+                                 float offset_khz) {
   this->captures_++;
-  const float rssi = this->read_rssi_();
   this->last_rssi_ = rssi;
-
-  // In continuous RX the chip advances its buffer pointer between packets,
-  // so ask where this one starts rather than assuming the base address.
-  uint8_t bs[2] = {0, 0};
-  this->read_cmd_(SX_GET_RX_BUFFER_STATUS, bs, 2);  // PayloadLengthRx, RxStartBufferPointer
-  const uint8_t got = bs[0];
-  const uint8_t start = bs[1];
-  const size_t len = std::min<size_t>(got ? got : this->capture_bytes_, sizeof(this->buffer_));
-  this->read_buffer_(start, this->buffer_, len);
-
 #ifdef USE_SENSOR
   if (this->last_rssi_sensor_ != nullptr)
     this->last_rssi_sensor_->publish_state(rssi);
 #endif
 
   const bool loud_enough = rssi >= this->rssi_floor_;
-  const bool gate_ok = this->manchester_gate_ok_(this->buffer_, len);
+  const bool gate_ok = this->manchester_gate_ok_(buf, len);
 
   // The first few captures after boot are the bring-up story: are captures
   // arriving at all (sync word and wiring), do they pass the gate (polarity
   // and framing), and what do the leading bytes look like.
-  if (this->bringup_logged_ < BRINGUP_CAPTURES) {
+  if (this->bringup_logged_ < BRINGUP_CAPTURES && len >= 8) {
     this->bringup_logged_++;
     ESP_LOGI(TAG,
-             "capture %u/%u: %u bytes from offset %u at %.1f dBm, gate %s, "
+             "capture %u/%u: %u bytes at %.1f dBm, offset %.1f kHz, gate %s, "
              "starts %02X %02X %02X %02X %02X %02X %02X %02X",
-             (unsigned) this->bringup_logged_, (unsigned) BRINGUP_CAPTURES, (unsigned) len,
-             (unsigned) start, rssi, gate_ok ? "PASS" : "fail", this->buffer_[0],
-             this->buffer_[1], this->buffer_[2], this->buffer_[3], this->buffer_[4],
-             this->buffer_[5], this->buffer_[6], this->buffer_[7]);
+             (unsigned) this->bringup_logged_, (unsigned) BRINGUP_CAPTURES, (unsigned) len, rssi,
+             offset_khz, gate_ok ? "PASS" : "fail", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
+             buf[6], buf[7]);
   }
 
   if (!loud_enough) {
@@ -414,10 +150,14 @@ void InsteonRF::handle_capture_() {
   this->seq_++;
   this->last_accepted_rssi_ = rssi;
   this->last_accepted_ms_ = millis();
-  this->publish_capture_(this->buffer_, len, rssi);
+  if (!std::isnan(offset_khz)) {
+    this->freq_offset_sum_ += offset_khz;
+    this->freq_offset_n_++;
+  }
+  this->publish_capture_(buf, len, rssi, first_bit_us);
 }
 
-void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi) {
+void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us) {
 #ifdef USE_MQTT
   if (this->mqtt_topic_.empty() || mqtt::global_mqtt_client == nullptr)
     return;
@@ -444,25 +184,24 @@ void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi) {
   // This used to be time(nullptr) * 1000 -- whole seconds, so up to a second
   // early at random -- taken at publish time. Against the other receivers
   // that alone split one transmission into several events. Now: the wall
-  // clock at millisecond resolution, less the time since RxDone, less the
-  // capture's own length on the air (RxDone fires when the last byte is in).
+  // clock at millisecond resolution, less how long ago the radio says the
+  // first bit arrived.
   struct timeval tv;
   gettimeofday(&tv, nullptr);
   const uint64_t now_ms = (uint64_t) tv.tv_sec * 1000ULL + (uint64_t) (tv.tv_usec / 1000);
-  const uint64_t air_ms = ((uint64_t) len * 8ULL * 1000ULL) / INSTEON_BITRATE;
-  const uint64_t since_ms = (uint64_t) (millis() - this->rx_done_ms_);
-  const uint64_t t_ms = now_ms - since_ms - air_ms;
+  const uint64_t age_ms = (uint64_t) (micros() - first_bit_us) / 1000ULL;
+  const uint64_t t_ms = now_ms - age_ms;
   // "sw" is the sync word this capture was matched on. The FIFO holds only
   // what follows it, so the host has to put the start header back before
-  // parsing, and it needs to know which polarity to put back.
+  // parsing, and it needs to know which polarity to put back. "us" is the
+  // board's own clock at that first bit: fine-grained within one board,
+  // meaningless between boards.
   char head[192];
-  const uint32_t us = micros();
   snprintf(head, sizeof(head),
            "{\"n\":\"%s\",\"seq\":%u,\"t\":%llu,\"us\":%u,\"rssi\":%.1f,\"len\":%u,"
            "\"sw\":\"%08X\",\"b\":\"",
-           App.get_name().c_str(), (unsigned) this->seq_,
-           (unsigned long long) t_ms, (unsigned) us, rssi,
-           (unsigned) len, (unsigned) this->sync_word_);
+           App.get_name().c_str(), (unsigned) this->seq_, (unsigned long long) t_ms,
+           (unsigned) first_bit_us, rssi, (unsigned) len, (unsigned) this->sync_word_);
 
   std::string payload(head);
   payload += blob;
@@ -474,28 +213,17 @@ void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi) {
   (void) buf;
   (void) len;
   (void) rssi;
+  (void) first_bit_us;
 #endif
 }
 
-void InsteonRF::dump_config() {
-  ESP_LOGCONFIG(TAG, "Insteon RF listener (receive only):");
-  ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz", this->frequency_hz_ / 1e6f);
-  ESP_LOGCONFIG(TAG, "  Bitrate: %u baud, deviation %u Hz, RX bandwidth 234.3 kHz",
-                (unsigned) INSTEON_BITRATE, (unsigned) INSTEON_DEVIATION_HZ);
-  ESP_LOGCONFIG(TAG, "  Sync word: 0x%08X (low %u bits)%s", (unsigned) this->sync_word_,
-                (unsigned) this->sync_bits_,
-                this->sync_word_ == INSTEON_SYNC_WORD ? "" : "  [non-default]");
-  ESP_LOGCONFIG(TAG, "  Preamble detector: %s", this->preamble_detector_ ? "on" : "off");
+void InsteonRF::dump_common_config_() {
   ESP_LOGCONFIG(TAG, "  Capture: %u bytes (%.0f ms of air)", (unsigned) this->capture_bytes_,
                 this->capture_bytes_ * 8.0f * 1000.0f / INSTEON_BITRATE);
   ESP_LOGCONFIG(TAG, "  Manchester gate: %u frames, up to %u bad pairs",
                 (unsigned) this->manchester_gate_, (unsigned) this->manchester_gate_errors_);
   ESP_LOGCONFIG(TAG, "  RSSI floor: %.1f dBm", this->rssi_floor_);
   ESP_LOGCONFIG(TAG, "  MQTT topic: %s", this->mqtt_topic_.c_str());
-  LOG_PIN("  CS Pin: ", this->cs_);
-  LOG_PIN("  RESET Pin: ", this->reset_pin_);
-  LOG_PIN("  BUSY Pin: ", this->busy_pin_);
-  LOG_PIN("  DIO1 Pin: ", this->dio1_pin_);
   if (this->is_failed())
     ESP_LOGE(TAG, "  RADIO NOT RESPONDING");
 }

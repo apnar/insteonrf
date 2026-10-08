@@ -68,7 +68,8 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/inject.py` | what may be handed to insteon-mqtt: tiers, shadow mode, PLM-heard suppression, rate limits |
 | `insteonrf/mesh.py` | the mesh service and the miss table (`insteon-rf mesh`) |
 | `insteonrf/radio/mqtt.py` | listener-board captures over MQTT, also a `RadioBackend` |
-| `esphome/components/insteon_rf/` | ESPHome listener firmware (SX1262, receive only) |
+| `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, publish, counters), radios `sx1262.cpp` (Heltec) and `cc1101.cpp` (T-Embed), chosen by `radio:` |
+| `esphome/insteon-rf-main.yaml`, `esphome/insteon-rf-embed.yaml` | the Heltec LoRa 32 V3 and the LilyGO T-Embed CC1101 (`Doc/T-EMBED.md`) |
 | `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/k8s/yaml/AGENTS.md` conventions) |
 | `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
 | `deploy/insteonrf-v3.yaml` | an RTL-SDR Blog V3 (serial `INST915`) as a third listener (`--mesh-capture=v3`), the only one producing soft decisions |
@@ -418,6 +419,17 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
 - A status byte is not a presence check for an SPI radio: with nothing on the bus MISO
   floats high and reads 0xFF. Write a register and read it back; that also catches CS on
   the wrong pin, the likeliest wiring mistake.
+- **The T-Embed CC1101 runs the dongle's modem registers** (2026-10-08, `Doc/T-EMBED.md`):
+  the CC1101 is the CC1111's radio, so its config is the `insteonrf` pod's `radio at
+  start` dump rescaled to 26 MHz, not a fresh guess. What is new is the 64-byte FIFO
+  (56 ms of air) under a 162-byte capture: a FreeRTOS task on core 1 drains it while the
+  packet arrives and hands whole captures to `loop()` through a queue, because the LCD
+  shares the SPI bus. Never read the FIFO empty mid-packet (errata), and read RXBYTES
+  until two reads agree. Board traps that look like silence: BOARD_PWR_EN (GPIO15) low,
+  the RF band switch (SW1 47 / SW0 48) left on 315/433, and a floating SD (13) or nRF24
+  (44) chip select on the shared bus; GPIO43/44 are also UART0, so the logger is on
+  USB-Serial-JTAG. ESPHome's own `cc1101` component reads packets only after they end,
+  which caps them at 64 bytes -- that is why it is not used.
 - Heltec LoRa 32 V3 pins, verified against Meshtastic `heltec_v3`: SCK 9, MISO 11, MOSI
   10, CS 8, RESET 12, BUSY 13, DIO1 14, TCXO 1.8 V on DIO3, DIO2 drives the RF switch,
   DC-DC. Board enumerates over USB as Espressif `303a:1001` (native USB-serial-JTAG);

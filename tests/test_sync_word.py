@@ -70,3 +70,18 @@ def test_the_esphome_component_uses_the_same_value():
     found = re.search(r"INSTEON_SYNC_WORD\s*(?:=|\{)\s*(0x[0-9A-Fa-f]+)", text)
     assert found, "insteon_rf.h must define INSTEON_SYNC_WORD"
     assert int(found.group(1), 16) == ON_AIR_SYNC_32
+
+
+def test_the_cc1101_driver_uses_the_low_half():
+    """The CC1101 matches 16 bits -- the start header alone, like the CC1111
+    dongle it shares a modem with. It must be exactly the low half of the
+    32-bit word, or the T-Embed is a board that never syncs."""
+    comp = ROOT / "esphome" / "components" / "insteon_rf"
+    header = (comp / "cc1101.h").read_text()
+    found = re.search(r"CC1101_SYNC_WORD\s*=\s*(0x[0-9A-Fa-f]+)", header)
+    assert found, "cc1101.h must define CC1101_SYNC_WORD"
+    assert int(found.group(1), 16) == ON_AIR_SYNC_32 & 0xFFFF == int(START_HEADER_INV, 2)
+
+    schema = (comp / "__init__.py").read_text()
+    default = re.search(r"DEFAULT_CC1101_SYNC_WORD\s*=\s*(0x[0-9A-Fa-f]+)", schema)
+    assert default and int(default.group(1), 16) == ON_AIR_SYNC_32 & 0xFFFF
