@@ -71,7 +71,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, publish, counters), radios `cc1101.cpp` (T-Embed, live) and `sx1262.cpp` (Heltec, retired 2026-10-08), chosen by `radio:` |
 | `esphome/insteon-rf-embed.yaml` | the LilyGO T-Embed CC1101 listener (`Doc/T-EMBED.md`); the Heltec's config is in `esphome/retired/` |
 | `tools/score_receivers.py` | score one receiver against a fixed reference set from the mesh event log, per time window (the A/B yardstick) |
-| `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/k8s/yaml/AGENTS.md` conventions) |
+| `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/root/homelab/docs/k8s.md` conventions) |
 | `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
 | `deploy/insteonrf-v3.yaml` | an RTL-SDR Blog V3 (serial `INST915`) as a third listener (`--mesh-capture=v3`), the only one producing soft decisions |
 | `deploy/insteon-mqtt/` | patch series + Containerfile adding `insteon/raw/rx` and `insteon/raw/inject` to insteon-mqtt |
@@ -359,8 +359,10 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   two. `publish_capture` ships from just after the first header in either polarity and
   says which in `sw` — an SDR burst starts with preamble, unlike a FIFO dump.
 - Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
-  Assistant `mqtt.publish` service (no `mosquitto_pub` on the host or in the pod), e.g.
-  payload `{"cmd":"get_engine","session":"x"}`; dual-band devices repeat it on RF.
+  Assistant `mqtt.publish` service, or with the clients in the HA pod's `mosquitto` sidecar
+  (`kubectl exec homeassistant -c mosquitto -- mosquitto_pub -h 127.0.0.1 …`; the host and
+  the `insteon` sidecar have none), e.g. payload `{"cmd":"get_engine","session":"x"}`;
+  dual-band devices repeat it on RF.
 - `Makefile.kali`, the WAV-header readers, `Doc/pkt_format.txt` and the never-committed
   `fsk2_mod.c` (liquid-dsp) are gone; `insteon-rf modulate` replaced the last of these.
 - **Insteon RF repeating is synchronous simulcast on a slot grid.** Measured 2026-09-15
