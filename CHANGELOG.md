@@ -4,6 +4,30 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.9.1 — 2026-10-08
+
+- **T-Embed: frequency-offset and bit-sync loops gated on carrier sense**
+  (FOCCFG `0x37`, was the dongle's `0x17`). Free-running, they wander on
+  noise between bursts, so a packet arriving out of silence loses its short
+  preamble re-acquiring them. In five-minute A/Bs against the V3, the PLM's
+  first copy was caught 87-94% of the time (four runs) instead of 55-62%
+  (seven), and device replies went from ~96.5% to ~98.7%. Twelve other
+  settings -- sync tolerance, carrier-sense threshold, channel filter, AGC
+  speed and ceiling, IF -- measured no better; the table is in
+  `Doc/T-EMBED.md`.
+- **The display is right side up** (rotation 270).
+- **Radio diagnostics**: a status line at INFO every minute (state, RSSI and
+  its peak, syncs, captures, losses, re-arms), registers read back every
+  minute, and a full chip reset after five minutes of strong signal with
+  nothing passing the gate.
+- **Live tuning** over the native API or Home Assistant, with no reflash:
+  frequency, filter, sync mode and word, carrier sense, LNA, attenuation,
+  band switch, any config register, and a frequency scan.
+- **`tools/score_receivers.py`**: score one receiver against a fixed
+  reference from the mesh event log, per window, with the PLM first-copy
+  rate.
+- **The Heltec is decommissioned**; its config moves to `esphome/retired/`.
+
 ## 2.9.0 — 2026-10-08
 
 - **A fourth listener: the LilyGO T-Embed CC1101 / CC1101 Plus**

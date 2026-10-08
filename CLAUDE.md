@@ -433,6 +433,17 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   (44) chip select on the shared bus; GPIO43/44 are also UART0, so the logger is on
   USB-Serial-JTAG. ESPHome's own `cc1101` component reads packets only after they end,
   which caps them at 64 bytes -- that is why it is not used.
+- **CC11xx radios lose the first copy of a burst unless FOCCFG gates the loops**
+  (2026-10-08, `Doc/T-EMBED.md`). With the dongle's FOCCFG `0x17`, the
+  frequency-offset and bit-sync loops track noise between bursts. The PLM's
+  original transmission, which arrives out of silence, was then lost about 40% of
+  the time; the repeat 50 ms later was not. `0x37` (FOC_BS_CS_GATE) took the
+  T-Embed from ~59% to ~91% first-copy. It depends on carrier sense: a -4 dB
+  threshold undoes it. Measure first-copy rate with `tools/score_receivers.py`; the
+  dongle likely has the same problem (0x17, ~63%).
+- The T-Embed's live-tuning entities and `tools/embed_api.py` (copied to `/k8s/homeassistant/esphome/.tune/`)
+  (native API, run in the esphome sidecar) make an A/B a matter of minutes, not
+  reflashes. Score A/Bs against the V3 alone whenever the dongle is not healthy.
 - Heltec LoRa 32 V3 pins, verified against Meshtastic `heltec_v3`: SCK 9, MISO 11, MOSI
   10, CS 8, RESET 12, BUSY 13, DIO1 14, TCXO 1.8 V on DIO3, DIO2 drives the RF switch,
   DC-DC. Board enumerates over USB as Espressif `303a:1001` (native USB-serial-JTAG);

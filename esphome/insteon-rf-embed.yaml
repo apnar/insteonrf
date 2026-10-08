@@ -44,7 +44,7 @@ esphome:
   # listener firmware in esphome/. See insteon-rf-main.yaml for why.
   project:
     name: insteonrf.listener
-    version: "2.9.0"
+    version: "2.9.1"
 
 esp32:
   board: esp32-s3-devkitc-1

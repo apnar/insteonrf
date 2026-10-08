@@ -334,8 +334,22 @@ bool InsteonRFCC1101::configure_radio_() {
   this->write_reg_(CC_MCSM1, 0x0C);
   this->write_reg_(CC_MCSM0, 0x18);
 
-  // The dongle's loops and AGC, verbatim.
-  this->write_reg_(CC_FOCCFG, 0x17);
+  // FOCCFG 0x37: the dongle's 0x17 plus FOC_BS_CS_GATE -- the frequency-
+  // offset and bit-sync loops stay frozen until carrier sense goes high.
+  // Free-running (the dongle's setting) they track noise between bursts
+  // (the noise captures showed offsets of -11 to -57 kHz), so a packet that
+  // arrives out of silence starts with both loops mis-set and spends its
+  // short preamble pulling them back. Measured 2026-10-08, five-minute A/Bs
+  // under identical traffic, against the V3: the PLM's *first* copy -- the
+  // one that arrives out of silence -- was caught 91% of the time with the
+  // gate (four runs: 92, 91, 87, 94) against 59% without (55-62 over seven
+  // baselines), and device replies rose from ~96.5% to ~98.7%. The gate is
+  // only as good as carrier sense: at a -4 dB threshold noise opens it and
+  // the gain vanishes (58%), so keep carrier_sense_threshold at 0.
+  this->write_reg_(CC_FOCCFG, 0x37);
+  // Bit-sync limit and AGC: the dongle's, verbatim. AGC speed (AGCCTRL0
+  // 0x80), a lower AGC ceiling (AGCCTRL2 0x43) and a 203 kHz IF all
+  // measured no better.
   this->write_reg_(CC_BSCFG, 0x6E);
   this->write_reg_(CC_AGCCTRL2, ((this->max_lna_gain_ & 0x07) << 3) | 0x03);
   // AGC_LNA_PRIORITY 1, relative carrier sense off, absolute threshold
@@ -508,10 +522,13 @@ void InsteonRFCC1101::drain_() {
 bool InsteonRFCC1101::verify_registers_() {
   const uint8_t sync1 = (this->sync_word_ >> 8) & 0xFF;
   const uint8_t sync0 = this->sync_word_ & 0xFF;
-  return this->read_reg_(CC_SYNC1) == sync1 && this->read_reg_(CC_SYNC0) == sync0 &&
-         this->read_reg_(CC_PKTLEN) == this->capture_bytes_ &&
-         (this->read_reg_(CC_MDMCFG2) & 0x07) == (this->sync_mode_ & 0x07) &&
-         this->read_reg_(CC_TEST2) == 0x81;
+  const bool ok = this->read_reg_(CC_SYNC1) == sync1 && this->read_reg_(CC_SYNC0) == sync0 &&
+                  this->read_reg_(CC_PKTLEN) == this->capture_bytes_ &&
+                  (this->read_reg_(CC_MDMCFG2) & 0x07) == (this->sync_mode_ & 0x07) &&
+                  this->read_reg_(CC_TEST2) == 0x81;
+  // FOCCFG carries the measured fix; a reset chip comes back at 0x36. Skip
+  // the check while a live-tuning override may legitimately have moved it.
+  return ok && (this->overrides_n_ > 0 || this->read_reg_(CC_FOCCFG) == 0x37);
 }
 
 void InsteonRFCC1101::health_check_() {

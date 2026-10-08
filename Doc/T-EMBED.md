@@ -25,7 +25,7 @@ the CC1111's 24 MHz crystal to the CC1101's 26 MHz.
 | data rate | 9132.4 baud | 9125.0 baud |
 | deviation | 76.17 kHz | 76.17 kHz |
 | channel filter | 187.5 kHz | 203 kHz (nearest step) |
-| FOCCFG / BSCFG | `0x17` / `0x6E` | same |
+| FOCCFG / BSCFG | `0x17` / `0x6E` | **`0x37`** (loops gated on carrier sense, measured below) / same |
 | AGCCTRL2/1/0 | `03 40 91` | same |
 | TEST2/1/0 | `81 35 09` | same |
 | PQT, CRC, whitening, Manchester | off | off |
@@ -151,24 +151,112 @@ device messages; `insteon-rf-embed` should appear there within an hour of
 normal traffic. Score it against a *fixed* receiver set (see CLAUDE.md):
 "% of all fused events" moves whenever any receiver drops out.
 
-## Tuning
+## Tuning results (2026-10-08)
 
-- **Frequency.** The `Frequency Offset` sensor is the CC1101's FREQEST
-  averaged over each minute's accepted packets. Insteon devices disagree
-  among themselves by a few kHz (the V3 saw a 9 kHz spread), so look at the
-  mean over an hour. If it sits well away from zero, move `frequency:` by
-  that amount, in the same direction as the sign, and it should then read
-  near zero. FOC (±BW/2) absorbs the rest.
-- **Next to the PLM.** If captures arrive clipped or the gate rejects loud
-  packets, use `rx_attenuation: 12dB` or `max_lna_gain_reduction`. The V4's
-  lesson was that placement beats any amount of tuning.
-- **Sync tolerance.** `sync_mode: 15/16 + carrier` accepts one bit error in
-  the start header: more weak packets, more noise syncs, and the gate takes
-  the noise. A/B it against the dongle the way the Heltec settings were
-  (CLAUDE.md, "Heltec A/B record") before keeping it.
-- `capture_bytes` stays 162; the reasoning is in `__init__.py`, and
-  `tests/test_listener_firmware.py` pins it to the slot grid for both sync
-  lengths.
+Three rounds of five-minute A/Bs under identical traffic: Get Engine Version
+every 1.5 s, round-robin to seven devices around the house (`29.4E.52`,
+`2B.A0.AB`, `38.FA.56`, `40.CE.68`, `3B.8F.8A`, `25.08.BC`, `29.4D.F8`).
+Scored with `tools/score_receivers.py --ref v3`: of the messages the V3
+decoded, how many the T-Embed decoded too. The dongle could not be part of
+the reference, because it wedged on USB at 13:10 that day. Settings were
+changed live (see "Live tuning" below), with a baseline repeated between
+groups.
+
+| setting | device replies | PLM | PLM first copy |
+|---|---|---|---|
+| baseline (FOCCFG 0x17), 7 runs | 93.0-98.4% | 98.1-99.5% | 55-62% |
+| **FOCCFG 0x37** (loops frozen until carrier sense), 4 runs | 97.9-99.5% | 99.0-100% | **87-94%** |
+| 0x37 + carrier sense -4 dB | 98.9% | 98.0% | 58% |
+| 0x37 + carrier sense +3 dB | 96.9% | 98.6% | 90% |
+| 0x37 + 15/16 sync | 97.2% | 99.5% | 93% |
+| 0x36 (gate, FOC limit BW/4) | 98.4% | 100% | 91% |
+| 0x35 (gate, FOC limit BW/8) | 97.4% | 99.5% | 85% |
+| 0x15 (no gate, FOC limit BW/8) | 96.8% | 99.5% | 53% |
+| sync 15/16 + carrier | 95.2% | 99.0% | 67% |
+| sync 16/16, no carrier sense | 98.9% | 98.6% | 58% |
+| carrier sense -4 / +3 dB | 96.3 / 96.1% | 99.0 / 99.5% | 56 / 59% |
+| channel filter 232 kHz | 94.6% | 95.6% | 61% |
+| channel filter 270 kHz | 26.4% | 12.9% | 8% |
+| channel filter 162 kHz | 77.6% | 83.2% | 51% |
+| AGCCTRL0 0x80 (faster AGC) | 96.8% | 98.5% | 56% |
+| AGCCTRL2 0x43 (lower AGC ceiling) | 98.5% | 98.6% | 57% |
+| IF 203 kHz (FSCTRL1 0x08) | 97.9% | 99.0% | 50% |
+
+"PLM first copy" is how often the T-Embed heard the PLM's *original*
+transmission, not just a hop repeat. That copy arrives out of silence,
+and it is the one that separated the settings: the CC11xx radios lost it
+about 40% of the time (the dongle about 37%), and caught the repeat 50 ms
+later instead. The cause was the frequency-offset and bit-sync loops.
+Free-running, they track noise between bursts; the noise captures showed
+offsets of -11 to -57 kHz. A burst out of silence then starts with both
+loops mis-set. Gating them on carrier sense (FOCCFG bit 5) fixes it. The
+gate is only as good as carrier sense, though: at -4 dB noise holds it open
+and the gain vanishes. So the threshold stays at 0.
+
+Everything else was within the baseline's own scatter, or worse. 203 kHz is
+the right filter: 162 kHz clips a ±76 kHz signal, and 270 kHz collapses
+with this IF.
+
+**Applied in 2.9.1:** FOCCFG `0x37` by default. Everything else is unchanged:
+16/16 + carrier, 203 kHz, carrier sense 0, 914.990 MHz (the T-Embed's
+FREQEST and the V3 both put the devices within a few kHz of it).
+
+**The dongle has the same weakness**, with the same chip family and the same
+0x17. Setting FOCCFG to 0x37 in `RfcatRadio.configure_rx()` should help it
+the same way. Untested so far, because the dongle was wedged.
+
+## Live tuning
+
+Number/select entities (entity category *config*), applied by the radio
+task between captures and **not** restored across a reboot, so a reboot
+always returns to the YAML:
+
+- `Tune Frequency Offset` (kHz from 914.990), `Tune Bandwidth`,
+  `Tune Sync Mode`, `Tune Sync Word` (3155/CEAA), `Tune Carrier Sense
+  Threshold`, `Tune LNA Gain Reduction`, `Tune RX Attenuation`,
+  `Tune Band Switch` (auto/315/433/915).
+- `Tune Register`: value = address × 256 + byte, e.g. 6455 = `0x1937` writes
+  FOCCFG = 0x37; 65535 clears all overrides. Any config register, on top
+  of the computed configuration.
+- Buttons `Scan Wide` (860-960 MHz) and `Scan Narrow` (914.5-915.5 MHz):
+  the peak RSSI per step, logged at INFO. Captures stop while a scan runs.
+  Generate traffic during it.
+
+The board was not adopted in Home Assistant when these were run. The same
+entities are reachable over the native API, with
+`tools/embed_api.py`, copied to `/k8s/homeassistant/esphome/.tune/` (it runs in the esphome sidecar):
+
+```bash
+kubectl exec homeassistant -c esphome -- python3 /config/.tune/embed_api.py \
+    192.168.88.156 insteon_rf_embed_tune_register=6455 --watch 120
+```
+
+Other knobs, when placement changes:
+
+- **Frequency.** The `Frequency Offset` sensor is the CC1101's FREQEST,
+  averaged over each minute's accepted packets. If it sits well away from
+  zero for an hour, move `frequency:` by that amount.
+- **Next to the PLM.** If the gate rejects loud packets, try
+  `rx_attenuation: 12dB`.
+
+## Diagnostics
+
+Every minute the board logs a status line at INFO:
+
+```
+radio: MARCSTATE 0x0D, RSSI -106.5 dBm (peak -40.5), RXBYTES 0x00; last 60s: 88 syncs, 88 captures,
+651 accepted total; overflows 0, stalls 0, re-arms 0, reprogrammed 0, deaf resets 0
+```
+
+On noise alone, a 16-bit sync matches about 8 times a minute
+(9124 bit/s ÷ 2^16); every one of those captures fails the gate.
+**Syncs at about that rate, with nothing accepted while the other receivers
+hear traffic, means real packets are not syncing.** That was the state of
+the first ~20 minutes after flashing on 2026-10-08. It was never
+reproduced: the same firmware, reflashed, received normally. So the
+firmware now resets the chip outright after five minutes of strong signal
+(peak ≥ -80 dBm) with nothing passing the gate, and reads its registers back
+every minute.
 
 ## Display
 
