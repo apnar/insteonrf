@@ -44,6 +44,17 @@ SYNC_PREAMBLE = 0x6666
 #: On-air (inverted) start header, ``START_HEADER_INV`` as a 16-bit word.
 SYNC_START_HEADER = int(START_HEADER_INV, 2)
 
+#: FOCCFG for receiving: rflib's 0x17 plus FOC_BS_CS_GATE, so the frequency-
+#: offset and bit-sync loops stay frozen until carrier sense goes high.
+#: Free-running, they track noise between bursts, and a packet arriving out
+#: of silence -- the PLM's original transmission, typically -- loses its short
+#: preamble re-acquiring them. Measured on the T-Embed's CC1101 (the same
+#: modem) 2026-10-08: first copies caught 87-94% instead of 55-62%. See
+#: Doc/T-EMBED.md; ``--foccfg 0x17`` restores the old behaviour.
+FOCCFG_RX = 0x37
+#: CC1111 XDATA address of FOCCFG, for when rflib does not export it.
+FOCCFG_ADDR = 0xDF15
+
 #: CC1101/CC1111 RSSI register offset for this configuration (datasheet).
 RSSI_OFFSET_DB = 74.0
 
@@ -251,7 +262,7 @@ class RfcatRadio:
 
     def __init__(self, freq: int = DEFAULT_FREQ, drate: int = DEFAULT_DRATE, *,
                  index: int = 0, debug: bool = False, auto_reset: bool = True,
-                 max_usb_errors: int = 3):
+                 max_usb_errors: int = 3, foccfg: int = FOCCFG_RX):
         self.rflib = _rflib()
         self.freq = freq
         self.drate = drate
@@ -259,6 +270,7 @@ class RfcatRadio:
         self.debug = debug
         self.auto_reset = auto_reset
         self.max_usb_errors = max_usb_errors
+        self.foccfg = foccfg
         self._sync_header = False
         self._rx_kwargs: dict[str, Any] | None = None
         self._tx = False
@@ -354,6 +366,9 @@ class RfcatRadio:
         else:
             d.setMdmSyncWord(SYNC_PREAMBLE)
             d.setMdmSyncMode(rf.SYNCM_CARRIER)
+        # Already IDLE, so write it directly rather than letting rflib bounce
+        # the radio state around the write.
+        d.setRFRegister(getattr(rf, "FOCCFG", FOCCFG_ADDR), self.foccfg, suppress=True)
         d.setModeRX()
 
     def configure_tx(self) -> None:

@@ -439,8 +439,9 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   original transmission, which arrives out of silence, was then lost about 40% of
   the time; the repeat 50 ms later was not. `0x37` (FOC_BS_CS_GATE) took the
   T-Embed from ~59% to ~91% first-copy. It depends on carrier sense: a -4 dB
-  threshold undoes it. Measure first-copy rate with `tools/score_receivers.py`; the
-  dongle likely has the same problem (0x17, ~63%).
+  threshold undoes it. The dongle had the same problem and has the same fix
+  (`RfcatRadio(foccfg=0x37)`, `--foccfg` to override): first copy ~62% -> ~95% in an
+  interleaved A/B. Measure first-copy rate with `tools/score_receivers.py`.
 - The T-Embed's live-tuning entities and `tools/embed_api.py` (copied to `/k8s/homeassistant/esphome/.tune/`)
   (native API, run in the esphome sidecar) make an A/B a matter of minutes, not
   reflashes. Score A/Bs against the V3 alone whenever the dongle is not healthy.

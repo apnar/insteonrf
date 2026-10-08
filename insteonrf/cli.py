@@ -113,6 +113,9 @@ def _radio_args(p: argparse.ArgumentParser, *, transmit: bool = False) -> None:
                    help="rfcat device index when several dongles are attached")
     p.add_argument("--no-auto-reset", action="store_true",
                    help="do not USB-reset and reopen an unresponsive rfcat dongle")
+    p.add_argument("--foccfg", type=lambda v: int(v, 0), default=None, metavar="BYTE",
+                   help="rfcat: FOCCFG register for receiving (default 0x37: offset and "
+                        "bit-sync loops gated on carrier sense; 0x17 is rflib's default)")
     p.add_argument("-s", "--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE,
                    help="SDR backends: I/Q sample rate (default %(default)s)")
     p.add_argument("--replay", action="append", metavar="FILE",
@@ -141,6 +144,8 @@ def _open_radio(a: argparse.Namespace, *, transmit: bool = False) -> Any:
     kw: dict[str, Any] = {}
     if a.backend == "rfcat":
         kw.update(index=a.index, auto_reset=not a.no_auto_reset)
+        if getattr(a, "foccfg", None) is not None:
+            kw["foccfg"] = a.foccfg
     elif a.backend in ("rtlsdr", "hackrf"):
         kw.update(sample_rate=a.sample_rate)
         if transmit:

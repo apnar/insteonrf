@@ -15,6 +15,12 @@ contract and the legacy script names are treated as public API.
   settings -- sync tolerance, carrier-sense threshold, channel filter, AGC
   speed and ceiling, IF -- measured no better; the table is in
   `Doc/T-EMBED.md`.
+- **The rfcat dongle gets the same fix** (`RfcatRadio(foccfg=0x37)` by default,
+  `--foccfg 0x17` for the old behaviour). It has the same modem and had the same 0x17.
+  Interleaved A/B on the live pod, against the V3: the PLM's first copy was caught
+  91-98.5% of the time at 0x37 (four windows) against 61-64% at 0x17 (three).
+  Device replies improved less (~93.4% to ~94.9%): the dongle's 255-byte blocks
+  already gave it a second chance at a later copy.
 - **The display is right side up** (rotation 270).
 - **Radio diagnostics**: a status line at INFO every minute (state, RSSI and
   its peak, syncs, captures, losses, re-arms), registers read back every

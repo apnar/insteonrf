@@ -489,3 +489,25 @@ def test_sdr_tool_stderr_reaches_the_log(caplog):
     assert (logging.INFO, "rtl_sdr: Found 3 device(s):") in got
     assert (logging.WARNING, "rtl_sdr: No matching devices found.") in got
     assert len(got) == 2  # blank lines dropped
+
+
+def test_receive_gates_the_offset_loops_on_carrier_sense(fake_radio, monkeypatch):
+    """FOCCFG 0x37 (FOC_BS_CS_GATE) is the measured fix for losing a burst's
+    first copy; it must reach the chip in RX, and be overridable for A/Bs."""
+    writes = []
+
+    def record(dev):
+        dev.setRFRegister = lambda addr, value, suppress=False: writes.append((addr, value))
+        return dev
+
+    monkeypatch.setattr(rfcat_mod.RfcatRadio, "_open", lambda self: record(_next_fake(fake_radio)))
+    radio = rfcat_mod.RfcatRadio()
+    radio.configure_rx()
+    assert (rfcat_mod.FOCCFG_ADDR, 0x37) in writes
+    radio.close()
+
+    writes.clear()
+    radio = rfcat_mod.RfcatRadio(foccfg=0x17)
+    radio.configure_rx()
+    assert (rfcat_mod.FOCCFG_ADDR, 0x17) in writes
+    radio.close()

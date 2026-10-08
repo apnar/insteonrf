@@ -201,9 +201,15 @@ with this IF.
 16/16 + carrier, 203 kHz, carrier sense 0, 914.990 MHz (the T-Embed's
 FREQEST and the V3 both put the devices within a few kHz of it).
 
-**The dongle has the same weakness**, with the same chip family and the same
-0x17. Setting FOCCFG to 0x37 in `RfcatRadio.configure_rx()` should help it
-the same way. Untested so far, because the dongle was wedged.
+**The dongle had the same weakness and has the same fix** (2.9.1,
+`RfcatRadio.configure_rx()` writes FOCCFG 0x37; `--foccfg 0x17` restores
+the old value). Interleaved on the live pod the same evening, scored against
+the V3 under the same traffic:
+
+| dongle FOCCFG | PLM first copy | device replies |
+|---|---|---|
+| 0x17, 3 windows | 61.2-63.7% | 92.1-95.2% |
+| 0x37, 4 windows (before and after the 0x17 control) | 91.1-98.5% | 93.2-97.9% |
 
 ## Live tuning
 
