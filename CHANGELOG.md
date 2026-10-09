@@ -4,6 +4,22 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.9.2 — 2026-10-09
+
+- **T-Embed: re-arm RX after 1 s of quiet air** (`idle_rearm`, default 1 s). A
+  burst arriving after >= 2 s of silence lost its first copy about half the time
+  on both CC11xx receivers. The V3 shows the PLM's signal unchanged, the FOC loop
+  is not responsible, and re-entering RX clears it: 10-minute A/Bs with 8 s
+  spacing gave 93-97% instead of 42-52%.
+- **T-Embed: end a capture after 20 ms without carrier** (`quiet_end`), so a
+  capture that outlived its exchange cannot hide the next one's first copy.
+  Three interleaved pairs under back-to-back traffic: first copy 91.6% -> 93.3%,
+  decoded 99.0% -> 99.8%.
+- **`tools/test_traffic.py`**: closed-loop test traffic (the next request only
+  after the previous END). It replaces a fixed-rate publisher that flooded
+  insteon-mqtt. `tools/score_receivers.py` gains `--after-silence` and
+  `--busy-gap`.
+
 ## 2.9.1 — 2026-10-08
 
 - **T-Embed: frequency-offset and bit-sync loops gated on carrier sense**

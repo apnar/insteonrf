@@ -44,6 +44,8 @@ CONF_SYNC_MODE = "sync_mode"
 CONF_RX_ATTENUATION = "rx_attenuation"
 CONF_MAX_LNA_GAIN_REDUCTION = "max_lna_gain_reduction"
 CONF_CARRIER_SENSE_THRESHOLD = "carrier_sense_threshold"
+CONF_IDLE_REARM = "idle_rearm"
+CONF_QUIET_END = "quiet_end"
 CONF_SYNC_WORD = "sync_word"
 CONF_SYNC_WORD_BITS = "sync_word_bits"
 CONF_PREAMBLE_DETECTOR = "preamble_detector_bits"
@@ -206,6 +208,22 @@ CC1101_SCHEMA = (
             # used by the "+ carrier" sync modes; -8 disables it. 0 is the
             # dongle's setting.
             cv.Optional(CONF_CARRIER_SENSE_THRESHOLD, default=0): cv.int_range(min=-8, max=7),
+            # Re-enter RX after this much quiet air. Without it a burst after
+            # >= 2 s of silence lost its first copy about half the time; with
+            # it (500 ms or 2 s, measured 2026-10-09) about 6%. 0 disables.
+            # End a capture once carrier sense has been low this long, so a
+            # capture that outlived its exchange cannot hide the next one's
+            # first copy. Insteon packets in one exchange are 10 ms apart.
+            # Measured 2026-10-09 (back-to-back traffic, three pairs): first
+            # copies 91.6% -> 93.3%, decoded 99.0% -> 99.8%. 0 disables.
+            cv.Optional(CONF_QUIET_END, default="20ms"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(max=cv.TimePeriod(milliseconds=1000)),
+            ),
+            cv.Optional(CONF_IDLE_REARM, default="1s"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(max=cv.TimePeriod(milliseconds=60000)),
+            ),
         }
     )
     .extend(spi.spi_device_schema(cs_pin_required=True))
@@ -250,6 +268,8 @@ async def to_code(config):
         cg.add(var.set_rx_attenuation(config[CONF_RX_ATTENUATION]))
         cg.add(var.set_max_lna_gain(config[CONF_MAX_LNA_GAIN_REDUCTION]))
         cg.add(var.set_carrier_sense_abs(config[CONF_CARRIER_SENSE_THRESHOLD]))
+        cg.add(var.set_idle_rearm_ms(config[CONF_IDLE_REARM].total_milliseconds))
+        cg.add(var.set_quiet_end_ms(config[CONF_QUIET_END].total_milliseconds))
         return
 
     reset = await cg.gpio_pin_expression(config[CONF_RESET_PIN])

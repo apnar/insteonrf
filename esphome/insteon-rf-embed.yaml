@@ -44,7 +44,7 @@ esphome:
   # listener firmware in esphome/. See insteon-rf-main.yaml for why.
   project:
     name: insteonrf.listener
-    version: "2.9.1"
+    version: "2.9.2"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -160,6 +160,10 @@ insteon_rf:
   sync_word: 0x3155
   sync_mode: 16/16 + carrier
   rx_attenuation: 0dB
+  # Re-arm RX after 1 s of quiet: after-silence first copies ~46% -> ~94%.
+  idle_rearm: 1s
+  # End a capture after 20 ms without carrier: busy first copies ~91.6% -> ~93.3%.
+  quiet_end: 20ms
   capture_bytes: 162
   rssi_floor: -110
   manchester_gate: 4
@@ -385,6 +389,34 @@ number:
     set_action:
       - lambda: 'id(rf)->tune_carrier_sense_abs((int8_t) x);'
 
+  # Re-enter RX after this much idle air (0 = never). See cc1101.cpp.
+  - platform: template
+    id: tune_idle_rearm
+    name: ${friendly_name} Tune Idle Rearm
+    entity_category: config
+    unit_of_measurement: ms
+    min_value: 0
+    max_value: 5000
+    step: 50
+    initial_value: 1000
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->set_idle_rearm_ms((uint32_t) x);'
+  # End a capture after this much quiet (0 = never). See cc1101.cpp.
+  - platform: template
+    id: tune_quiet_end
+    name: ${friendly_name} Tune Quiet End
+    entity_category: config
+    unit_of_measurement: ms
+    min_value: 0
+    max_value: 200
+    step: 5
+    initial_value: 20
+    optimistic: true
+    restore_value: false
+    set_action:
+      - lambda: 'id(rf)->set_quiet_end_ms((uint32_t) x);'
   # Raw register override: value = address * 256 + byte, e.g. 0x1D91 =
   # 7569 writes AGCCTRL0 = 0x91. 65535 clears every override. For trying
   # modem settings that have no knob of their own.

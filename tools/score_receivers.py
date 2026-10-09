@@ -71,16 +71,43 @@ def device_sent(ev: dict) -> bool:
     return (ev.get("to") or "").upper() == PLM
 
 
-def score(events: list[dict], ref: list[str], target: str) -> dict:
-    rows: dict[str, dict] = {}
-    for kind in ("device", "plm", "all"):
-        rows[kind] = {"ref": 0, "heard": 0, "decoded": 0, "rssi": [], "first": 0}
+def quiet_before(events: list[dict]) -> list[float]:
+    """Seconds of air with no fused event before each event (events sorted).
+
+    Measured from the previous event's last copy, so a hop repeat or an ACK
+    does not count as the start of a new burst.
+    """
+    out, last = [], None
     for ev in events:
+        t = ev.get("first_seen", ev.get("timestamp", 0.0))
+        out.append(t - last if last is not None else float("inf"))
+        end = ev.get("last_seen", t)
+        last = end if last is None else max(last, end)
+    return out
+
+
+def score(events: list[dict], ref: list[str], target: str, after_silence: float = 0.0,
+          busy_gap: float = 0.0) -> dict:
+    rows: dict[str, dict] = {}
+    for kind in ("device", "plm", "quiet", "busy", "all"):
+        rows[kind] = {"ref": 0, "heard": 0, "decoded": 0, "rssi": [], "first": 0}
+    events = sorted(events, key=lambda e: e.get("first_seen", e.get("timestamp", 0.0)))
+    gaps = quiet_before(events)
+    for ev, gap in zip(events, gaps, strict=True):
         hb = ev.get("heard_by") or {}
         if not any(hb.get(r, {}).get("crc_ok") for r in ref):
             continue
         kind = "device" if device_sent(ev) else "plm"
-        for k in (kind, "all"):
+        kinds = [kind, "all"]
+        # PLM messages that arrive out of at least `after_silence` seconds of
+        # quiet: the case the CC11xx radios lose most.
+        if kind == "plm" and after_silence and gap >= after_silence:
+            kinds.append("quiet")
+        # ...and those that follow other traffic closely, where a capture
+        # still running from the previous exchange can be in the way.
+        if kind == "plm" and busy_gap and gap < busy_gap:
+            kinds.append("busy")
+        for k in kinds:
             row = rows[k]
             row["ref"] += 1
             t = hb.get(target)
@@ -100,11 +127,13 @@ def score(events: list[dict], ref: list[str], target: str) -> dict:
 
 def fmt(label: str, rows: dict) -> str:
     parts = [f"{label:24}"]
-    for kind in ("device", "plm", "all"):
+    for kind in ("device", "plm", "quiet", "busy", "all"):
         r = rows[kind]
+        if kind in ("quiet", "busy") and not r["ref"]:
+            continue
         n = r["ref"] or 1
         med = f"{statistics.median(r['rssi']):.0f}" if r["rssi"] else "--"
-        first = f", 1st {100 * r['first'] / n:5.1f}%" if kind == "plm" else ""
+        first = f", 1st {100 * r['first'] / n:5.1f}%" if kind in ("plm", "quiet", "busy") else ""
         parts.append(f"{kind}: {r['decoded']:4}/{r['ref']:<4} {100 * r['decoded'] / n:5.1f}% "
                      f"(heard {100 * r['heard'] / n:5.1f}%{first}, rssi {med})")
     return "  ".join(parts)
@@ -114,7 +143,14 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--log", type=pathlib.Path, default=LOG)
     p.add_argument("--ref", default="dongle,v3", help="comma-separated reference receivers")
-    p.add_argument("--target", default="insteon-rf-embed")
+    p.add_argument("--target", default="insteon-rf-embed",
+                   help="receiver to score; comma-separated scores several in turn")
+    p.add_argument("--after-silence", type=float, default=0.0, metavar="SECONDS",
+                   help="also report PLM messages preceded by at least this much quiet "
+                        "('quiet' column): out-of-silence bursts are the CC11xx weak spot")
+    p.add_argument("--busy-gap", type=float, default=0.0, metavar="SECONDS",
+                   help="also report PLM messages that follow other traffic within this "
+                        "many seconds ('busy' column)")
     p.add_argument("--since")
     p.add_argument("--until")
     p.add_argument("--windows", type=pathlib.Path, help='file of "label start end" lines')
@@ -135,7 +171,10 @@ def main(argv: list[str] | None = None) -> int:
         p.error("give --since/--until or --windows")
 
     for label, s, e in windows:
-        print(fmt(label, score(load(paths, s, e), ref, a.target)))
+        events = load(paths, s, e)
+        for target in a.target.split(","):
+            name = label if "," not in a.target else f"{label}:{target[:8]}"
+            print(fmt(name, score(events, ref, target, a.after_silence, a.busy_gap)))
     return 0
 
 

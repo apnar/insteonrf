@@ -381,6 +381,29 @@ bool InsteonRFCC1101::configure_radio_() {
   return true;
 }
 
+void InsteonRFCC1101::end_capture_early_() {
+  // Stop the receiver first: the FIFO keeps its contents in IDLE, and reading
+  // it empty can then not race a byte being written (errata SWRZ020).
+  this->strobe_(CC_SIDLE);
+  for (uint8_t i = 0; i < 20 && (this->read_status_(CC_MARCSTATE) & 0x1F) != CC_MARC_IDLE; i++)
+    delayMicroseconds(50);
+  const uint8_t rxbytes = this->read_rxbytes_();
+  if (!(rxbytes & 0x80)) {
+    const uint8_t n = std::min<uint8_t>(rxbytes & 0x7F, this->capture_bytes_ - this->got_);
+    if (n)
+      this->read_fifo_(this->cur_.data + this->got_, n);
+    this->got_ += n;
+    // Shorter than the minimum capture is a noise sync, not an exchange.
+    if (this->got_ >= 32) {
+      this->cur_.len = this->got_;
+      if (xQueueSend(this->queue_, &this->cur_, 0) != pdTRUE)
+        this->queue_drops_++;
+    }
+  }
+  this->quiet_ends_++;
+  this->restart_rx_();
+}
+
 void InsteonRFCC1101::restart_rx_() {
   this->strobe_(CC_SIDLE);
   // SIDLE takes effect within a few us; wait for it rather than guess.
@@ -435,6 +458,35 @@ void InsteonRFCC1101::task_loop_() {
     if (want) {
       this->drain_();
       this->last_drain_ms_ = now_ms;
+    }
+    // Quiet end: a capture still recording after the exchange it synced on
+    // has gone quiet only keeps the radio from syncing on the next one.
+    // Measured 2026-10-09 on PLM first copies within 0.5 s of earlier
+    // traffic: 21 of 36 misses fell inside (17) or at the end (4) of a
+    // capture that had outlived its exchange. Insteon packets in one
+    // exchange are 10 ms apart, so a longer quiet ends the exchange.
+    const uint32_t qe = this->quiet_end_ms_.load();
+    if (qe && this->got_ > 0) {
+      if (this->read_status_(CC_PKTSTATUS) & 0x40) {
+        this->last_carrier_ms_ = now_ms;
+      } else if (now_ms - this->last_carrier_ms_ >= qe) {
+        this->end_capture_early_();
+      }
+    } else {
+      this->last_carrier_ms_ = now_ms;
+    }
+    // Idle re-arm: while the air is quiet (no capture under way, no sync,
+    // nothing in the FIFO), re-enter RX every idle_rearm_ms_. Measured
+    // 2026-10-09: a burst after >= 2 s of silence lost its first copy about
+    // half the time on both CC11xx receivers, against ~9% after a short gap,
+    // although the PLM's signal itself was identical (V3: same CFO and SNR).
+    const uint32_t rearm = this->idle_rearm_ms_.load();
+    if (have_gdo && (this->got_ > 0 || this->gdo0_pin_->digital_read() || this->gdo2_pin_->digital_read()))
+      this->last_busy_ms_ = now_ms;
+    if (rearm && have_gdo && now_ms - this->last_busy_ms_ >= rearm && now_ms - this->last_rearm_ms_ >= rearm) {
+      this->restart_rx_();
+      this->last_rearm_ms_ = now_ms;
+      this->idle_rearms_++;
     }
     if (now_ms - this->last_health_ms_ >= HEALTH_MS) {
       this->health_check_();
@@ -607,13 +659,14 @@ void InsteonRFCC1101::loop() {
     const uint32_t syncs = this->syncs_.load();
     ESP_LOGI(TAG,
              "radio: MARCSTATE 0x%02X, RSSI %.1f dBm (peak %.1f), RXBYTES 0x%02X; last %us: %u syncs, %u captures, "
-             "%u accepted total; overflows %u, stalls %u, re-arms %u, reprogrammed %u, deaf resets %u",
+             "%u accepted total; overflows %u, stalls %u, re-arms %u, reprogrammed %u, deaf resets %u, idle re-arms %u, quiet ends %u",
              (unsigned) this->diag_state_.load(), rssi_dbm_(this->diag_rssi_.load()),
              rssi_dbm_(this->diag_rssi_max_.load()),
              (unsigned) this->diag_rxbytes_.load(), (unsigned) ((now_ms - this->last_diag_log_ms_) / 1000),
              (unsigned) (syncs - this->syncs_at_diag_), (unsigned) (this->captures_ - this->captures_at_diag_),
              (unsigned) this->accepted_, (unsigned) overflows, (unsigned) stalls, (unsigned) recoveries,
-             (unsigned) this->reconfigs_.load(), (unsigned) this->hard_resets_.load());
+             (unsigned) this->reconfigs_.load(), (unsigned) this->hard_resets_.load(),
+             (unsigned) this->idle_rearms_.load(), (unsigned) this->quiet_ends_.load());
     const bool loud = rssi_dbm_(this->diag_rssi_max_.load()) >= DEAF_PEAK_DBM;
     const bool none = this->accepted_ == this->accepted_at_diag_;
     this->deaf_minutes_ = (loud && none) ? this->deaf_minutes_ + 1 : 0;

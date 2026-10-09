@@ -112,6 +112,7 @@ enum : uint8_t {
   CC_LQI = 0x33,
   CC_RSSI = 0x34,
   CC_MARCSTATE = 0x35,
+  CC_PKTSTATUS = 0x38,
   CC_RXBYTES = 0x3B,
 };
 
@@ -171,6 +172,12 @@ class InsteonRFCC1101 : public InsteonRF,
   /// Drive the band switch directly: 0 = from the frequency (normal),
   /// 1 = 315 MHz path, 2 = 433 MHz path, 3 = 868/915 MHz path.
   void tune_band(uint8_t band) { this->band_override_ = band; this->request_reconfig_(); }
+  /// Re-enter RX every `ms` of idle air (0 = never), so a burst that
+  /// arrives after long silence meets freshly reset demodulator loops.
+  void set_idle_rearm_ms(uint32_t ms) { this->idle_rearm_ms_ = ms; }
+  /// End a capture early once carrier sense has been low for `ms` (0 =
+  /// never: every capture runs its full capture_bytes).
+  void set_quiet_end_ms(uint32_t ms) { this->quiet_end_ms_ = ms; }
   /// Sweep [start, stop] in `step` Hz, dwelling `dwell_ms` per step, and log
   /// the peak RSSI per step at INFO. Generate traffic while it runs.
   void request_scan(uint32_t start, uint32_t stop, uint32_t step, uint32_t dwell_ms) {
@@ -217,6 +224,7 @@ class InsteonRFCC1101 : public InsteonRF,
   void apply_band_switch_();
   void program_frequency_(uint32_t hz);
   void run_scan_();
+  void end_capture_early_();
   void restart_rx_();
   static float rssi_dbm_(uint8_t raw) { return (float) (int8_t) raw / 2.0f - 74.0f; }
 
@@ -279,6 +287,13 @@ class InsteonRFCC1101 : public InsteonRF,
   std::atomic<uint8_t> diag_rssi_max_{0x80};  // peak raw RSSI since the last status line
   std::atomic<bool> diag_rssi_reset_{false};
   uint8_t band_override_{0};
+  std::atomic<uint32_t> idle_rearm_ms_{0};
+  std::atomic<uint32_t> quiet_end_ms_{0};
+  uint32_t last_carrier_ms_{0};
+  std::atomic<uint32_t> quiet_ends_{0};
+  uint32_t last_busy_ms_{0};
+  uint32_t last_rearm_ms_{0};
+  std::atomic<uint32_t> idle_rearms_{0};
   uint8_t overrides_[12][2]{};
   uint8_t overrides_n_{0};
   uint32_t scan_start_{0}, scan_stop_{0}, scan_step_{0}, scan_dwell_ms_{0};

@@ -358,11 +358,16 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   the CRC fails, so **one soft copy alone can be repaired** while hard copies still need
   two. `publish_capture` ships from just after the first header in either polarity and
   says which in `sw` — an SDR burst starts with preamble, unlike a FIFO dump.
-- Generating test traffic on this host: publish to `insteon/command/<addr>` via the Home
-  Assistant `mqtt.publish` service, or with the clients in the HA pod's `mosquitto` sidecar
-  (`kubectl exec homeassistant -c mosquitto -- mosquitto_pub -h 127.0.0.1 …`; the host and
-  the `insteon` sidecar have none), e.g. payload `{"cmd":"get_engine","session":"x"}`;
-  dual-band devices repeat it on RF.
+- Generating test traffic on this host: `tools/test_traffic.py` (closed loop: the next
+  `get_engine` only after the previous one's END; `--pause` sets the quiet between
+  exchanges). One-offs: publish to `insteon/command/<addr>` via the Home Assistant
+  `mqtt.publish` service, or with `mosquitto_pub` in the HA pod's `mosquitto` sidecar
+  (`kubectl exec homeassistant -c mosquitto -- mosquitto_pub -h 127.0.0.1 …`), payload
+  `{"cmd":"get_engine","session":"x"}`. **Never publish commands at a fixed rate**: on
+  2026-10-09 a 0.3 s publisher outran the PLM, insteon-mqtt queued thousands of commands,
+  and reused session ids made it fan every reply out at ~5,000 log lines a second. Real
+  light commands waited about 20 min until the insteon sidecar was restarted (`kill -TERM`
+  its `start.py`). Dual-band devices repeat `get_engine` on RF.
 - `Makefile.kali`, the WAV-header readers, `Doc/pkt_format.txt` and the never-committed
   `fsk2_mod.c` (liquid-dsp) are gone; `insteon-rf modulate` replaced the last of these.
 - **Insteon RF repeating is synchronous simulcast on a slot grid.** Measured 2026-09-15
@@ -442,6 +447,13 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   threshold undoes it. The dongle had the same problem and has the same fix
   (`RfcatRadio(foccfg=0x37)`, `--foccfg` to override): first copy ~62% -> ~95% in an
   interleaved A/B. Measure first-copy rate with `tools/score_receivers.py`.
+- **CC11xx radios also go stale after ~1-2 s of quiet** (2026-10-09, `Doc/T-EMBED.md`). A
+  burst after >= 2 s of silence lost its first copy ~half the time on the T-Embed *and*
+  the dongle, with FOCCFG 0x37 or without and with the FOC loop off. Re-entering RX
+  clears it: the T-Embed re-arms after 1 s idle (`idle_rearm`, 42-52% -> 93-97%). The
+  dongle's equivalent (its `--max-silence` re-arm is 20 s) is untested. The PLM's signal
+  after silence is unchanged per the V3 (same CFO/SNR) and per raw I/Q. Score with
+  `tools/score_receivers.py --after-silence 2` under `tools/test_traffic.py --pause 8`.
 - The T-Embed's live-tuning entities and `tools/embed_api.py` (copied to `/k8s/homeassistant/esphome/.tune/`)
   (native API, run in the esphome sidecar) make an A/B a matter of minutes, not
   reflashes. Score A/Bs against the V3 alone whenever the dongle is not healthy.

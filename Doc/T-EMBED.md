@@ -211,6 +211,55 @@ the V3 under the same traffic:
 | 0x17, 3 windows | 61.2-63.7% | 92.1-95.2% |
 | 0x37, 4 windows (before and after the 0x17 control) | 91.1-98.5% | 93.2-97.9% |
 
+## After silence and back-to-back (2026-10-09)
+
+The 2.9.1 tuning ran with an exchange every ~1.2 s, and that hid two cases.
+Over one night of natural traffic (17:00-09:00), scored against the V3:
+
+- **A PLM message after >= 2 s of quiet** was caught first-copy only ~42% of
+  the time by the T-Embed and ~56% by the dongle. The V3 caught 100%.
+- **A PLM message within 0.5 s of other traffic** was caught ~75% of the time
+  by the T-Embed and ~88% by the dongle.
+
+**The PLM's signal is not the cause.** Bucketed by the preceding quiet, the
+V3 measures the same carrier offset (-7.3 kHz) and SNR (33 dB) for every
+gap. A raw I/Q recording on the spare SDR shows a steady envelope, a constant
+offset and an on-grid start for the originals. The weakness is in the CC11xx
+receiver.
+
+Measured with `tools/test_traffic.py --pause 8` (bursts out of silence),
+10-minute windows, against the V3, "1st" for PLM messages after >= 2 s of
+quiet:
+
+| T-Embed setting | after-silence 1st | dongle in the same window (unchanged) |
+|---|---|---|
+| baseline, 4 runs | 42-52% | 46-67% |
+| FOC off (FOCCFG 0x34) | 53% | 55% |
+| FOC gentler/limited (0x25) | 53% | 47% |
+| relative carrier sense +6 dB, 3 runs | 61-73% | 41-51% |
+| relative +10 dB, absolute off | 69% (but 89% decoded) | 49% |
+| absolute carrier sense +3 dB | 45% | 58% |
+| **re-arm RX after 500 ms idle** | **95%** | (dongle down) |
+| **re-arm RX after 2 s idle** | **93%** | |
+| relative +6 dB *and* re-arm 500 ms | 66% | |
+
+**Something in the CC1101's RX state goes stale after a second or two without
+a packet, and re-entering RX clears it.** The frequency-offset loop is not
+it, since switching the loop off entirely changed nothing. 2.9.2 re-arms
+after 1 s of quiet air (`idle_rearm`). A re-arm costs ~0.8 ms of deafness
+(it recalibrates), once a second while nothing is arriving. Stock 2.9.2,
+confirmed: 97% and 93% after silence, and 95% for 1.5 s spacing (no
+regression).
+
+**Back-to-back:** a capture-geometry attribution over 90 minutes of the
+T-Embed's own captures put most rapid-burst misses inside or at the end of a
+capture that had outlived its exchange (21 of 36). The rest were plain
+sync misses (15). The idle re-arm alone raised busy first copies to ~92%.
+**`quiet_end`** (end a capture after 20 ms without carrier sense; packets in
+one exchange are 10 ms apart) adds a little on top. Three interleaved pairs
+under closed-loop back-to-back traffic: first copy 91.6% -> 93.3% and
+decoded 99.0% -> 99.8%, with device replies unchanged at ~97%.
+
 ## Live tuning
 
 Number/select entities (entity category *config*), applied by the radio
@@ -221,6 +270,7 @@ always returns to the YAML:
   `Tune Sync Mode`, `Tune Sync Word` (3155/CEAA), `Tune Carrier Sense
   Threshold`, `Tune LNA Gain Reduction`, `Tune RX Attenuation`,
   `Tune Band Switch` (auto/315/433/915).
+- `Tune Idle Rearm` (ms, 0 = off) and `Tune Quiet End` (ms, 0 = off).
 - `Tune Register`: value = address × 256 + byte, e.g. 6455 = `0x1937` writes
   FOCCFG = 0x37; 65535 clears all overrides. Any config register, on top
   of the computed configuration.
