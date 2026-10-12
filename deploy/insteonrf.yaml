@@ -79,6 +79,12 @@ spec:
         # times for nothing. A reset now happens only if the dongle stops
         # answering altogether, which --diag-after decides.
         - --max-silence=20
+        # A different staleness: after a second or two of quiet the CC1111
+        # loses the first copy of the next burst. Strobing IDLE -> RX after
+        # 1 s with no block took first copies after silence from 88.6% to
+        # 98.2% (ABBA x2, 2026-10-11). It is the monitor's default; spelled
+        # out here because it is the reason the first copy is caught.
+        - --idle-rearm=1
         - --diag-after=300
         - --out=/config/log/insteon-rf.jsonl
         - --watch-all-on

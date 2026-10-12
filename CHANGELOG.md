@@ -4,6 +4,23 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 2.10.0 — 2026-10-11
+
+- **rfcat dongle: strobe IDLE -> RX after 1 s with no block**
+  (`monitor --idle-rearm`, default 1; `RfcatRadio.rearm()`), the dongle's
+  version of the T-Embed's `idle_rearm`. Two firmware mode commands, skipped
+  while PKTSTATUS shows a packet arriving (SFD or CS). ABBA x2 on the live pod
+  with 8 s spacing, against the V3: first copies after silence 88.6% -> 98.2%
+  (248/280 -> 274/279); device-sent messages unchanged (86.0% / 86.3%).
+- **rfcat dongle: no USB reset for quiet air.** `_wedged()` required repeated
+  timeouts plus `usb_errors > 0`, but rflib's count never goes down: after a
+  single old error, any three quiet timeouts reset the dongle. It now counts
+  errors since the last block.
+- **T-Embed: passive Bluetooth proxy** for BTHome sensors (scan 1100/1100 ms,
+  `active: false`), with advert counters, loop time/heap sensors and a live
+  "Tune BLE Scan Window". Scanning measured no cost to Insteon reception, quiet
+  or busy (`Doc/T-EMBED.md`).
+
 ## 2.9.2 — 2026-10-09
 
 - **T-Embed: re-arm RX after 1 s of quiet air** (`idle_rearm`, default 1 s). A

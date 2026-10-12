@@ -194,7 +194,9 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   register writes and can only lose a packet mid-flight) and no time-based heal at all:
   `_silence_action` never returns `heal`, and a reset happens only when
   `--diag-after` (300 s) finds the dongle no longer answering, or `receive()` hits
-  repeated USB errors. Liveness is a *decoded packet*, never a block.
+  repeated USB errors. Liveness is a *decoded packet*, never a block. rflib's
+  `_usberrorcnt` never goes down, so `_wedged()` counts only errors since the last block;
+  counting "any ever" made every third quiet timeout a USB reset after one old error.
   Leading mechanism, per the firmware: its RF ISR drops a packet **without re-arming
   DMA** when the main loop has not shipped the previous one, so anything that keeps the
   host from draining EP5 during a burst costs the whole spell after it. Hence the
@@ -450,10 +452,16 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
 - **CC11xx radios also go stale after ~1-2 s of quiet** (2026-10-09, `Doc/T-EMBED.md`). A
   burst after >= 2 s of silence lost its first copy ~half the time on the T-Embed *and*
   the dongle, with FOCCFG 0x37 or without and with the FOC loop off. Re-entering RX
-  clears it: the T-Embed re-arms after 1 s idle (`idle_rearm`, 42-52% -> 93-97%). The
-  dongle's equivalent (its `--max-silence` re-arm is 20 s) is untested. The PLM's signal
+  clears it: the T-Embed re-arms after 1 s idle (`idle_rearm`, 42-52% -> 93-97%), the
+  dongle after 1 s with no block (`monitor --idle-rearm`, default 1: an IDLE -> RX strobe,
+  skipped while PKTSTATUS shows SFD or CS; 88.6% -> 98.2% in ABBA x2, 2026-10-11). That is
+  separate from `--max-silence` (20 s with no *decoded* packet, full `configure_rx`). The PLM's signal
   after silence is unchanged per the V3 (same CFO/SNR) and per raw I/Q. Score with
   `tools/score_receivers.py --after-silence 2` under `tools/test_traffic.py --pause 8`.
+- **The T-Embed is also a passive BLE proxy** (2.10.0) for the 22 BTHome thermometers:
+  scan 1100/1100 ms, `bluetooth_proxy: active: false`. Off / 320 / 1100 ms measured the
+  same on Insteon, quiet and busy (`Doc/T-EMBED.md`); "Tune BLE Scan Window" = 0 turns it
+  off live if that ever needs re-checking.
 - The T-Embed's live-tuning entities and `tools/embed_api.py` (copied to `/k8s/homeassistant/esphome/.tune/`)
   (native API, run in the esphome sidecar) make an A/B a matter of minutes, not
   reflashes. Score A/Bs against the V3 alone whenever the dongle is not healthy.

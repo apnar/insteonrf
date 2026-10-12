@@ -54,6 +54,11 @@ SYNC_START_HEADER = int(START_HEADER_INV, 2)
 FOCCFG_RX = 0x37
 #: CC1111 XDATA address of FOCCFG, for when rflib does not export it.
 FOCCFG_ADDR = 0xDF15
+#: CC1111 XDATA address of PKTSTATUS, and the bits that mean "a packet is
+#: arriving": SFD (sync word found, until the packet ends) and CS.
+PKTSTATUS_ADDR = 0xDF3C
+PKTSTATUS_SFD = 0x08
+PKTSTATUS_CS = 0x40
 
 #: CC1101/CC1111 RSSI register offset for this configuration (datasheet).
 RSSI_OFFSET_DB = 74.0
@@ -276,6 +281,8 @@ class RfcatRadio:
         self._tx = False
         self._timeouts = 0
         self._heals = 0
+        #: rflib's USB error count as of the last block received.
+        self._usb_errors_ok = 0
         self.dev = self._open()
         self._common()
 
@@ -370,6 +377,26 @@ class RfcatRadio:
         # the radio state around the write.
         d.setRFRegister(getattr(rf, "FOCCFG", FOCCFG_ADDR), self.foccfg, suppress=True)
         d.setModeRX()
+
+    def rearm(self) -> bool:
+        """Strobe IDLE -> RX, leaving the configuration alone.
+
+        After a second or two of quiet the CC11xx loses the first copy of the
+        next burst about half the time, FOCCFG gated or not; re-entering RX
+        clears it (measured on the T-Embed's CC1101, 2026-10-09, where it took
+        first copies after silence from ~45% to ~95%). This is that re-entry:
+        two firmware mode commands instead of :meth:`configure_rx`'s couple of
+        dozen register writes. Returns False, doing nothing, while PKTSTATUS
+        says a packet is arriving (sync found or carrier sensed), so the
+        strobe cannot cut one off.
+        """
+        d = self.dev
+        status = d.peek(getattr(self.rflib, "X_PKTSTATUS", PKTSTATUS_ADDR), 1)[0]
+        if status & (PKTSTATUS_SFD | PKTSTATUS_CS):
+            return False
+        d.setModeIDLE()
+        d.setModeRX()
+        return True
 
     def configure_tx(self) -> None:
         """Set up for transmitting: the radio adds its own ``AA`` preamble and a
@@ -531,7 +558,11 @@ class RfcatRadio:
             return True
         if getattr(self.dev, "resetup_error", None) is not None:
             return True
-        return self._timeouts >= self.max_usb_errors and self.usb_errors > 0
+        # rflib's count never goes down, so "any error ever" would make every
+        # third timeout of quiet air a USB reset for the rest of the run --
+        # three seconds of quiet under --idle-rearm 1.
+        return (self._timeouts >= self.max_usb_errors
+                and self.usb_errors > self._usb_errors_ok)
 
     def heal(self) -> bool:
         """USB-reset the dongle from outside, then reopen it in the last mode.
@@ -553,6 +584,7 @@ class RfcatRadio:
         self.dev = self._open()
         self._common()
         self._timeouts = 0
+        self._usb_errors_ok = self.usb_errors
         if self._rx_kwargs is not None:
             self.configure_rx(**self._rx_kwargs)
         elif self._tx:
@@ -588,6 +620,7 @@ class RfcatRadio:
                 return None
             raise
         self._timeouts = 0
+        self._usb_errors_ok = self.usb_errors
         return ts - len(data) * 8 / self.drate, bytes(data)
 
     def receive_bits(self, timeout_ms: int = 2000) -> tuple[float, str] | None:

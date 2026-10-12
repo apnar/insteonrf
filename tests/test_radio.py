@@ -129,6 +129,9 @@ class FakeDongle:
         self.mode = None
         self.sent = []
         self.cleaned = False
+        self.modes = []
+        self.peeks = []
+        self.pktstatus = 0x00
 
     # configuration calls RfcatRadio makes; all no-ops here
     def __getattr__(self, name):
@@ -138,6 +141,15 @@ class FakeDongle:
 
     def setModeIDLE(self):
         self.mode = "idle"
+        self.modes.append("idle")
+
+    def setModeRX(self):
+        self.mode = "rx"
+        self.modes.append("rx")
+
+    def peek(self, addr, count=1):
+        self.peeks.append(addr)
+        return bytes([self.pktstatus])
 
     def cleanup(self):
         self.cleaned = True
@@ -253,6 +265,44 @@ def test_plain_timeouts_do_not_trigger_a_reset(fake_radio):
     for _ in range(10):
         radio.receive_bits()
     assert radio._heals == 0 and len(fake_radio) == 1
+
+
+def test_old_usb_errors_do_not_make_quiet_air_a_reset(fake_radio):
+    """rflib never lowers its error count; only errors since the last block count."""
+    radio = rfcat_mod.RfcatRadio(max_usb_errors=2)
+    radio.configure_rx()
+    dev = radio.dev
+    dev.fail_after = None
+    dev._usberrorcnt = 7          # long ago
+    dev.blocks = [b"\xff\x00"]
+    assert radio.receive_bits() is not None
+    for _ in range(10):           # then a quiet minute
+        assert radio.receive_bits() is None
+    assert radio._heals == 0 and len(fake_radio) == 1
+    dev._usberrorcnt += 1         # fresh trouble does still count
+    radio.receive_bits()
+    assert radio._heals == 1
+
+
+def test_rearm_strobes_idle_then_rx(fake_radio):
+    radio = rfcat_mod.RfcatRadio()
+    radio.configure_rx()
+    dev = radio.dev
+    dev.modes.clear()
+    assert radio.rearm() is True
+    assert dev.modes == ["idle", "rx"]
+    assert dev.peeks == [rfcat_mod.PKTSTATUS_ADDR]
+
+
+@pytest.mark.parametrize("status", [0x08, 0x40, 0x48])
+def test_rearm_leaves_an_arriving_packet_alone(fake_radio, status):
+    radio = rfcat_mod.RfcatRadio()
+    radio.configure_rx()
+    dev = radio.dev
+    dev.modes.clear()
+    dev.pktstatus = status | 0x10          # CCA etc. do not matter
+    assert radio.rearm() is False
+    assert dev.modes == []
 
 
 def test_transmit_bits_packs_and_idles(fake_radio):

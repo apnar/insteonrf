@@ -812,6 +812,13 @@ def monitor_main(argv: list[str] | None = None) -> int:
                         "reads downstream as 'there was no traffic' rather than as a fault, and "
                         "re-arming is what recovers it -- so this is seconds, not minutes "
                         "(default %(default)s)")
+    p.add_argument("--idle-rearm", type=float, default=1.0, metavar="SECONDS",
+                   help="strobe the radio IDLE -> RX after this many seconds with no block at "
+                        "all, and again every as long while the air stays quiet (0 disables). "
+                        "CC11xx radios lose the first copy of a burst out of silence about half "
+                        "the time; re-entering RX clears it (88.6%% -> 98.2%% of first copies on "
+                        "the dongle). Only radios with a rearm() take part. The receive timeout "
+                        "is capped at this (default %(default)s)")
     p.add_argument("--diag-after", type=float, default=300.0, metavar="SECONDS",
                    help="after this long with no decoded packet, log what the radio says it is "
                         "doing, and USB-reset it if it has stopped answering altogether "
@@ -880,6 +887,7 @@ def monitor_main(argv: list[str] | None = None) -> int:
     live = _Liveness()
     last_action = time.time()
     rearms = heals = 0
+    idle_rearms = idle_skips = 0
     if a.mesh_capture:
         if mqtt is None:
             p.error("--mesh-capture needs --mqtt")
@@ -1002,14 +1010,34 @@ def monitor_main(argv: list[str] | None = None) -> int:
                 diag("after heal")
 
             last_diag = 0.0
+            idle_rearm = a.idle_rearm if hasattr(radio, "rearm") else 0.0
+            timeout_ms = a.timeout
+            if idle_rearm > 0:
+                timeout_ms = max(50, min(a.timeout, int(idle_rearm * 1000)))
+            # Any block, decodable or not, is activity: re-arming is about the
+            # radio's loops having gone stale on empty air, not about liveness.
+            last_block = time.time()
             diag("at start")
             while not STOP.is_set():
                 if DIAG.is_set():
                     DIAG.clear()
                     diag(f"on request ({live.junk_blocks} undecodable block(s) "
                          "since the last packet)")
-                got = _receive(radio, a.timeout)
+                got = _receive(radio, timeout_ms)
                 now = time.time()
+                if got is not None:
+                    last_block = now
+                elif idle_rearm > 0 and now - last_block >= idle_rearm:
+                    try:
+                        if radio.rearm():
+                            idle_rearms += 1
+                            last_block = now
+                        else:
+                            idle_skips += 1
+                    except Exception as err:
+                        # The silence watchdog below owns recovery.
+                        log.debug("idle re-arm failed: %r", err)
+                        last_block = now
                 quiet = now - live.last_packet
                 if (_silence_action(quiet, a.max_silence) == "rearm"
                         and now - last_action >= a.max_silence):
@@ -1082,6 +1110,9 @@ def monitor_main(argv: list[str] | None = None) -> int:
             log.info("mqtt: %d packet(s), %d alert(s), %d capture(s) published",
                      mqtt.published, mqtt.alerts, mqtt.captures)
             mqtt.close()
+        if idle_rearms or idle_skips:
+            log.info("idle re-arm: %d strobe(s), %d skipped mid-packet",
+                     idle_rearms, idle_skips)
         if rearms or heals:
             # Re-arms are routine now and cheap; heals are not, and a
             # dropped block means the decoder could not keep up.

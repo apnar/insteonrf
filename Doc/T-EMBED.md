@@ -295,6 +295,33 @@ Other knobs, when placement changes:
 - **Next to the PLM.** If the gate rejects loud packets, try
   `rx_attenuation: 12dB`.
 
+## Bluetooth proxy (2026-10-11)
+
+The board is also a passive Bluetooth proxy for the house's 22 BTHome
+thermometers. BTHome puts everything in the advertisement, so the tracker
+scans passively and `bluetooth_proxy` has `active: false`: no scan requests,
+no connection slots. The BLE controller and host run on core 0 with WiFi; the
+radio task keeps core 1. Sensors added for it: BLE Adverts, BTHome Adverts and
+BTHome Sensors Heard (per minute), Loop Time and heap. "Tune BLE Scan Window"
+changes the window per 1100 ms interval live (0 stops scanning).
+
+A/B, 5-minute blocks rotating off / 320 ms / 1100 ms, scored against the V3,
+with arrival lag measured from the capture's on-air stamp to the broker:
+
+| window | quiet traffic, PLM 1st copy | busy traffic, PLM caught | lag median / p95 | BTHome adverts/min | sensors/min |
+|---|---|---|---|---|---|
+| off | 97-100% | 90.8% | 207 / 329 ms | 0 | 0 |
+| 320 ms | 97-100% | 92.9% | 240 / 406 ms | 32 | 14.3 |
+| 1100 ms | 94-97% | 93.1% | 241 / 368 ms | 110 | 16.7 |
+
+(4 rotations quiet with `--pause 8`, 3 busy with `--pause 0`.) Scanning costs
+Insteon nothing measurable; it adds ~35 ms of publish latency, well inside the
+mesh's 1 s lateness. Loop time (~64 ms max), heap (~127 kB free) and Lost (0)
+did not move. So the YAML keeps the full 1100 ms window. The busy windows
+swung between 83% and 99% for every setting, and the dongle missed exactly the
+same messages in the same windows: events the V3 reference alone counted, not
+a receiver fault. The air here carries ~5,200 BLE adverts a minute.
+
 ## Diagnostics
 
 Every minute the board logs a status line at INFO:

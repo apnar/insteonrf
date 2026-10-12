@@ -233,6 +233,76 @@ def test_stop_flag_ends_the_receive_loop(monkeypatch):
         cli.STOP.clear()
 
 
+def test_idle_rearm_strobes_the_radio_on_quiet_air(monkeypatch):
+    """--idle-rearm: after that long with no block, re-enter RX, and keep doing
+    so while the air stays quiet; the receive timeout is capped to match."""
+    import time as _time
+
+    from insteonrf.radio import FileRadio
+
+    data = pathlib.Path(__file__).parent / "data" / "rfcat-get-engine.txt"
+
+    class QuietRadio(FileRadio):
+        reads = 0
+        timeouts: list[int] = []
+        strobes = 0
+
+        def receive_bits(self, timeout_ms=2000):
+            self.reads += 1
+            self.timeouts.append(timeout_ms)
+            if self.reads == 1:
+                return super().receive_bits(timeout_ms)
+            if self.reads >= 12:
+                cli.STOP.set()
+            _time.sleep(timeout_ms / 1000)
+            return None
+
+        def rearm(self):
+            # The second strobe finds a packet arriving and declines.
+            self.strobes += 1
+            return self.strobes != 2
+
+    radio = QuietRadio(paths=[data], loop=True)
+    radio.lossless = False
+    monkeypatch.setattr(cli, "_open_radio", lambda *a, **k: radio)
+    try:
+        rc, _, _ = run(cli.monitor_main, ["--quiet", "--idle-rearm", "0.05"])
+        assert rc == 0
+        assert set(radio.timeouts) == {50}
+        # Ten quiet 50 ms reads after the block: a strobe on each.
+        assert 8 <= radio.strobes <= 11
+    finally:
+        cli.STOP.clear()
+
+
+def test_idle_rearm_can_be_disabled(monkeypatch):
+    from insteonrf.radio import FileRadio
+
+    data = pathlib.Path(__file__).parent / "data" / "rfcat-get-engine.txt"
+
+    class Radio(FileRadio):
+        reads = 0
+        strobes = 0
+
+        def receive_bits(self, timeout_ms=2000):
+            self.reads += 1
+            if self.reads >= 3:
+                cli.STOP.set()
+            return None
+
+        def rearm(self):
+            self.strobes += 1
+            return True
+
+    radio = Radio(paths=[data], loop=True)
+    monkeypatch.setattr(cli, "_open_radio", lambda *a, **k: radio)
+    try:
+        assert run(cli.monitor_main, ["--quiet", "--idle-rearm", "0"])[0] == 0
+        assert radio.strobes == 0
+    finally:
+        cli.STOP.clear()
+
+
 def test_signal_handlers_set_the_stop_flag():
     import signal
 
