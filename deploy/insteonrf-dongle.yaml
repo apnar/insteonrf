@@ -16,28 +16,30 @@
 # NEVER add a transmit command here: the PLM owns the air. Topic prefix is
 # insteon-rf/ so it cannot collide with insteon-mqtt's insteon/ prefix.
 #
-# Image is built locally from /nvme/k8s/insteonrf-config/build (buildah bud →
-# ctr image import), so imagePullPolicy MUST stay Never:
-#   cd /nvme/k8s/insteonrf-config/build && buildah bud -t insteonrf:local . \
-#     && rm -f /var/tmp/insteonrf.tar \
-#     && buildah push localhost/insteonrf:local \
-#          docker-archive:/var/tmp/insteonrf.tar:localhost/insteonrf:local \
-#     && microk8s ctr image import /var/tmp/insteonrf.tar
+# Image is built locally from /nvme/k8s/insteonrf-config/build and served by the
+# local registry (registry.yaml). Shared by all three insteonrf-* pods:
+#   cd /nvme/k8s/insteonrf-config/build && T=$(date +%Y%m%d) \
+#     && buildah bud -t localhost:32000/insteonrf:$T . \
+#     && buildah push --tls-verify=false localhost:32000/insteonrf:$T
+# then bump the tag in insteonrf-dongle.yaml, insteonrf-v3.yaml, insteonrf-mesh.yaml.
+#
+# Pod renamed insteonrf → insteonrf-dongle on 2026-10-15 (pods are named for their
+# receiver: dongle, v3, mesh).
 #
 # The dongle is exclusive: stop this pod before running insteon-rf by hand.
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: insteonrf
+  name: insteonrf-dongle
   labels:
-    app: insteonrf
+    app: insteonrf-dongle
 spec:
   restartPolicy: Always
   containers:
-    - name: insteonrf
-      image: localhost/insteonrf:local
-      imagePullPolicy: Never
+    - name: insteonrf-dongle
+      image: localhost:32000/insteonrf:20261012
+      imagePullPolicy: IfNotPresent
       # privileged + /dev/bus/usb: rflib drives the CC1111 over raw USB.
       securityContext:
         privileged: true

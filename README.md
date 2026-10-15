@@ -234,7 +234,7 @@ insteon-rf monitor -o insteon-rf.jsonl --mqtt 192.168.1.10:1883 --topic insteon-
 ```
 
 One JSON object per packet, mesh repeats folded together, to a rotating file
-and/or MQTT. [deploy/insteonrf.yaml](deploy/insteonrf.yaml) runs exactly this
+and/or MQTT. [deploy/insteonrf-dongle.yaml](deploy/insteonrf-dongle.yaml) runs exactly this
 as a receive-only Kubernetes Pod.
 
 Every command takes `-h`, and `insteon-rf` on its own lists them. All of it is
@@ -291,7 +291,7 @@ and flips the least-confident bits looking for a CRC match.
 
     Src/                    C demodulator / burst splitter (legacy fast path)
     esphome/                ESPHome component + node config for an SX1262 board
-    deploy/insteonrf.yaml   k8s Pod: the rfcat dongle, logging and mesh capture
+    deploy/insteonrf-dongle.yaml   k8s Pod: the rfcat dongle, logging and mesh capture
     deploy/insteonrf-v3.yaml    the same for an RTL-SDR Blog V3, picked by serial
     deploy/insteonrf-mesh.yaml  the fusing service, no radio of its own
     deploy/insteon-mqtt/    patch series giving insteon-mqtt its raw topics
@@ -393,7 +393,7 @@ with the same fault buries the event you are waiting for. Every sender also accu
 all-link traffic, CRC failures and repaired bits, so a repeat offender rises to
 the top of the exit summary even between events.
 
-[deploy/insteonrf.yaml](deploy/insteonrf.yaml) runs exactly this as a
+[deploy/insteonrf-dongle.yaml](deploy/insteonrf-dongle.yaml) runs exactly this as a
 receive-only Kubernetes Pod (built from [deploy/Containerfile](deploy/Containerfile)
 — note it installs `libusb-1.0-0`, which `python:*-slim` lacks and without
 which `rflib` cannot see the dongle). The pod exits with a one-line error if
@@ -770,7 +770,7 @@ hackrf_transfer -x 20 -a 1 -s 2400000 -f 914950000 -t ping.iq
 insteon-rf pkt -s 2B.93.07 -d 29.4E.52 0F 00 | insteon-rf send --backend hackrf
 ```
 
-Log everything (this is what `deploy/insteonrf.yaml` runs):
+Log everything (this is what `deploy/insteonrf-dongle.yaml` runs):
 
 ```
 export INSTEONRF_MQTT_USER=... INSTEONRF_MQTT_PASS=...   # keeps it out of ps

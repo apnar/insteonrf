@@ -30,8 +30,8 @@
 # 86% vs 83%, fewer syncs that fail to decode every time, and 70% of
 # samples clipped per burst instead of 95%. Small, but never the other way.
 #
-# Uses the same locally built image as the other two pods, so
-# imagePullPolicy MUST stay Never. See deploy/insteonrf.yaml for the build.
+# Uses the same locally built image as the other two pods (local registry).
+# See insteonrf-dongle.yaml for the build.
 ---
 apiVersion: v1
 kind: Pod
@@ -43,8 +43,8 @@ spec:
   restartPolicy: Always
   containers:
     - name: insteonrf-v3
-      image: localhost/insteonrf:local
-      imagePullPolicy: Never
+      image: localhost:32000/insteonrf:20261012
+      imagePullPolicy: IfNotPresent
       # privileged + /dev/bus/usb: librtlsdr drives the tuner over raw USB.
       securityContext:
         privileged: true

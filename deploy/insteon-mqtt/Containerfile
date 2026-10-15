@@ -27,19 +27,18 @@
 # and the verification below imports insteon_mqtt with **no sys.path
 # manipulation** so it exercises whichever copy actually wins.
 #
-# Build and load into microk8s (same pattern as nfhs-relay and insteonrf):
+# Build and push to the host's local registry (localhost:32000, since 2026-10-15;
+# same pattern as nfhs-relay and insteonrf):
 #
 #   cd /nvme/k8s/insteon-config/build
-#   buildah bud -t insteon-mqtt-raw:local .
-#   TAR=/var/tmp/imqtt-raw-$(date +%s).tar   # docker-archive cannot overwrite
-#   buildah push localhost/insteon-mqtt-raw:local \
-#     docker-archive:$TAR:localhost/insteon-mqtt-raw:local
-#   microk8s ctr image import $TAR
+#   T=localhost:32000/insteon-mqtt-raw:$(date +%Y%m%d)   # new tag every build
+#   buildah bud -t $T . && buildah push --tls-verify=false $T
+#   # bump the insteon container's image: in /k8s/yaml/homeassistant.yaml to $T, then
 #   microk8s kubectl delete pod homeassistant
 #   microk8s kubectl apply -f /k8s/yaml/homeassistant.yaml
 #
-# The manifest must use `image: localhost/insteon-mqtt-raw:local` with
-# `imagePullPolicy: Never`.
+# The manifest must use that localhost:32000 tag (imagePullPolicy IfNotPresent),
+# never the upstream image, which would silently drop the patches.
 
 FROM docker.io/td22057/amd64-insteon-mqtt@sha256:e98ceedc6b16c06b67bf66fed56dceccbddf0c1e5e476c48f3e0eb4bb5cf70e7
 

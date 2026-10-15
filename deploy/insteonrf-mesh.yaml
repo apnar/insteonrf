@@ -37,8 +37,8 @@
 #   cp deploy/insteonrf-mesh.yaml /k8s/yaml/
 #   microk8s kubectl apply -f /k8s/yaml/insteonrf-mesh.yaml
 #
-# Uses the same locally built image as the insteonrf pod, so
-# imagePullPolicy MUST stay Never.
+# Uses the same locally built image as insteonrf-dongle (local registry;
+# see insteonrf-dongle.yaml for the build).
 ---
 apiVersion: v1
 kind: Pod
@@ -50,8 +50,8 @@ spec:
   restartPolicy: Always
   containers:
     - name: mesh
-      image: localhost/insteonrf:local
-      imagePullPolicy: Never
+      image: localhost:32000/insteonrf:20261012
+      imagePullPolicy: IfNotPresent
       env:
         - name: TZ
           value: "America/New_York"

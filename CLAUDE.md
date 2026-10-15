@@ -71,7 +71,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, publish, counters), radios `cc1101.cpp` (T-Embed, live) and `sx1262.cpp` (Heltec, retired 2026-10-08), chosen by `radio:` |
 | `esphome/insteon-rf-embed.yaml` | the LilyGO T-Embed CC1101 listener (`Doc/T-EMBED.md`); the Heltec's config is in `esphome/retired/` |
 | `tools/score_receivers.py` | score one receiver against a fixed reference set from the mesh event log, per time window (the A/B yardstick) |
-| `deploy/insteonrf.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/root/homelab/docs/k8s.md` conventions) |
+| `deploy/insteonrf-dongle.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/root/homelab/docs/k8s.md` conventions) |
 | `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
 | `deploy/insteonrf-v3.yaml` | an RTL-SDR Blog V3 (serial `INST915`) as a third listener (`--mesh-capture=v3`), the only one producing soft decisions |
 | `deploy/insteon-mqtt/` | patch series + Containerfile adding `insteon/raw/rx` and `insteon/raw/inject` to insteon-mqtt |
