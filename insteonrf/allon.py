@@ -59,8 +59,21 @@ DEFAULT_COOLDOWN_S = 300.0
 DEFAULT_WINDOW_S = 30.0
 
 #: A storm is this many distinct group broadcasts inside `storm_window_s`.
+#: Distinct means hop repeats of one message count once: a single PLM scene
+#: reaches the listener as up to four copies, so counting copies made ordinary
+#: scene traffic a "storm" (797 windows in 32 days, peak 30 copies). Counted as
+#: distinct messages the same 32 days peaked at 9.
 DEFAULT_STORM_COUNT = 12
 DEFAULT_STORM_WINDOW_S = 3.0
+
+
+def _message_key(p: Packet) -> tuple[int, ...]:
+    """A message's bytes with what a repeat changes masked out."""
+    data = list(p.data[: p.crc_index + 1])
+    data[0] &= ~0x0C          # hops-left
+    if len(data) > p.crc_index:
+        data[p.crc_index] = 0  # and the CRC computed over it
+    return tuple(data)
 
 
 @dataclass
@@ -150,7 +163,8 @@ class AllOnWatcher:
         self.triggers: list[Trigger] = []
         #: How many repeats of each trigger signature the cooldown swallowed.
         self.suppressed: dict[tuple[str, str, int], int] = {}
-        self._recent_groups: list[tuple[float, int]] = []
+        #: (first seen, message key) of each distinct group broadcast in the storm window.
+        self._recent_groups: list[tuple[float, tuple[int, ...]]] = []
         self._last_fired: dict[tuple[str, str, int], float] = {}
 
     # ---- ingest ----
@@ -192,9 +206,11 @@ class AllOnWatcher:
     def _check(self, pkt: Packet, now: float) -> list[Trigger]:
         out: list[Trigger] = []
         if pkt.is_group_broadcast:
-            self._recent_groups.append((now, pkt.group if pkt.group is not None else -1))
-            self._recent_groups = [(t, g) for t, g in self._recent_groups
+            self._recent_groups = [(t, k) for t, k in self._recent_groups
                                    if now - t <= self.storm_window_s]
+            key = _message_key(pkt)
+            if all(k != key for _, k in self._recent_groups):
+                self._recent_groups.append((now, key))
             if pkt.group == ALL_DEVICES_GROUP:
                 # The smoking gun. A valid CRC means a device really sent this.
                 how = ("CRC valid — some device transmitted this"
@@ -213,7 +229,7 @@ class AllOnWatcher:
             if len(self._recent_groups) >= self.storm_count:
                 out.append(Trigger(
                     "storm", now,
-                    f"{len(self._recent_groups)} group broadcasts in "
+                    f"{len(self._recent_groups)} distinct group broadcasts in "
                     f"{self.storm_window_s:g}s", pkt))
                 self._recent_groups.clear()
         return out
@@ -240,15 +256,9 @@ class AllOnWatcher:
 
     def copies_of(self, pkt: Packet) -> list[Seen]:
         """Every buffered copy of this message, ignoring what a repeat changes."""
-        def key(p: Packet) -> tuple[int, ...]:
-            data = list(p.data[: p.crc_index + 1])
-            data[0] &= ~0x0C          # hops-left
-            if len(data) > p.crc_index:
-                data[p.crc_index] = 0  # and the CRC computed over it
-            return tuple(data)
-
-        want = key(pkt)
-        return [h for h in self.history if h.packet is not None and key(h.packet) == want]
+        want = _message_key(pkt)
+        return [h for h in self.history
+                if h.packet is not None and _message_key(h.packet) == want]
 
     def report(self, trig: Trigger) -> str:
         """Human-readable attribution for one trigger."""

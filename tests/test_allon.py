@@ -97,6 +97,13 @@ def test_storm_detection():
     assert any(t.kind == "storm" for t in w.triggers)
 
 
+def test_hop_repeats_are_not_a_storm():
+    """One scene heard at every hop is one message, not four."""
+    pkts = [bcast(PLM, 21 + i, hops_left=hl, at=1000.0 + i * 0.5 + (3 - hl) * 0.05)
+            for i in range(4) for hl in (3, 2, 1, 0)]
+    assert not any(t.kind == "storm" for t in scan(pkts).triggers)
+
+
 def test_slow_traffic_is_not_a_storm():
     pkts = [bcast(PLM, 21 + i, at=1000.0 + i * 10) for i in range(14)]
     assert not any(t.kind == "storm" for t in scan(pkts).triggers)
