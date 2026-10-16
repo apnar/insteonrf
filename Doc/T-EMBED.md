@@ -303,7 +303,7 @@ scans passively and `bluetooth_proxy` has `active: false`: no scan requests,
 no connection slots. The BLE controller and host run on core 0 with WiFi; the
 radio task keeps core 1. Sensors added for it: BLE Adverts, BTHome Adverts and
 BTHome Sensors Heard (per minute), Loop Time and heap. "Tune BLE Scan Window"
-changes the window per 1100 ms interval live (0 stops scanning).
+changes the window per 640 ms interval live (max 600 ms; 0 stops scanning).
 
 A/B, 5-minute blocks rotating off / 320 ms / 1100 ms, scored against the V3,
 with arrival lag measured from the capture's on-air stamp to the broker:
@@ -317,7 +317,13 @@ with arrival lag measured from the capture's on-air stamp to the broker:
 (4 rotations quiet with `--pause 8`, 3 busy with `--pause 0`.) Scanning costs
 Insteon nothing measurable; it adds ~35 ms of publish latency, well inside the
 mesh's 1 s lateness. Loop time (~64 ms max), heap (~127 kB free) and Lost (0)
-did not move. So the YAML keeps the full 1100 ms window. The busy windows
+did not move. So the YAML kept the full 1100 ms window.
+
+**2026-10-16:** changed to interval 640 ms / window 600 ms (~94% duty), the same as
+`common/ble-proxy2.yaml`. ESPHome 2026.9 warns that any window over 600 ms starves wifi on the
+shared radio, and the warning can't be silenced. Afterwards: 94-114 BTHome adverts/min from 15-17
+sensors and ~4,500-5,200 adverts/min in total, in line with the 1100 ms row. "Tune BLE Scan
+Window" now tops out at 600 ms. The busy windows
 swung between 83% and 99% for every setting, and the dongle missed exactly the
 same messages in the same windows: events the V3 reference alone counted, not
 a receiver fault. The air here carries ~5,200 BLE adverts a minute.
