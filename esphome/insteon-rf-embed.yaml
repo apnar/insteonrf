@@ -74,7 +74,8 @@ api:
 
 ota:
   platform: esphome
-  password: !secret ota_pass
+  # Uses the api encryption key; plaintext/password uploads are refused.
+  encryption: {}
 
 # insteon-mqtt consumes the decoded messages over MQTT directly, not the HA
 # API, so this node needs both. Topic prefix is insteon-rf/ so it cannot
@@ -440,7 +441,7 @@ number:
     set_action:
       - lambda: 'id(rf)->tune_register(((uint32_t) x >> 8) & 0xFF, (uint32_t) x & 0xFF);'
 
-  # BLE scan window per 1100 ms interval; 0 stops scanning altogether.
+  # BLE scan window per 640 ms interval (max 600); 0 stops scanning altogether.
   # Restarts the scan to apply, which takes about a second.
   - platform: template
     id: tune_ble_window
@@ -448,9 +449,9 @@ number:
     entity_category: config
     unit_of_measurement: ms
     min_value: 0
-    max_value: 1100
+    max_value: 600
     step: 10
-    initial_value: 1100
+    initial_value: 600
     optimistic: true
     restore_value: false
     set_action:
@@ -518,14 +519,16 @@ select:
 # Passive only. Every BLE sensor in the house is BTHome (22 thermometers):
 # everything they say is in the advertisement, so there is nothing to gain
 # from scan requests or from connections, and connection slots would cost
-# RAM and airtime. Unlike common/ble-proxy2.yaml (100% duty, active
-# connections), the window here is the A/B winner -- see Doc/T-EMBED.md --
-# and "Tune BLE Scan Window" changes it live (0 = scanning off).
+# RAM and airtime. Same scan timing as common/ble-proxy2.yaml; the full-window
+# A/B behind it is in Doc/T-EMBED.md. "Tune BLE Scan Window" changes the
+# window live (0 = scanning off).
 esp32_ble_tracker:
   id: ble_tracker
   scan_parameters:
-    interval: 1100ms
-    window: 1100ms
+    # 600/640 ms (~94% duty) since 2026-10-16, down from the 1100/1100 A/B winner:
+    # ESPHome warns that windows >600 ms starve wifi on the shared radio.
+    interval: 640ms
+    window: 600ms
     active: false
     continuous: true
   on_ble_advertise:
