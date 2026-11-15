@@ -228,7 +228,7 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   `<topic>/msg/<rx>`, QoS 0, unretained; `--mqtt-alerts-only` does not affect it. Each
   copy is dated at its own header (`packet_air_times`: burst stamp + position / baud),
   since a dongle block spans four hop slots. Live radios release a message on the wall
-  clock at window (0.5 s) + `RELEASE_LATENESS_S` (0.2 s) after its first copy, checked
+  clock at window (0.35 s; device retransmits start at 0.5 s) + `RELEASE_LATENESS_S` (0.2 s) after its first copy, checked
   every 0.1 s even on silent air; a lossless replay releases on the recording's own
   on-air clock, and `FileRadio` honours `# <time>` lines (`recv -t`), so replay is
   deterministic. `rssi` is `null` for the dongle (post-block register snapshot, the
@@ -237,7 +237,7 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
 - **The T-Embed decodes on the board** (3.0.0, `publish: decoded`): each gated capture
   goes through `decoder.cpp` in `loop()` (never the radio task), every valid copy is
   dated at its own header (capture's first FIFO bit + position / 9124, the 16-bit header
-  put back counts) and folded in a fixed 16-slot `MessageFolder` (0.5 s window, so copies
+  put back counts) and folded in a fixed 16-slot `MessageFolder` (0.35 s window, so copies
   straddling two captures publish once); `loop()` releases at window + 0.2 s, quiet air
   included. No repair: `repaired` 0, `snr` null, `rssi` the strongest copy's capture
   RSSI. Before SNTP sets the clock messages are dropped and counted (logged per minute).

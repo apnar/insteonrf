@@ -116,7 +116,7 @@ struct FoldedMessage {
 class MessageFolder {
  public:
   static constexpr size_t SLOTS = 16;
-  explicit MessageFolder(uint32_t window_ms = 500) : window_ms_(window_ms) {}
+  explicit MessageFolder(uint32_t window_ms = 350) : window_ms_(window_ms) {}
 
   void set_window_ms(uint32_t ms) { this->window_ms_ = ms; }
   uint32_t window_ms() const { return this->window_ms_; }

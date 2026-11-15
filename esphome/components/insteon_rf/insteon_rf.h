@@ -73,7 +73,7 @@ enum PublishMode : uint8_t {
 };
 
 /// Fold window for hop copies, from the first copy (listener.FOLD_WINDOW_S).
-static const uint32_t FOLD_WINDOW_MS = 500;
+static const uint32_t FOLD_WINDOW_MS = 350;
 /// How long past the window a message is held for copies still on their way:
 /// a capture reaches loop() only after it ends (up to ~220 ms of air for 255
 /// bytes) and may wait in the hand-off queue. Same as the host pods'

@@ -22,6 +22,16 @@ Where the build differs from the plan below, **As built** says so.
 - Host pods: `monitor --publish-decoded=<rx>` (not a new `listen`
   command). Both publish `rssi: null` (the dongle's register snapshot is the
   post-block floor; the SDR measures none).
+- After four review passes and a Fable review with measurements (2026-11-15),
+  insteon-mqtt's decision model is: same bytes within 0.5 s on air = one
+  transmission; each modem read credited once, plus any modem read of the same
+  bytes within 2 s on air = heard (device retransmissions); other form
+  (broadcast vs cleanup) within 8 s = paired; a newer same-state message the
+  modem read = superseded (leak groups 1/2 are one state); cleanup reports never
+  injected. Windows: GRACE 2.5, EARLY 2.5, MATCH 2.0, ORDER 5, PAIR 8, STALE 10.
+  Listener fold window 0.35 s. Measured: listener publish lag ~0.75 s, PLM lag
+  p50 0.2 / p99 0.93 s, cross-listener on-air spread p99 0.46 s; the PLM misses
+  ~1 battery *state* message per 4 days (most battery misses are 0x06 reports).
 - The dongle keeps `--watch-all-on` and the HA automation on
   `insteon-rf/alert`; insteon-mqtt's `insteon/listeners/alert` (group 0 from
   any listener) runs alongside it.
@@ -91,7 +101,7 @@ Rules every listener follows:
    counters (the extended data CRC is not required; see As built). The counters are what keep
    an 8-bit CRC from accepting one random string in 256.
 2. One message per transmission: fold hop copies by the hop-insensitive key
-   (flags minus hop bits, to, from, cmd1, cmd2, extended data) within 0.5 s
+   (flags minus hop bits, to, from, cmd1, cmd2, extended data) within 0.35 s (0.5 s before 2026-11-15)
    of on-air time. A device retry later than that is a new message.
 3. Publish the PLM's own transmissions too. insteon-mqtt drops them; they are
    useful for coverage and clock checks.
@@ -182,7 +192,7 @@ The work is in the `insteon_rf` ESPHome component (this repo), and the
   (rule 2), and when one copy fails its CRC, take a bitwise majority across
   the copies that decoded (`repaired` counts the flipped bits). No
   CRC-search repair on the board.
-- Keep a 0.5 s key window across consecutive captures, so a transmission that
+- Keep a 0.35 s key window across consecutive captures, so a transmission that
   spans two captures is published once.
 - New option `publish: decoded | captures | both` (default `decoded`).
   `both` is for the migration and for A/B work.

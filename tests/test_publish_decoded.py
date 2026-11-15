@@ -22,6 +22,7 @@ import pytest
 import insteonrf.monitor as mon
 from insteonrf import cli
 from insteonrf.dsp import Burst
+from insteonrf.listener import FOLD_WINDOW_S
 from insteonrf.monitor import RELEASE_LATENESS_S, DecodedPublisher, packet_air_times
 from insteonrf.packet import Packet, find_headers, parse_bits
 from insteonrf.plm import to_plm_bytes
@@ -113,9 +114,9 @@ def test_hop_copies_fold_into_one_message_on_the_contract_topic() -> None:
     pub = DecodedPublisher("dongle", lambda t, p: sent.append((t, p)), clock=lambda: now[0])
     for i, h in enumerate((3, 2, 1)):
         pub.add(ack(h), t=100.0 + 0.05 * i)
-    now[0] = 100.6
+    now[0] = 100.0 + FOLD_WINDOW_S + RELEASE_LATENESS_S - 0.05
     assert pub.tick() == [] and sent == []
-    now[0] = 100.0 + 0.5 + RELEASE_LATENESS_S + 0.01
+    now[0] = 100.0 + FOLD_WINDOW_S + RELEASE_LATENESS_S + 0.01
     (msg,) = pub.tick()
     (topic, payload), = sent
     assert topic == "insteon-rf/msg/dongle"
@@ -304,7 +305,7 @@ def test_messages_go_out_on_quiet_air_without_another_packet(
                 "--idle-rearm", "0", "--timeout", "50", "--max-silence", "0"]) == 0
     assert "seen" in state, "released only at shutdown"
     lag = state["seen"] - state["t0"]
-    assert 0.5 + RELEASE_LATENESS_S <= lag < 1.5
+    assert FOLD_WINDOW_S + RELEASE_LATENESS_S <= lag < 1.5
     (msg,) = [d for _, _, d in fake_pub.instances[0].messages]
     assert msg["copies"] == 2
 

@@ -40,9 +40,11 @@ from .plm import PlmFormatError, message_key, to_plm_bytes
 
 CONTRACT_VERSION = 1
 TOPIC_PREFIX = "insteon-rf/msg"
-#: Four hop slots are 200 ms; a device's retry after a missed ACK comes later
-#: than this and is (correctly) a new message.
-FOLD_WINDOW_S = 0.5
+#: Four hop slots are 200 ms. A device re-sends a message 0.5-1.4 s later
+#: (measured 2026-11-15, 110 of ~280 battery broadcasts); a window that ends
+#: short of that keeps the retransmission a separate message on every
+#: listener alike, rather than folded by one and not another.
+FOLD_WINDOW_S = 0.35
 
 
 @dataclass
