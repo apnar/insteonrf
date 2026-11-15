@@ -1,7 +1,7 @@
 From 844ac922249089b87c0e88b613a97f5e4adc4d98 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:15:07 -0500
-Subject: [PATCH] Add optional RF listener support
+Subject: [PATCH 1/2] Add optional RF listener support
 
 A PLM hears only what reaches its own antenna. Battery devices (leak,
 door, motion, remotes) are RF-only and can't be polled, so a message the
@@ -80,6 +80,62 @@ index daaf3aa..e3bd796 100644
 +  #   alert_topic: 'insteon/listeners/alert'
 +
  #----------------------------------------------------------------
+-- 
+2.53.0
+
+
+From 9ed7291245e57d3af412e7a667455c0053c9a4ff Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 13:08:47 -0500
+Subject: [PATCH 2/2] Listeners: fixes from review
+
+- Correlate on insteon-mqtt's own clock (arrival), never the listener's:
+  a listener clock that is off can no longer make a heard message look
+  missed. The modem-heard window runs to the actual release time, so a
+  release delayed by the main loop cannot miss a modem copy read
+  meanwhile.
+- Do not inject a message if the modem has since read a later message
+  from the same device (a close after an open, the cleanup after a
+  broadcast): that replayed old state.
+- Group broadcasts the modem has no responder link for are not counted
+  as missed and never injected (the modem would never pass them up).
+- Reject non-finite 't' (NaN poisoned the TimedCall queue and stalled
+  every timed call) and drop messages older than 10 s instead of
+  re-dating them as fresh. 't' is now required.
+- Rate limit per device per minute (4) instead of one per 30 s, so an
+  open/close pair both get through; release oldest first.
+- Protocol: drop the injected-copy guard. The modem's late copy of a
+  message it missed almost never arrives, so the guard swallowed the
+  next real identical press instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ config-example.yaml | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/config-example.yaml b/config-example.yaml
+index e3bd796..1478561 100644
+--- a/config-example.yaml
++++ b/config-example.yaml
+@@ -230,10 +230,13 @@ mqtt:
+   #    "rssi": -78.5, "snr": null, "repaired": 0}
+   # where "frame" is the message as the modem would have reported it.
+   #
+-  # Tiers:  battery = broadcasts and cleanups from battery devices;
+-  # group = any group broadcast or cleanup; state = other messages to the
+-  # modem.  Replies (ACK/NAK), the modem's own messages, unknown senders,
+-  # repaired messages and group 0 broadcasts are never handled.  Tiers in
++  # A message is only considered if the modem did not read it, has not
++  # since read a later message from the same device, and (for a group
++  # broadcast) holds a link for that group.  Tiers:  battery = broadcasts
++  # and cleanups from battery devices; group = any group broadcast or
++  # cleanup; state = other messages to the modem.  Replies (ACK/NAK), the
++  # modem's own messages, unknown senders, repaired messages and group 0
++  # broadcasts are never handled.  Tiers in
+   # "shadow" are only logged ("would inject"), so a tier can be watched
+   # before it is turned on.
+   #
 -- 
 2.53.0
 
