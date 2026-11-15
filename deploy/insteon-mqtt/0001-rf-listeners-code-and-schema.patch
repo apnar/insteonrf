@@ -1,7 +1,7 @@
 From 844ac922249089b87c0e88b613a97f5e4adc4d98 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:15:07 -0500
-Subject: [PATCH 1/7] Add optional RF listener support
+Subject: [PATCH 1/8] Add optional RF listener support
 
 A PLM hears only what reaches its own antenna. Battery devices (leak,
 door, motion, remotes) are RF-only and can't be polled, so a message the
@@ -804,7 +804,7 @@ index 9bfd1bc..b7e9ce8 100644
 From 2e3ac24770be0d5bf8e99ab4c3894c92bae1b7f9 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:24:45 -0500
-Subject: [PATCH 2/7] Listeners: drop the doubled 'Listeners:' log prefix
+Subject: [PATCH 2/8] Listeners: drop the doubled 'Listeners:' log prefix
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
@@ -857,7 +857,7 @@ index af58dc1..41a1f8b 100644
 From 314fc46156ebbca96fe947240ff0f65b8dc087f2 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:39:44 -0500
-Subject: [PATCH 3/7] Listeners: messages to other devices are not modem misses
+Subject: [PATCH 3/8] Listeners: messages to other devices are not modem misses
 
 Direct and cleanup messages addressed to another device (e.g. a leak
 sensor's cleanups to its other responders) are never passed up by a PLM,
@@ -916,7 +916,7 @@ index 41a1f8b..76bc1ec 100644
 From 9ed7291245e57d3af412e7a667455c0053c9a4ff Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 13:08:47 -0500
-Subject: [PATCH 4/7] Listeners: fixes from review
+Subject: [PATCH 4/8] Listeners: fixes from review
 
 - Correlate on insteon-mqtt's own clock (arrival), never the listener's:
   a listener clock that is off can no longer make a heard message look
@@ -1338,7 +1338,7 @@ index b4fa640..320d70e 100644
 From ea2be693e0276fdd219af55f11b18a51de2c4017 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 13:13:24 -0500
-Subject: [PATCH 5/7] Listeners: late copies, a narrower superseded rule, 1.5 s
+Subject: [PATCH 5/8] Listeners: late copies, a narrower superseded rule, 1.5 s
  early window
 
 From the second review of 9ed7291:
@@ -1599,7 +1599,7 @@ index cad49f5..33af792 100644
 From fd65b445997494b9c5ceb84d296b53af6430d169 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 13:17:37 -0500
-Subject: [PATCH 6/7] Listeners: transmissions by on-air time, one modem read
+Subject: [PATCH 6/8] Listeners: transmissions by on-air time, one modem read
  per event
 
 From the third review of ea2be69:
@@ -1987,7 +1987,7 @@ index 33af792..d9aa5fc 100644
 From 38e37dd28f296a20b81c0c9a328f593aa1bded34 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 13:20:08 -0500
-Subject: [PATCH 7/7] Listeners: 0.5 s same-transmission window, split counter,
+Subject: [PATCH 7/8] Listeners: 0.5 s same-transmission window, split counter,
  tighter ordering
 
 From the fourth review of fd65b44:
@@ -2119,6 +2119,256 @@ index d9aa5fc..48c46b8 100644
              return
  
          LOG.info("Injecting %s message missed by the modem, "
+-- 
+2.53.0
+
+
+From febd5c68452d8660dab026dbe4e6c342ba76519c Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 14:23:00 -0500
+Subject: [PATCH 8/8] Listeners: findings and timing from the Fable review
+
+- Cleanup status reports (0x06) are never injected and not counted as
+  misses ('reports'): they carry no state, were ~85% of what the modem
+  misses from battery devices, and each used a rate-limit slot.
+- A modem read of the same bytes within 2 s on air counts as heard even
+  if credited to another event (a device retransmits 0.5-1.4 s later);
+  duplicate modem reads are not recorded (one could be credited to a
+  later, missed, press).
+- Broadcast/cleanup pairing is matched on on-air time within PAIR_S
+  (8 s; measured gap p99 5.3 s) instead of the early window, which the
+  cleanup path never reached.
+- Leak sensors: groups 1 (dry) and 2 (wet) are one state for the
+  'newer' rule.
+- An exception deciding one event no longer strands the other due ones.
+- EARLY_S 1.5 -> 2.5 s, MATCH_S 1.5 -> 2.0 s (measured lags).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ insteon_mqtt/Listeners.py | 130 ++++++++++++++++++++++++++++----------
+ 1 file changed, 98 insertions(+), 32 deletions(-)
+
+diff --git a/insteon_mqtt/Listeners.py b/insteon_mqtt/Listeners.py
+index 48c46b8..f3c45a1 100644
+--- a/insteon_mqtt/Listeners.py
++++ b/insteon_mqtt/Listeners.py
+@@ -39,8 +39,9 @@ listener's 't' is only checked for being finite and recent):
+    one transmission; each modem read is credited to at most one of them.
+ 3. Otherwise classify it.  'battery': a broadcast or cleanup from a battery
+    device.  'group': any other group broadcast or cleanup.  'state': any
+-   other message to the modem.  Never handled: ACK/NAK replies, the modem's
+-   own transmissions, senders that are not in the config, repaired messages,
++   other message to the modem.  Never handled: ACK/NAK replies, cleanup
++   status reports (0x06, no state of their own), the modem's own
++   transmissions, senders that are not in the config, repaired messages,
+    and group 0 (which raises an alert).
+ 4. Inject it if its tier is listed in 'inject', log it if listed in
+    'shadow', within rate limits (per device and overall, per minute).
+@@ -64,6 +65,7 @@ import time
+ from . import log
+ from . import message as Msg
+ from .device.BatterySensor import BatterySensor
++from .device.Leak import Leak
+ 
+ LOG = log.get_logger()
+ 
+@@ -141,9 +143,9 @@ class Listeners:
+     # modem's own copy (it can arrive later: it also travels the powerline).
+     GRACE_S = 2.5
+     # The modem's copy counts if it was read up to this long before the
+-    # first listener copy arrived (listeners publish ~0.7 s after the air,
+-    # the modem's copy lands between ~0.7 s before and ~0.6 s after).
+-    EARLY_S = 1.5
++    # first listener copy arrived (listeners publish ~0.75 s after the air;
++    # the modem's copy can be of an earlier retransmission).
++    EARLY_S = 2.5
+     # Listener copies of the same bytes this close on air are one
+     # transmission; further apart they are separate ones (repeat presses).
+     # Each listener stamps the earliest hop copy *it* heard (up to ~150 ms
+@@ -156,12 +158,17 @@ class Listeners:
+     SPLIT_S = 1.0
+     # A listener copy places a modem read in order only if it arrived
+     # within this of the read (it is then the same transmission).
+-    MATCH_S = 1.5
++    MATCH_S = 2.0
++    # A modem read of the same bytes this close on air means the modem
++    # handled the event even if that read was credited to another event: a
++    # device's own retransmission (0.5-1.4 s later) is the same event.
++    SAME_EVENT_S = 2.0
+     # Listener evidence older or newer than this is not used for ordering.
+     ORDER_S = 5.0
+-    # An event injected in one form (broadcast or cleanup) handles the other
+-    # form for this long.
+-    PAIR_S = 5.0
++    # A broadcast and its cleanup are one event if this close on air
++    # (measured gap p99 5.3 s): either form read by the modem, or injected,
++    # handles the other.
++    PAIR_S = 8.0
+     # Listener messages whose 't' is further than this from now are dropped.
+     STALE_S = 10.0
+     # How long modem frames and decided events are remembered.
+@@ -214,7 +221,7 @@ class Listeners:
+         self.counts = {'messages': 0, 'not_for_modem': 0, 'no_modem_link': 0,
+                        'plm_heard': 0, 'superseded': 0, 'plm_missed': 0,
+                        'stale': 0, 'late_copies': 0, 'paired': 0,
+-                       'split': 0,
++                       'split': 0, 'reports': 0,
+                        'injected': 0, 'shadow': 0, 'rejected': 0,
+                        'rate_limited': 0, 'malformed': 0, 'alerts': 0}
+         self.receivers = {}
+@@ -302,11 +309,13 @@ class Listeners:
+ 
+         Args:
+           raw (bytes):  The complete modem frame that was read.
+-          duplicate (bool):  Unused; a duplicate was still heard.
++          duplicate (bool):  Whether insteon-mqtt judged it a duplicate.
+         """
+-        # pylint: disable=unused-argument
+-        if len(raw) < 11 or raw[1] not in (Msg.InpStandard.msg_code,
+-                                           Msg.InpExtended.msg_code):
++        # A duplicate is a second copy of something already recorded; as a
++        # separate read it could be credited to a later, missed, press.
++        if duplicate or len(raw) < 11 or \
++                raw[1] not in (Msg.InpStandard.msg_code,
++                               Msg.InpExtended.msg_code):
+             return
+ 
+         now = self.clock()
+@@ -408,7 +417,13 @@ class Listeners:
+         # and a modem read is credited to the earliest matching event.
+         for event in sorted(due, key=lambda e: e['t']):
+             self._events.remove(event)
+-            self._release(event)
++            try:
++                self._release(event)
++            except Exception:  # pylint: disable=broad-except
++                # One bad event (or a device handler raising on an injected
++                # message) must not strand the others.
++                LOG.exception("Error deciding listener message %s",
++                              event['msg'])
+         if self._events:
+             self._schedule(min(e['due'] for e in self._events))
+ 
+@@ -448,43 +463,87 @@ class Listeners:
+           now (float):  Release time: the end of the window.
+ 
+         Returns:
+-          str:  'heard' (the modem read this message; that read is now
+-          credited to this event), 'paired' (the same event in its other
+-          form -- the cleanup of a broadcast or the reverse -- was read or
+-          injected), 'newer' (the modem read a later message for the same
+-          group from this device), or None.
++          str:  'heard' (the modem read this message, or the same bytes
++          within SAME_EVENT_S on air -- a device retransmission), 'paired'
++          (the same event in its other form -- the cleanup of a broadcast or
++          the reverse -- was read or injected), 'newer' (the modem read a
++          later message about the same state from this device), or None.
+         """
+-        key = event['key']
++        key, t = event['key'], event['t']
+         lo = event['first'] - self.EARLY_S
+-        for read in self._plm:
+-            if read['key'] == key and not read['used'] and \
+-                    lo <= read['when'] <= now:
+-                read['used'] = True
+-                return 'heard'
++        if self._read_same(key, t, lo, now):
++            return 'heard'
+ 
+         sender, group, cmd1 = _topic(key)
+         if group is None:
+             return None
++        groups = self._state_groups(event['msg'], group)
+         newer = False
+         for read in self._plm:
+-            if not lo <= read['when'] <= now or read['key'] == key:
++            if read['key'] == key or read['when'] > now:
+                 continue
+             r_sender, r_group, r_cmd1 = _topic(read['key'])
+-            if r_sender != sender or r_group != group:
++            if r_sender != sender or r_group not in groups:
+                 continue
+-            if r_cmd1 == cmd1:
+-                if _other_form(read['key'], key):
++            if r_cmd1 == cmd1 and r_group == group:
++                if _other_form(read['key'], key) and \
++                        abs(read['when'] - t) <= self.PAIR_S:
+                     return 'paired'
+                 continue
+-            if not self._heard_before(read['key'], event['t'], read['when']):
++            if read['when'] >= lo and \
++                    not self._heard_before(read['key'], t, read['when']):
+                 newer = True
+         for done in self._decided:
+             if done['injected'] and _other_form(done['key'], key) and \
+-                    abs(done['t'] - event['t']) <= self.PAIR_S and \
++                    abs(done['t'] - t) <= self.PAIR_S and \
+                     _topic(done['key']) == (sender, group, cmd1):
+                 return 'paired'
+         return 'newer' if newer else None
+ 
++    #-----------------------------------------------------------------------
++    def _read_same(self, key, t, lo, now):
++        """Whether the modem read this message (crediting that read).
++
++        Args:
++          key (bytes):  The message key.
++          t (float):  Its on-air time.
++          lo (float):  Start of the window, insteon-mqtt clock.
++          now (float):  Release time: the end of the window.
++
++        Returns:
++          bool
++        """
++        for read in self._plm:
++            if read['key'] == key and not read['used'] and \
++                    lo <= read['when'] <= now:
++                read['used'] = True
++                return True
++        # Already credited to another event, but this close on air it is the
++        # same event: the device's own retransmission.
++        return any(read['key'] == key and
++                   abs(read['when'] - t) <= self.SAME_EVENT_S
++                   for read in self._plm)
++
++    #-----------------------------------------------------------------------
++    def _state_groups(self, msg, group):
++        """The groups that report the same state as this one.
++
++        A leak sensor reports dry on group 1 and wet on group 2, so a later
++        message on either is newer state than a missed one on the other.
++        Everything else keeps its state per group.
++
++        Args:
++          msg:  The message being decided.
++          group (int):  Its group.
++
++        Returns:
++          set
++        """
++        if group in (1, 2) and isinstance(self.modem.find(msg.from_addr),
++                                          Leak):
++            return {1, 2}
++        return {group}
++
+     #-----------------------------------------------------------------------
+     def _heard_before(self, key, t, when):
+         """Whether a modem read is of a message the listeners heard before t.
+@@ -543,6 +602,13 @@ class Listeners:
+             'messages': 0, 'plm_missed': 0, 'injected': 0, 'shadow': 0})
+         dev['messages'] += 1
+ 
++        # A cleanup status report (0x06) carries no state of its own: it is
++        # neither injected nor counted as a miss.
++        if flag_type == Msg.Flags.Type.ALL_LINK_BROADCAST and \
++                msg.cmd1 == 0x06:
++            self.counts['reports'] += 1
++            return
++
+         # A group broadcast the modem has no link for is never passed up by
+         # it, so it is neither heard nor missed.  (Group 0 still alerts.)
+         if flag_type == Msg.Flags.Type.ALL_LINK_BROADCAST and \
 -- 
 2.53.0
 
