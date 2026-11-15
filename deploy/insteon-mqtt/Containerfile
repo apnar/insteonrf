@@ -1,13 +1,14 @@
-# insteon-mqtt with the raw inbound-message topics (Doc/MESH-PLAN.md §4).
+# insteon-mqtt with RF listener support (Doc/REARCHITECTURE.md).
 #
-# Two additions, both inert until enabled in config.yaml:
-#   insteon/raw/rx      every message read from the modem, published as JSON
-#   insteon/raw/inject  messages from other receivers, fed to Protocol.inject()
+# One addition, inert unless config.yaml has an mqtt.listeners section:
+# decoded messages from receive-only RF listeners (insteon-rf/msg/+) are
+# compared with what the modem heard, and the modem's misses are handed to
+# Protocol.inject() by tier (battery / group / state), or only logged.
 #
 # Why this image exists at all: the PLM hears only what reaches its single
 # antenna, and passes up only the group broadcasts it holds an ALDB link for.
-# Extra RF receivers can hear what it missed; this is the seam they hand it
-# through. There is still exactly one transmitter — the PLM owns the air.
+# Extra RF receivers can hear what it missed. There is still exactly one
+# transmitter — the PLM owns the air.
 #
 # The base is pinned **by digest, not by tag**. That is load-bearing: the
 # upstream tag is :latest, and an unpinned pull would silently replace the
@@ -18,12 +19,12 @@
 # running house.
 #
 # The patches are generated from the upstream PR branch
-# (/root/src/insteon-mqtt, branch rf-listener-raw-topics, based on dev),
+# (/root/src/insteon-mqtt, branch rf-listeners, based on dev),
 # never edited by hand:
-#   git format-patch --stdout origin/dev..rf-listener-raw-topics -- insteon_mqtt \
-#       > 0001-raw-topics-code-and-schema.patch
-#   git format-patch --stdout origin/dev..rf-listener-raw-topics -- config-example.yaml \
-#       > 0002-raw-topics-config-example.patch
+#   git format-patch --stdout origin/dev..rf-listeners -- insteon_mqtt \
+#       > 0001-rf-listeners-code-and-schema.patch
+#   git format-patch --stdout origin/dev..rf-listeners -- config-example.yaml \
+#       > 0002-rf-listeners-config-example.patch
 #
 # TWO COPIES OF THE PACKAGE.  The image pip-installs insteon-mqtt into
 # site-packages and *also* keeps the source checkout at /opt/insteon-mqtt.
@@ -53,8 +54,8 @@ FROM docker.io/td22057/amd64-insteon-mqtt@sha256:e0ce53613172bd3d642e3d9049eb1c4
 
 # 0001 is code and schema, applied to both trees.
 # 0002 documents the config and applies to the source checkout only.
-COPY 0001-raw-topics-code-and-schema.patch \
-     0002-raw-topics-config-example.patch \
+COPY 0001-rf-listeners-code-and-schema.patch \
+     0002-rf-listeners-config-example.patch \
      /tmp/patches/
 
 # The base is Alpine and ships no patch(1); install it for the build and drop
@@ -73,7 +74,7 @@ RUN set -eu; \
         done; \
     done; \
     patch -d /opt/insteon-mqtt -p1 --forward --no-backup-if-mismatch \
-        -i /tmp/patches/0002-raw-topics-config-example.patch; \
+        -i /tmp/patches/0002-rf-listeners-config-example.patch; \
     rm -r /tmp/patches; \
     apk del patch
 
@@ -90,7 +91,8 @@ RUN set -eu; \
 
 # Verify the copy that actually runs. No sys.path games: import insteon_mqtt
 # the way the service does, assert the patched surface is present, and hand
-# its own validator a config carrying the raw section. Without this, the
+# its own validator a config carrying the listeners section (validate()
+# returns its errors as a string; it does not raise). Without this, the
 # failure mode is a crash-looping sidecar and an Insteon network that is down
 # until someone reverts the config.
 RUN set -eu; \
@@ -101,24 +103,24 @@ RUN set -eu; \
       'mqtt:' \
       "  broker: '127.0.0.1'" \
       '  port: 1883' \
-      '  raw:' \
-      '    enable_publish: True' \
-      "    publish_topic: 'insteon/raw/rx'" \
-      '    enable_inject: True' \
-      "    inject_topic: 'insteon/raw/inject'" \
-      > /tmp/raw-check.yaml; \
+      '  listeners:' \
+      "    topic: 'insteon-rf/msg/+'" \
+      "    inject: ['battery']" \
+      "    shadow: ['group', 'state']" \
+      '    stats_interval: 300' \
+      > /tmp/listeners-check.yaml; \
     python3 -c "\
 import insteon_mqtt, os;\
 from insteon_mqtt import config;\
 from insteon_mqtt.Protocol import Protocol;\
-from insteon_mqtt.mqtt import Raw;\
+from insteon_mqtt.Listeners import Listeners;\
 from insteon_mqtt.const import __version__;\
 assert __version__ == '1.4.0', __version__;\
 pkg = os.path.dirname(insteon_mqtt.__file__);\
 print('checking', pkg);\
 assert hasattr(Protocol, 'inject'), 'Protocol.inject is missing';\
-assert 'signal_raw_read' in open(pkg + '/Protocol.py').read(), 'signal missing';\
-assert 'self.raw.subscribe' in open(pkg + '/mqtt/Mqtt.py').read(), 'not wired';\
-config.validate('/tmp/raw-check.yaml');\
-print('raw topics present in the installed package, schema accepts them')"; \
-    rm /tmp/raw-check.yaml
+assert 'self.listeners.subscribe' in open(pkg + '/mqtt/Mqtt.py').read(), 'not wired';\
+err = config.validate('/tmp/listeners-check.yaml');\
+assert err == '', err;\
+print('RF listeners present in the installed package, schema accepts them')"; \
+    rm /tmp/listeners-check.yaml

@@ -1,0 +1,802 @@
+From 844ac922249089b87c0e88b613a97f5e4adc4d98 Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 12:15:07 -0500
+Subject: [PATCH] Add optional RF listener support
+
+A PLM hears only what reaches its own antenna. Battery devices (leak,
+door, motion, remotes) are RF-only and can't be polled, so a message the
+modem misses from one of them is lost. Receive-only RF listeners placed
+elsewhere in the house (an ESPHome board with a CC1101, an RTL-SDR)
+decode what they hear and publish it to MQTT; this compares what they
+heard with what the modem heard and hands the modem's misses to the
+protocol stack. Nothing is transmitted.
+
+New optional `mqtt.listeners` config section. Without it nothing is
+created and nothing changes. With it, Listeners:
+
+- subscribes to decoded listener messages (default insteon-rf/msg/+):
+  JSON carrying the message as the modem would have reported it
+  (0x50/0x51 frame), its on-air time and receiver diagnostics;
+- holds each message 2.5 s for the modem's own (often later, powerline)
+  copy and does nothing if the modem heard it;
+- classifies the rest into tiers (battery, group, state), never
+  handling replies, the modem's own messages, unknown senders, repaired
+  messages or group 0 (which raises an alert instead);
+- injects listed tiers through the new Protocol.inject(), logs "shadow"
+  tiers only, with per-device and global rate limits;
+- publishes per-listener and per-device counters (retained) and group 0
+  alerts.
+
+Protocol gains signal_raw_read (every frame read from the modem) and
+inject(), which accepts only complete 0x50/0x51 frames and ignores the
+modem's own copy of an injected message for 3 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ insteon_mqtt/Listeners.py            | 503 +++++++++++++++++++++++++++
+ insteon_mqtt/Protocol.py             | 116 +++++-
+ insteon_mqtt/data/config-schema.yaml |  20 ++
+ insteon_mqtt/mqtt/Mqtt.py            |  18 +
+ 4 files changed, 656 insertions(+), 1 deletion(-)
+ create mode 100644 insteon_mqtt/Listeners.py
+
+diff --git a/insteon_mqtt/Listeners.py b/insteon_mqtt/Listeners.py
+new file mode 100644
+index 0000000..af58dc1
+--- /dev/null
++++ b/insteon_mqtt/Listeners.py
+@@ -0,0 +1,503 @@
++#===========================================================================
++#
++# RF listeners: extra receivers for messages the modem missed
++#
++#===========================================================================
++"""Use additional RF receivers to hear what the modem missed.
++
++A PLM hears only what reaches its own antenna, and passes up only the group
++broadcasts it holds a link for.  Battery devices (leak, door, motion,
++remotes) are RF only and cannot be polled, so a message the modem misses
++from one of them is simply lost.  Receive-only RF listeners placed around
++the house (for example a LilyGO T-Embed CC1101 running ESPHome, or an
++RTL-SDR) decode what they hear and publish it to MQTT.  This class compares
++what they heard with what the modem heard and hands the modem's misses to
++the protocol stack, as though the modem had heard them itself.  Nothing is
++ever transmitted: the modem stays the only transmitter.
++
++Listener messages (topic default 'insteon-rf/msg/+'):
++
++    {"v": 1, "rx": "t-embed", "t": 1794759872.429,
++     "frame": "0250294E522B9307270D02", "copies": 3, "hops_left": 2,
++     "rssi": -78.5, "snr": null, "repaired": 0}
++
++'frame' is the message exactly as the modem would have reported it (0x50
++standard or 0x51 extended), 't' the time it was on the air and 'repaired'
++the number of bits the listener had to correct (0 = clean).
++
++For each message:
++
++1. Hold it for 'grace' seconds.  The modem's own copy also travels the
++   powerline and often arrives after a listener's.
++2. If the modem heard it within that window, do nothing.
++3. Otherwise classify it.  'battery': a broadcast or cleanup from a battery
++   device.  'group': any group broadcast or cleanup addressed to the modem.
++   'state': any other message addressed to the modem.  Never handled:
++   ACK/NAK replies, the modem's own transmissions, senders that are not in
++   the config, repaired messages, and group 0 (which raises an alert).
++4. Inject it if its tier is listed in 'inject', log it if listed in
++   'shadow', subject to rate limits.
++
++Config, under the mqtt section:
++
++    listeners:
++      topic: 'insteon-rf/msg/+'
++      inject: ['battery']
++      shadow: ['group', 'state']
++      stats_topic: 'insteon/listeners/stats'
++      stats_interval: 300
++      alert_topic: 'insteon/listeners/alert'
++"""
++#===========================================================================
++import json
++import time
++
++from . import log
++from . import message as Msg
++from .device.BatterySensor import BatterySensor
++
++LOG = log.get_logger()
++
++TIERS = ('battery', 'group', 'state')
++
++_GROUP_TYPES = (Msg.Flags.Type.ALL_LINK_BROADCAST,
++                Msg.Flags.Type.ALL_LINK_CLEANUP)
++_REPLY_TYPES = (Msg.Flags.Type.DIRECT_ACK, Msg.Flags.Type.DIRECT_NAK,
++                Msg.Flags.Type.CLEANUP_ACK, Msg.Flags.Type.CLEANUP_NAK)
++
++
++def message_key(frame):
++    """Hop-insensitive identity of a modem frame.
++
++    Two copies of one transmission differ only in the hops-left bits of the
++    flags byte, so those are masked out and everything else is kept.
++
++    Args:
++      frame (bytes):  A complete 0x50 or 0x51 frame.
++
++    Returns:
++      bytes:  The key.
++    """
++    return bytes(frame[1:8]) + bytes([frame[8] & ~0x0C & 0xFF]) + \
++        bytes(frame[9:])
++
++
++class Listeners:
++    """Correlate RF listeners with the modem and inject what it missed."""
++
++    # Seconds to wait for the modem's own copy of a message.
++    GRACE_S = 2.5
++    # The modem's copy counts if it was read this long before the listener
++    # says the message was on the air (clocks are not perfectly aligned).
++    EARLY_S = 1.0
++    # How long modem frames are remembered.
++    PLM_MEMORY_S = 30.0
++    # Rate limits.
++    PER_DEVICE_INTERVAL_S = 30.0
++    GLOBAL_PER_MINUTE = 6
++
++    def __init__(self, mqtt, modem, protocol):
++        """Constructor
++
++        Args:
++          mqtt (mqtt.Mqtt):  The main MQTT handler, used to publish stats
++               and alerts.
++          modem (Modem):  The modem: its address, its devices and its
++                timed_call scheduler.
++          protocol (Protocol):  The protocol stack to inject into and to
++                   learn from what the modem itself read.
++        """
++        self.mqtt = mqtt
++        self.modem = modem
++        self.protocol = protocol
++
++        self.topic = 'insteon-rf/msg/+'
++        self.inject = set()
++        self.shadow = set()
++        self.stats_topic = None
++        self.stats_interval = 300
++        self.alert_topic = None
++
++        # Pending events: key -> dict(t, frame, msg, heard_by, ...)
++        self._events = {}
++        # What the modem read: list of (key, time).
++        self._plm = []
++        self._last_injected = {}
++        self._recent_injections = []
++        # The one scheduled TimedCall that releases due events.  TimedCall
++        # runs a single call per loop pass, so one per event would make a
++        # burst trickle out.
++        self._tick = None
++
++        # Clock, replaceable in tests.
++        self.clock = time.time
++        self.started = self.clock()
++        self.counts = {'messages': 0, 'plm_heard': 0, 'plm_missed': 0,
++                       'injected': 0, 'shadow': 0, 'rejected': 0,
++                       'rate_limited': 0, 'malformed': 0, 'alerts': 0}
++        self.receivers = {}
++        self.devices = {}
++
++        protocol.signal_raw_read.connect(self.handle_plm_read)
++
++    #-----------------------------------------------------------------------
++    def load_config(self, data):
++        """Load the 'listeners' section of the mqtt config.
++
++        Args:
++          data (dict):  The listeners configuration dictionary.
++        """
++        self.topic = data.get('topic', self.topic)
++        self.inject = set(data.get('inject', []))
++        self.shadow = set(data.get('shadow', [])) - self.inject
++        self.stats_topic = data.get('stats_topic', 'insteon/listeners/stats')
++        self.stats_interval = data.get('stats_interval', self.stats_interval)
++        self.alert_topic = data.get('alert_topic', 'insteon/listeners/alert')
++
++        LOG.info("RF listeners on %s: inject %s, shadow %s", self.topic,
++                 sorted(self.inject) or "none", sorted(self.shadow) or "none")
++
++        if self.stats_topic and self.stats_interval:
++            self.modem.timed_call.add(self.clock() + self.stats_interval,
++                                      self.publish_stats)
++
++    #-----------------------------------------------------------------------
++    def subscribe(self, link, qos):
++        """Subscribe to the listener topic.
++
++        Args:
++          link (network.Mqtt):  The MQTT network client.
++          qos (int):  The quality of service to use.
++        """
++        link.subscribe(self.topic, qos, self.handle_mqtt)
++
++    #-----------------------------------------------------------------------
++    def unsubscribe(self, link):
++        """Unsubscribe from the listener topic.
++
++        Args:
++          link (network.Mqtt):  The MQTT network client.
++        """
++        link.unsubscribe(self.topic)
++
++    #-----------------------------------------------------------------------
++    def handle_mqtt(self, client, userdata, message):
++        """Listener topic callback.
++
++        Args:
++          client (paho.Client):  The paho mqtt client.
++          userdata:  Unused.
++          message:  The incoming MQTT message.
++        """
++        # pylint: disable=unused-argument
++        try:
++            data = json.loads(message.payload.decode("utf-8"))
++        except ValueError:
++            LOG.warning("Listener message on %s is not JSON: %s",
++                        message.topic, message.payload)
++            self.counts['malformed'] += 1
++            return
++        if not isinstance(data, dict):
++            self.counts['malformed'] += 1
++            return
++        self.handle_message(data)
++
++    #-----------------------------------------------------------------------
++    def publish_stats(self):
++        """Publish the counters (retained) and schedule the next time."""
++        if not self.stats_topic:
++            return
++        self.mqtt.publish(self.stats_topic, json.dumps(self.stats()),
++                          retain=True)
++        LOG.info("Listeners: %s", self.counts)
++        if self.stats_interval:
++            self.modem.timed_call.add(self.clock() + self.stats_interval,
++                                      self.publish_stats)
++
++    #-----------------------------------------------------------------------
++    def handle_plm_read(self, raw, duplicate):
++        """Protocol.signal_raw_read callback: remember what the modem read.
++
++        Args:
++          raw (bytes):  The complete modem frame that was read.
++          duplicate (bool):  Unused; a duplicate was still heard.
++        """
++        # pylint: disable=unused-argument
++        if len(raw) < 11 or raw[1] not in (Msg.InpStandard.msg_code,
++                                           Msg.InpExtended.msg_code):
++            return
++
++        now = self.clock()
++        self._plm.append((message_key(raw), now))
++        cutoff = now - self.PLM_MEMORY_S
++        while self._plm and self._plm[0][1] < cutoff:
++            self._plm.pop(0)
++
++    #-----------------------------------------------------------------------
++    def handle_message(self, data, now=None):
++        """Process one decoded listener message.
++
++        Args:
++          data (dict):  The parsed JSON payload.
++          now (float):  Current time, for tests.  Defaults to self.clock().
++        """
++        now = self.clock() if now is None else now
++        try:
++            if data.get('v') != 1:
++                raise ValueError("unsupported version %r" % data.get('v'))
++            rx = str(data['rx'])
++            frame = bytes.fromhex(data['frame'])
++            msg = self._parse(frame)
++            t = float(data.get('t', now))
++            repaired = int(data.get('repaired', 0))
++        except (KeyError, TypeError, ValueError) as e:
++            LOG.warning("Bad listener message %s: %s", data, e)
++            self.counts['malformed'] += 1
++            return
++
++        # A listener clock far from ours: fall back to arrival time.
++        if abs(now - t) > 30:
++            t = now
++
++        rec = self.receivers.setdefault(rx, {'heard': 0, 'heard_missed': 0,
++                                             'sole_missed': 0})
++        rec['heard'] += 1
++
++        key = message_key(frame)
++        event = self._events.get(key)
++        if event is None or t - event['t'] > self.GRACE_S:
++            if event is not None:
++                self._release(key)
++            event = {'t': t, 'frame': frame, 'msg': msg, 'heard_by': {},
++                     'repaired': repaired,
++                     'due': max(t + self.GRACE_S, now + 0.1)}
++            self._events[key] = event
++            self._schedule(event['due'])
++        elif repaired < event['repaired']:
++            event['frame'], event['msg'] = frame, msg
++            event['repaired'] = repaired
++        event['t'] = min(event['t'], t)
++        event['heard_by'][rx] = {'rssi': data.get('rssi'),
++                                 'snr': data.get('snr'),
++                                 'copies': data.get('copies', 1)}
++
++    #-----------------------------------------------------------------------
++    def _schedule(self, when):
++        """Make sure the release tick runs no later than 'when'.
++
++        Args:
++          when (float):  Time an event becomes due.
++        """
++        if self._tick is not None:
++            if self._tick.time <= when:
++                return
++            self.modem.timed_call.remove(self._tick)
++        self._tick = self.modem.timed_call.add(when, self._release_due)
++
++    #-----------------------------------------------------------------------
++    def _release_due(self):
++        """TimedCall callback: release every event whose grace is over."""
++        self._tick = None
++        now = self.clock()
++        for key in [k for k, e in self._events.items() if e['due'] <= now]:
++            self._release(key)
++        if self._events:
++            self._schedule(min(e['due'] for e in self._events.values()))
++
++    #-----------------------------------------------------------------------
++    def _parse(self, frame):
++        """Parse a modem frame, insisting on the exact length.
++
++        Args:
++          frame (bytes):  The 0x50/0x51 frame.
++
++        Returns:
++          The InpStandard or InpExtended message.
++
++        Raises:
++          ValueError:  If the frame is not a complete inbound message.
++        """
++        if len(frame) < 2 or frame[0] != 0x02:
++            raise ValueError("frame does not start with 0x02")
++        if frame[1] == Msg.InpStandard.msg_code:
++            cls = Msg.InpStandard
++        elif frame[1] == Msg.InpExtended.msg_code:
++            cls = Msg.InpExtended
++        else:
++            raise ValueError("message code %#04x is not an inbound Insteon "
++                             "message" % frame[1])
++        if len(frame) != cls.msg_size(frame):
++            raise ValueError("frame is %d bytes, needs %d" %
++                             (len(frame), cls.msg_size(frame)))
++        return cls.from_bytes(frame)
++
++    #-----------------------------------------------------------------------
++    def _plm_heard(self, key, t):
++        """Whether the modem read this message around time t.
++
++        Args:
++          key (bytes):  The message key.
++          t (float):  When the message was on the air.
++
++        Returns:
++          bool
++        """
++        lo, hi = t - self.EARLY_S, t + self.GRACE_S + 0.5
++        return any(k == key and lo <= when <= hi for k, when in self._plm)
++
++    #-----------------------------------------------------------------------
++    def _release(self, key):
++        """Grace period over: decide what to do with one message.
++
++        Args:
++          key (bytes):  The message key.
++        """
++        event = self._events.pop(key, None)
++        if event is None:
++            return
++
++        msg = event['msg']
++        self.counts['messages'] += 1
++
++        # The modem's own transmissions are heard on RF but never come back
++        # as inbound messages, so they are neither heard nor missed.
++        if self.modem.addr is not None and msg.from_addr == self.modem.addr:
++            return
++
++        dev = self.devices.setdefault(msg.from_addr.hex, {
++            'messages': 0, 'plm_missed': 0, 'injected': 0, 'shadow': 0})
++        dev['messages'] += 1
++
++        if self._plm_heard(key, event['t']):
++            self.counts['plm_heard'] += 1
++            return
++
++        self.counts['plm_missed'] += 1
++        dev['plm_missed'] += 1
++        for rx in event['heard_by']:
++            self.receivers[rx]['heard_missed'] += 1
++        if len(event['heard_by']) == 1:
++            rx = next(iter(event['heard_by']))
++            self.receivers[rx]['sole_missed'] += 1
++
++        tier, why = self._classify(msg, event)
++        if tier is None:
++            LOG.debug("Listener message not handled (%s): %s", why, msg)
++            self.counts['rejected'] += 1
++            return
++
++        if tier not in self.inject and tier not in self.shadow:
++            return
++
++        now = self.clock()
++        limit = self._rate_limited(msg.from_addr, now)
++        if limit:
++            LOG.info("Listener %s message rate limited (%s): %s", tier,
++                     limit, msg)
++            self.counts['rate_limited'] += 1
++            return
++
++        heard_by = ", ".join(sorted(event['heard_by']))
++        if tier in self.shadow:
++            LOG.info("Listeners: would inject %s message missed by the "
++                     "modem, heard by %s: %s", tier, heard_by, msg)
++            self.counts['shadow'] += 1
++            dev['shadow'] += 1
++            return
++
++        LOG.info("Listeners: injecting %s message missed by the modem, "
++                 "heard by %s: %s", tier, heard_by, msg)
++        self._last_injected[msg.from_addr.id] = now
++        self._recent_injections.append(now)
++        if self.protocol.inject(event['frame']):
++            self.counts['injected'] += 1
++            dev['injected'] += 1
++
++    #-----------------------------------------------------------------------
++    def _classify(self, msg, event):
++        """Pick the tier of a message the modem missed.
++
++        Args:
++          msg:  The InpStandard or InpExtended message.
++          event (dict):  The pending event.
++
++        Returns:
++          (str, str):  (tier or None, reason when None).
++        """
++        flag_type = msg.flags.type
++        if event['repaired']:
++            return None, "repaired by the listener"
++        if flag_type in _REPLY_TYPES:
++            return None, "ACK/NAK"
++        if flag_type == Msg.Flags.Type.ALL_LINK_BROADCAST and msg.group == 0:
++            self._alert(msg, event)
++            return None, "group 0"
++
++        device = self.modem.find(msg.from_addr)
++        if device is None:
++            return None, "unknown sender"
++
++        broadcast = flag_type in (Msg.Flags.Type.ALL_LINK_BROADCAST,
++                                  Msg.Flags.Type.BROADCAST)
++        if not broadcast and msg.to_addr != self.modem.addr:
++            return None, "not addressed to the modem"
++
++        if isinstance(device, BatterySensor) and (
++                broadcast or flag_type in _GROUP_TYPES):
++            return 'battery', None
++        if flag_type in _GROUP_TYPES:
++            return 'group', None
++        return 'state', None
++
++    #-----------------------------------------------------------------------
++    def _rate_limited(self, addr, now):
++        """Check the injection rate limits.
++
++        Args:
++          addr (Address):  The sender.
++          now (float):  Current time.
++
++        Returns:
++          str:  Which limit applies, or None.
++        """
++        last = self._last_injected.get(addr.id)
++        if last is not None and now - last < self.PER_DEVICE_INTERVAL_S:
++            return "per device"
++        self._recent_injections = [t for t in self._recent_injections
++                                   if now - t < 60]
++        if len(self._recent_injections) >= self.GLOBAL_PER_MINUTE:
++            return "global"
++        return None
++
++    #-----------------------------------------------------------------------
++    def _alert(self, msg, event):
++        """Publish an alert for a group 0 broadcast (a phantom 'all on').
++
++        Args:
++          msg:  The message.
++          event (dict):  The pending event.
++        """
++        self.counts['alerts'] += 1
++        LOG.warning("Listeners: group 0 broadcast from %s cmd %#04x, heard "
++                    "by %s", msg.from_addr, msg.cmd1,
++                    ", ".join(sorted(event['heard_by'])))
++        if self.alert_topic:
++            payload = json.dumps({
++                'alert': 'all-link-group-0', 't': round(event['t'], 3),
++                'from': msg.from_addr.hex, 'cmd1': msg.cmd1,
++                'cmd2': msg.cmd2, 'heard_by': event['heard_by']})
++            self.mqtt.publish(self.alert_topic, payload, retain=False)
++
++    #-----------------------------------------------------------------------
++    def stats(self):
++        """Current counters, as published on the stats topic.
++
++        Returns:
++          dict
++        """
++        return {'since': round(self.started), 'counts': dict(self.counts),
++                'receivers': self.receivers, 'devices': self.devices}
++
++
++#===========================================================================
++__all__ = ['Listeners', 'TIERS', 'message_key']
+diff --git a/insteon_mqtt/Protocol.py b/insteon_mqtt/Protocol.py
+index 01a9402..b4fa640 100644
+--- a/insteon_mqtt/Protocol.py
++++ b/insteon_mqtt/Protocol.py
+@@ -68,6 +68,9 @@ class Protocol:
+        sending one command, getting an ACK, then reading a series of messages
+        (1 per db entry) until we get a final message which ends the sequence.
+     """
++    # How long the modem's own copy of an injected message is ignored for.
++    INJECTED_GUARD_S = 3.0
++
+     def __init__(self, link):
+         """Constructor
+ 
+@@ -94,6 +97,12 @@ class Protocol:
+         # been removed from the _write_queue
+         self.signal_msg_finished = Signal()  # (Message)
+ 
++        # Emitted for every inbound Insteon message read from the modem, with
++        # the raw frame bytes and whether it was judged a duplicate.  This is
++        # the ground truth for "what did the modem actually hear", which an
++        # external receiver needs in order to know what it should inject.
++        self.signal_raw_read = Signal()  # (bytes, bool)
++
+         # Inbound message buffer.
+         self._buf = bytearray()
+ 
+@@ -126,6 +135,10 @@ class Protocol:
+         # this time.
+         self._read_history = []
+ 
++        # Messages handed in by inject(), with the time until which the
++        # modem's own copy of each is ignored.  See inject().
++        self._injected = []
++
+         # List of Msg.Timed objects which store a message and a time at which
+         # to send the message.  It will be sorted by send time.  These are
+         # messages that should be sent after a certain time has passed.  The
+@@ -271,6 +284,102 @@ class Protocol:
+                     return True
+         return False
+ 
++    #-----------------------------------------------------------------------
++    def inject(self, raw):
++        """Process an inbound Insteon message that did not come from the modem.
++
++        A PLM hears only what reaches its single antenna, and passes up only
++        the group broadcasts it holds an ALDB link for.  Additional receivers
++        placed elsewhere can hear messages the modem missed; handing them over
++        here makes the modem effectively more sensitive without introducing a
++        second transmitter.
++
++        The bytes must be a complete inbound message frame exactly as the
++        modem would have produced it (0x02 0x50 for standard, 0x02 0x51 for
++        extended).  Nothing else is accepted: an injected frame is not allowed
++        to reconfigure the modem or fake a reply to an outbound command at the
++        link level.
++
++        This deliberately does **not** feed self._buf.  That buffer is filled
++        by the serial link and may hold a partially received frame; appending
++        to it would interleave the two streams and corrupt both.  Instead the
++        frame is parsed on its own and handed to the same duplicate check and
++        handler dispatch that _data_read() uses, so an injected copy of a
++        message the modem also heard is dropped exactly like a mesh repeat.
++
++        Args:
++          raw (bytes):  A complete 0x50 or 0x51 modem frame.
++
++        Returns:
++          bool:  True if the message was processed, False if it was rejected
++          as malformed or dropped as a duplicate.
++        """
++        buf = bytes(raw)
++        if len(buf) < 2 or buf[0] != 0x02:
++            LOG.warning("Injected frame does not start with 0x02: %s",
++                        buf.hex())
++            return False
++
++        msg_type = buf[1]
++        if msg_type not in (Msg.InpStandard.msg_code,
++                            Msg.InpExtended.msg_code):
++            LOG.warning("Injected message code %#04x is not an inbound "
++                        "Insteon message", msg_type)
++            return False
++
++        msg_class = Msg.types[msg_type]
++        if len(buf) != msg_class.msg_size(buf):
++            LOG.warning("Injected %#04x frame is %d bytes, needs %d", msg_type,
++                        len(buf), msg_class.msg_size(buf))
++            return False
++
++        try:
++            msg = msg_class.from_bytes(buf)
++        except Exception:
++            LOG.exception("Cannot parse injected message bytes %s", buf.hex())
++            return False
++
++        LOG.info("Injected %#04x: %s", msg_type, msg)
++
++        if self._is_duplicate(msg):
++            LOG.info("Ignored duplicate injected %s", msg)
++            return False
++
++        # The modem may still hear this message itself, late: its copy can
++        # arrive over the powerline after an RF listener's.  The normal
++        # duplicate window is hops_left * ~0.09 s (none at 0 hops left), far
++        # too short to catch that, so remember what was injected for a few
++        # seconds.  Kept short on purpose: a second press of the same button
++        # produces identical bytes and must not be swallowed.
++        now = time.time()
++        self._injected = [(m, t) for m, t in self._injected if t > now]
++        self._injected.append((msg, now + self.INJECTED_GUARD_S))
++
++        self._process_msg(msg)
++        return True
++
++    #-----------------------------------------------------------------------
++    def _is_injected_copy(self, msg):
++        """Check whether a message read from the modem was already injected.
++
++        Args:
++          msg:   Insteon message object read from the modem.
++
++        Returns:
++          bool: True if inject() handled this message within the last
++          INJECTED_GUARD_S seconds.
++        """
++        if not self._injected:
++            return False
++
++        now = time.time()
++        self._injected = [(m, t) for m, t in self._injected if t > now]
++        for i, (injected, _) in enumerate(self._injected):
++            if injected == msg:
++                del self._injected[i]
++                return True
++        return False
++
+     #-----------------------------------------------------------------------
+     def _poll(self, t):
+         """Periodic polling function.
+@@ -375,11 +484,16 @@ class Protocol:
+                 self._buf = self._buf[1:]
+                 continue
+ 
++            raw = bytes(self._buf[:msg_size])
+             self._buf = self._buf[msg_size:]
+             LOG.info("Read %#04x: %s", msg_type, msg)
+ 
+-            if self._is_duplicate(msg):
++            duplicate = self._is_duplicate(msg)
++            self.signal_raw_read.emit(raw, duplicate)
++            if duplicate:
+                 LOG.info("Ignored duplicate %s", msg)
++            elif self._is_injected_copy(msg):
++                LOG.info("Ignored modem copy of injected %s", msg)
+             else:
+                 # And try to process the message using the handlers.
+                 self._process_msg(msg)
+diff --git a/insteon_mqtt/data/config-schema.yaml b/insteon_mqtt/data/config-schema.yaml
+index 6d63a17..e2bf154 100644
+--- a/insteon_mqtt/data/config-schema.yaml
++++ b/insteon_mqtt/data/config-schema.yaml
+@@ -305,6 +305,26 @@ mqtt:
+     discovery_topic_base: *mqtt_topic
+     discovery_ha_status: *mqtt_topic
+     device_info_template: *discovery_device
++    # RF listeners (Listeners.py).  Declared here because unknown keys under
++    # mqtt: are validated as user-defined discovery classes.
++    listeners:
++      type: dict
++      schema:
++        # A subscription, so MQTT wildcards are allowed.
++        topic:
++          type: string
++          empty: false
++        inject: &listener_tiers
++          type: list
++          schema:
++            type: string
++            allowed: ['battery', 'group', 'state']
++        shadow: *listener_tiers
++        stats_topic: *mqtt_topic
++        stats_interval:
++          type: integer
++          min: 0
++        alert_topic: *mqtt_topic
+     modem:
+       type: dict
+       allow_unknown: True
+diff --git a/insteon_mqtt/mqtt/Mqtt.py b/insteon_mqtt/mqtt/Mqtt.py
+index 9bfd1bc..b7e9ce8 100644
+--- a/insteon_mqtt/mqtt/Mqtt.py
++++ b/insteon_mqtt/mqtt/Mqtt.py
+@@ -7,6 +7,7 @@ import functools
+ import json
+ import logging
+ from .. import log
++from ..Listeners import Listeners
+ from . import config
+ from .MsgTemplate import MsgTemplate
+ from .Reply import Reply
+@@ -90,6 +91,11 @@ class Mqtt:
+         # Loaded config object.
+         self._config = None
+ 
++        # RF listeners (Listeners.py).  Only created when the config has a
++        # 'listeners' section, so nothing changes for anyone who doesn't use
++        # them.
++        self.listeners = None
++
+     #-----------------------------------------------------------------------
+     def load_config(self, data):
+         """Load a configuration dictionary.
+@@ -148,6 +154,12 @@ class Mqtt:
+         # Save the config for later passing to devices when they are created.
+         self._config = data
+ 
++        # RF listeners.
++        self.listeners = None
++        if data.get('listeners'):
++            self.listeners = Listeners(self, self.modem, self.modem.protocol)
++            self.listeners.load_config(data['listeners'])
++
+         # Subscribe to the new topics.
+         if self.link.connected:
+             self._startup()
+@@ -427,6 +439,9 @@ class Mqtt:
+             self.link.subscribe(self._ha_status_topic, self.qos,
+                                 self.handle_ha_status)
+ 
++        if self.listeners:
++            self.listeners.subscribe(self.link, self.qos)
++
+         for device in self.devices.values():
+             device.subscribe(self.link, self.qos)
+             self._publish_device_discovery(device)
+@@ -440,6 +455,9 @@ class Mqtt:
+         if self._cmd_topic:
+             self.link.unsubscribe(self._cmd_topic + "/+")
+ 
++        if self.listeners:
++            self.listeners.unsubscribe(self.link)
++
+         for device in self.devices.values():
+             device.unsubscribe(self.link)
+ 
+-- 
+2.53.0
+

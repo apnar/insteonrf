@@ -1,0 +1,85 @@
+From 844ac922249089b87c0e88b613a97f5e4adc4d98 Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 12:15:07 -0500
+Subject: [PATCH] Add optional RF listener support
+
+A PLM hears only what reaches its own antenna. Battery devices (leak,
+door, motion, remotes) are RF-only and can't be polled, so a message the
+modem misses from one of them is lost. Receive-only RF listeners placed
+elsewhere in the house (an ESPHome board with a CC1101, an RTL-SDR)
+decode what they hear and publish it to MQTT; this compares what they
+heard with what the modem heard and hands the modem's misses to the
+protocol stack. Nothing is transmitted.
+
+New optional `mqtt.listeners` config section. Without it nothing is
+created and nothing changes. With it, Listeners:
+
+- subscribes to decoded listener messages (default insteon-rf/msg/+):
+  JSON carrying the message as the modem would have reported it
+  (0x50/0x51 frame), its on-air time and receiver diagnostics;
+- holds each message 2.5 s for the modem's own (often later, powerline)
+  copy and does nothing if the modem heard it;
+- classifies the rest into tiers (battery, group, state), never
+  handling replies, the modem's own messages, unknown senders, repaired
+  messages or group 0 (which raises an alert instead);
+- injects listed tiers through the new Protocol.inject(), logs "shadow"
+  tiers only, with per-device and global rate limits;
+- publishes per-listener and per-device counters (retained) and group 0
+  alerts.
+
+Protocol gains signal_raw_read (every frame read from the modem) and
+inject(), which accepts only complete 0x50/0x51 frames and ignores the
+modem's own copy of an injected message for 3 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ config-example.yaml | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/config-example.yaml b/config-example.yaml
+index daaf3aa..e3bd796 100644
+--- a/config-example.yaml
++++ b/config-example.yaml
+@@ -213,4 +213,38 @@ mqtt:
+   # TO ENABLE THE DISCOVERY PLATFORM: Set the following to true
+   enable_discovery: false
+ 
++  #==================================================================
++  # RF listeners
++  #==================================================================
++  # The modem hears only what reaches its own antenna.  Battery devices
++  # (leak, door, motion, remotes) are RF only and can't be polled, so a
++  # message the modem misses from one of them is lost.  Receive-only RF
++  # listeners elsewhere in the house (for example a LilyGO T-Embed CC1101
++  # running ESPHome, or an RTL-SDR) can publish what they decode here.
++  # Messages the modem missed are then handled as though it had heard them.
++  # Nothing is ever transmitted; the modem stays the only transmitter.
++  #
++  # Each listener publishes JSON to its own topic:
++  #   {"v": 1, "rx": "t-embed", "t": 1794759872.429,
++  #    "frame": "0250...", "copies": 3, "hops_left": 2,
++  #    "rssi": -78.5, "snr": null, "repaired": 0}
++  # where "frame" is the message as the modem would have reported it.
++  #
++  # Tiers:  battery = broadcasts and cleanups from battery devices;
++  # group = any group broadcast or cleanup; state = other messages to the
++  # modem.  Replies (ACK/NAK), the modem's own messages, unknown senders,
++  # repaired messages and group 0 broadcasts are never handled.  Tiers in
++  # "shadow" are only logged ("would inject"), so a tier can be watched
++  # before it is turned on.
++  #
++  # listeners:
++  #   topic: 'insteon-rf/msg/+'
++  #   inject: ['battery']
++  #   shadow: ['group', 'state']
++  #   # Counters per listener and per device, published retained.
++  #   stats_topic: 'insteon/listeners/stats'
++  #   stats_interval: 300
++  #   # A group 0 broadcast ("all on") heard by a listener.
++  #   alert_topic: 'insteon/listeners/alert'
++
+ #----------------------------------------------------------------
+-- 
+2.53.0
+

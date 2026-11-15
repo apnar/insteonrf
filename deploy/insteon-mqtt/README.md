@@ -25,13 +25,13 @@ it is applied to an insteon-mqtt install at image build time.
 ## The series
 
 Generated, never hand-edited, from the upstream PR branch
-`rf-listener-raw-topics` (local checkout `/root/src/insteon-mqtt`, based on
+`rf-listeners` (local checkout `/root/src/insteon-mqtt`, based on
 upstream `dev` = 1.4.0). The commands are in the Containerfile header.
 
 | Patch | Applies to |
 |---|---|
-| `0001-raw-topics-code-and-schema.patch` | `Protocol.py` (`signal_raw_read`, `inject()`), new `mqtt/Raw.py`, `mqtt/Mqtt.py`, `data/config-schema.yaml` |
-| `0002-raw-topics-config-example.patch` | `config-example.yaml` (source checkout only) |
+| `0001-rf-listeners-code-and-schema.patch` | `Protocol.py` (`signal_raw_read`, `inject()`), new `mqtt/Raw.py`, `mqtt/Mqtt.py`, `data/config-schema.yaml` |
+| `0002-rf-listeners-config-example.patch` | `config-example.yaml` (source checkout only) |
 
 0001 is applied to **both** trees; see the Containerfile for why that
 matters. The PR's tests are not in the series (the installed package has no
@@ -83,6 +83,6 @@ INSTEONRF_IMQTT=/tmp/imqtt pytest tests/test_inject.py
 
 ## Upstreaming
 
-In progress: branch `rf-listener-raw-topics` in `/root/src/insteon-mqtt`,
+In progress: branch `rf-listeners` in `/root/src/insteon-mqtt`,
 targeting upstream `dev` (their CONTRIBUTING forbids PRs against `master`).
 Once merged and released, drop this directory and run the upstream image.
