@@ -1,7 +1,31 @@
 # Re-architecture: decode at the listener, decide in insteon-mqtt
 
-Status: **plan**, 2026-11-15. Supersedes the injection half of `MESH-PLAN.md`
-once Phase 5 is done.
+Status: **implemented 2026-11-15**, going straight to the end state (no
+parallel phases, no separate raw-topics PR). Supersedes the injection half of
+`MESH-PLAN.md`; the `insteonrf-mesh` pod is parked in `/k8s/yaml/limbo/`.
+Where the build differs from the plan below, **As built** says so.
+
+## As built
+
+- insteon-mqtt: branch `rf-listeners` in `/root/src/insteon-mqtt` (one PR, not
+  two). `insteon_mqtt/Listeners.py` holds the engine *and* its MQTT side
+  (subscribe, stats, alerts); there is no `Raw.py` and no `insteon/raw/*`
+  topics. Config is `mqtt.listeners` with `inject:` (live tiers) and
+  `shadow:` (logged-only tiers) lists; the section's presence enables it.
+  Releases run from one `modem.timed_call` tick (TimedCall runs a single call
+  per loop pass, so one per event would trickle a burst out).
+- Alpha runs `inject: ['battery']`, `shadow: ['group', 'state']`.
+- Rule 1 does **not** require the extended data CRC (the packet CRC covers
+  every data byte, and some devices leave it unset).
+- The T-Embed does **no** repair (no bitwise majority across copies):
+  `repaired` is always 0 from the board. Firmware 3.0.0.
+- Host pods: `monitor --publish-decoded=<rx>` (not a new `listen`
+  command). Both publish `rssi: null` (the dongle's register snapshot is the
+  post-block floor; the SDR measures none).
+- The dongle keeps `--watch-all-on` and the HA automation on
+  `insteon-rf/alert`; insteon-mqtt's `insteon/listeners/alert` (group 0 from
+  any listener) runs alongside it.
+
 
 ## Why
 
@@ -63,8 +87,8 @@ Topic `insteon-rf/msg/<rx>`, QoS 0, not retained. A new topic, not the old
 
 Rules every listener follows:
 
-1. Publish only messages with a valid CRC (standard, and data CRC for
-   extended) **and** valid frame-index counters. The counters are what keep
+1. Publish only messages with a valid packet CRC **and** valid frame-index
+   counters (the extended data CRC is not required; see As built). The counters are what keep
    an 8-bit CRC from accepting one random string in 256.
 2. One message per transmission: fold hop copies by the hop-insensitive key
    (flags minus hop bits, to, from, cmd1, cmd2, extended data) within 0.5 s
