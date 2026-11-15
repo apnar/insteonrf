@@ -1,7 +1,7 @@
 From 844ac922249089b87c0e88b613a97f5e4adc4d98 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:15:07 -0500
-Subject: [PATCH 1/4] Add optional RF listener support
+Subject: [PATCH 1/5] Add optional RF listener support
 
 A PLM hears only what reaches its own antenna. Battery devices (leak,
 door, motion, remotes) are RF-only and can't be polled, so a message the
@@ -804,7 +804,7 @@ index 9bfd1bc..b7e9ce8 100644
 From 2e3ac24770be0d5bf8e99ab4c3894c92bae1b7f9 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:24:45 -0500
-Subject: [PATCH 2/4] Listeners: drop the doubled 'Listeners:' log prefix
+Subject: [PATCH 2/5] Listeners: drop the doubled 'Listeners:' log prefix
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
@@ -857,7 +857,7 @@ index af58dc1..41a1f8b 100644
 From 314fc46156ebbca96fe947240ff0f65b8dc087f2 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:39:44 -0500
-Subject: [PATCH 3/4] Listeners: messages to other devices are not modem misses
+Subject: [PATCH 3/5] Listeners: messages to other devices are not modem misses
 
 Direct and cleanup messages addressed to another device (e.g. a leak
 sensor's cleanups to its other responders) are never passed up by a PLM,
@@ -916,7 +916,7 @@ index 41a1f8b..76bc1ec 100644
 From 9ed7291245e57d3af412e7a667455c0053c9a4ff Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 13:08:47 -0500
-Subject: [PATCH 4/4] Listeners: fixes from review
+Subject: [PATCH 4/5] Listeners: fixes from review
 
 - Correlate on insteon-mqtt's own clock (arrival), never the listener's:
   a listener clock that is off can no longer make a heard message look
@@ -1331,6 +1331,267 @@ index b4fa640..320d70e 100644
              else:
                  # And try to process the message using the handlers.
                  self._process_msg(msg)
+-- 
+2.53.0
+
+
+From ea2be693e0276fdd219af55f11b18a51de2c4017 Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 13:13:24 -0500
+Subject: [PATCH 5/5] Listeners: late copies, a narrower superseded rule, 1.5 s
+ early window
+
+From the second review of 9ed7291:
+
+- A copy of the same bytes from another listener within 4 s of the first
+  arrival is the same transmission, merged or (if already released)
+  absorbed as a late copy; it was injected twice. The same listener again
+  is a new transmission (listeners fold their own hop copies). A late copy
+  no longer releases a pending event early.
+- 'Superseded' only for a newer message for the same group from the same
+  device, ordered by when the listeners heard it (the modem's copy of an
+  older message can land after a listener's copy of a newer one), and
+  never for replies or 0x06 cleanup reports. The cleanup of a broadcast
+  (same group and command) counts as the modem having handled it.
+- EARLY_S 3.0 -> 1.5 s, so a missed repeat press 2 s after a heard one is
+  injected rather than taken as heard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ insteon_mqtt/Listeners.py | 134 +++++++++++++++++++++++++++++---------
+ 1 file changed, 102 insertions(+), 32 deletions(-)
+
+diff --git a/insteon_mqtt/Listeners.py b/insteon_mqtt/Listeners.py
+index cad49f5..33af792 100644
+--- a/insteon_mqtt/Listeners.py
++++ b/insteon_mqtt/Listeners.py
+@@ -30,10 +30,13 @@ listener's 't' is only checked for being finite and recent):
+ 
+ 1. Hold it for 'grace' seconds.  The modem's own copy also travels the
+    powerline and often arrives after a listener's.
+-2. Do nothing if the modem read it, if the modem has since read a later
+-   message from the same device (injecting would replay old state), if it is
+-   addressed to another device, or if it is a group broadcast the modem has
+-   no responder link for (the modem would never pass it up).
++2. Do nothing if the modem read it (or the same event in its other form:
++   the cleanup of a broadcast), if the modem has since read a newer message
++   for the same group from the same device (injecting would replay old
++   state), if it is addressed to another device, or if it is a group
++   broadcast the modem has no responder link for (the modem would never
++   pass it up).  Copies from several listeners are one event; the same
++   listener again is a new transmission.
+ 3. Otherwise classify it.  'battery': a broadcast or cleanup from a battery
+    device.  'group': any other group broadcast or cleanup.  'state': any
+    other message to the modem.  Never handled: ACK/NAK replies, the modem's
+@@ -88,16 +91,27 @@ def message_key(frame):
+         bytes(frame[9:])
+ 
+ 
+-def message_sender(key):
+-    """The sender id (0xAABBCC) encoded in a message_key().
++def _topic(key):
++    """What a message is about, from its message_key().
+ 
+     Args:
+       key (bytes):  A key from message_key().
+ 
+     Returns:
+-      int
++      (int, int, int):  (sender id, group or None, cmd1).  The group is set
++      only for group broadcasts (the low byte of 'to') and cleanups (cmd2),
++      and never for replies or cleanup status reports (0x06), which carry
++      no state of their own.
+     """
+-    return (key[1] << 16) | (key[2] << 8) | key[3]
++    sender = (key[1] << 16) | (key[2] << 8) | key[3]
++    kind = key[7] >> 5
++    cmd1, cmd2 = key[8], key[9]
++    group = None
++    if kind == Msg.Flags.Type.ALL_LINK_BROADCAST and cmd1 != 0x06:
++        group = key[6]
++    elif kind == Msg.Flags.Type.ALL_LINK_CLEANUP:
++        group = cmd2
++    return sender, group, cmd1
+ 
+ 
+ class Listeners:
+@@ -111,10 +125,15 @@ class Listeners:
+     # modem's own copy (it can arrive later: it also travels the powerline).
+     GRACE_S = 2.5
+     # The modem's copy counts if it was read up to this long before the
+-    # first listener copy arrived (listeners publish ~0.7 s after the air).
+-    EARLY_S = 3.0
+-    # Copies of one message from several listeners arrive within this.
+-    MERGE_S = 1.5
++    # first listener copy arrived (listeners publish ~0.7 s after the air,
++    # the modem's copy lands between ~0.7 s before and ~0.6 s after).
++    EARLY_S = 1.5
++    # A copy of the same bytes from a *different* listener within this of
++    # the first arrival is the same transmission, even if the event was
++    # already released (Wi-Fi jitter, an SDR backlog).  From the *same*
++    # listener it is always a new transmission: listeners fold their own hop
++    # copies.
++    LATE_COPY_S = 4.0
+     # Listener messages whose 't' is further than this from now are dropped.
+     STALE_S = 10.0
+     # How long modem frames are remembered.
+@@ -145,8 +164,11 @@ class Listeners:
+         self.stats_interval = 300
+         self.alert_topic = None
+ 
+-        # Pending events: key -> dict(t, frame, msg, heard_by, ...)
++        # Pending events: key -> dict(first, t, frame, msg, heard_by, ...)
+         self._events = {}
++        # Released events, for late copies and ordering: key -> dict(first,
++        # rx=set of listeners), kept PLM_MEMORY_S.
++        self._released = {}
+         # What the modem read: list of (key, sender id, time).
+         self._plm = []
+         # Injection times: per sender id, and overall.
+@@ -162,7 +184,7 @@ class Listeners:
+         self.started = self.clock()
+         self.counts = {'messages': 0, 'not_for_modem': 0, 'no_modem_link': 0,
+                        'plm_heard': 0, 'superseded': 0, 'plm_missed': 0,
+-                       'stale': 0,
++                       'stale': 0, 'late_copies': 0,
+                        'injected': 0, 'shadow': 0, 'rejected': 0,
+                        'rate_limited': 0, 'malformed': 0, 'alerts': 0}
+         self.receivers = {}
+@@ -302,11 +324,19 @@ class Listeners:
+ 
+         key = message_key(frame)
+         event = self._events.get(key)
+-        if event is None or now - event['first'] > self.MERGE_S:
+-            if event is not None:
+-                # Same bytes again, too late to be another listener's copy:
+-                # a new transmission.  Decide on the old one first.
+-                self._release(key)
++        if event is not None and rx in event['heard_by']:
++            # The same listener again: a new transmission (a repeat press).
++            # Decide on the earlier one first.
++            self._release(key)
++            event = None
++        if event is None:
++            past = self._released.get(key)
++            if past is not None and rx not in past['rx'] and \
++                    now - past['first'] <= self.LATE_COPY_S:
++                # Another listener's late copy of a message already decided.
++                past['rx'].add(rx)
++                self.counts['late_copies'] += 1
++                return
+             event = {'first': now, 't': t, 'frame': frame, 'msg': msg,
+                      'heard_by': {}, 'repaired': repaired,
+                      'due': now + self.GRACE_S}
+@@ -375,7 +405,7 @@ class Listeners:
+ 
+     #-----------------------------------------------------------------------
+     def _plm_heard(self, key, first, now):
+-        """Whether the modem read this message, and anything newer.
++        """What the modem read that bears on this message.
+ 
+         Args:
+           key (bytes):  The message key.
+@@ -383,17 +413,51 @@ class Listeners:
+           now (float):  Release time: the end of the window.
+ 
+         Returns:
+-          (bool, bool):  (heard this message, heard a later message from the
+-          same sender).
++          (bool, bool):  (handled: the modem read this message, or the same
++          event in its other form -- the cleanup of a broadcast or the
++          broadcast of a cleanup; superseded: the modem has read a newer
++          message for the same group from the same device).
+         """
+-        sender = message_sender(key)
+-        heard = newer = False
++        sender, group, cmd1 = _topic(key)
++        handled = newer = False
+         for k, who, when in self._plm:
+-            if k == key and first - self.EARLY_S <= when <= now:
+-                heard = True
+-            elif who == sender and first <= when <= now:
++            if not first - self.EARLY_S <= when <= now:
++                continue
++            if k == key:
++                handled = True
++                continue
++            if who != sender or group is None:
++                continue
++            k_sender, k_group, k_cmd1 = _topic(k)
++            if k_group != group or k_sender != sender:
++                continue
++            if k_cmd1 == cmd1:
++                handled = True          # the same event, other form
++            elif self._later(k, first, when):
+                 newer = True
+-        return heard, newer
++        return handled, newer
++
++    #-----------------------------------------------------------------------
++    def _later(self, key, first, when):
++        """Whether a message the modem read came after an event.
++
++        The listeners' own order is used when they heard it too: the modem's
++        copy of an *earlier* message can arrive after a listener's copy of a
++        later one.  Otherwise it must have been read beyond the modem's
++        maximum lag.
++
++        Args:
++          key (bytes):  The other message.
++          first (float):  First listener arrival of the event.
++          when (float):  When the modem read the other message.
++
++        Returns:
++          bool
++        """
++        seen = self._events.get(key) or self._released.get(key)
++        if seen is not None:
++            return seen['first'] > first
++        return when > first + self.EARLY_S
+ 
+     #-----------------------------------------------------------------------
+     def _release(self, key):
+@@ -406,6 +470,13 @@ class Listeners:
+         if event is None:
+             return
+ 
++        now = self.clock()
++        self._released[key] = {'first': event['first'],
++                               'rx': set(event['heard_by'])}
++        for k in [k for k, r in self._released.items()
++                  if now - r['first'] > self.PLM_MEMORY_S]:
++            del self._released[k]
++
+         msg = event['msg']
+         self.counts['messages'] += 1
+ 
+@@ -434,14 +505,14 @@ class Listeners:
+             self.counts['no_modem_link'] += 1
+             return
+ 
+-        heard, newer = self._plm_heard(key, event['first'], self.clock())
++        heard, newer = self._plm_heard(key, event['first'], now)
+         if heard:
+             self.counts['plm_heard'] += 1
+             return
+         if newer:
+             # The modem missed this but has since handled something later
+-            # from the same device (a close after an open, the cleanup after
+-            # a broadcast): injecting now would replay old state.
++            # for the same group from the same device (a close after an
++            # open): injecting now would replay old state.
+             LOG.info("Not injecting a message the modem missed: it has "
+                      "since read a later one from %s: %s", msg.from_addr, msg)
+             self.counts['superseded'] += 1
+@@ -458,7 +529,6 @@ class Listeners:
+         if tier not in self.inject and tier not in self.shadow:
+             return
+ 
+-        now = self.clock()
+         limit = self._rate_limited(msg.from_addr, now)
+         if limit:
+             LOG.info("Listener %s message rate limited (%s): %s", tier,
 -- 
 2.53.0
 
