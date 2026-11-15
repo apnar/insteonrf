@@ -32,6 +32,13 @@ Where the build differs from the plan below, **As built** says so.
   Listener fold window 0.35 s. Measured: listener publish lag ~0.75 s, PLM lag
   p50 0.2 / p99 0.93 s, cross-listener on-air spread p99 0.46 s; the PLM misses
   ~1 battery *state* message per 4 days (most battery misses are 0x06 reports).
+- Final review (2026-11-15): shadow decisions have their own rate-limit
+  budget; after an injection, `Protocol.read_filter` (set by Listeners) drops
+  the modem's own late copy of the same bytes within 1 s, or of the other form
+  (broadcast vs cleanup) within 8 s, once. This replaces the 10 s guard in
+  `inject()` that the plan below describes. Retransmission and pairing windows
+  are measured on insteon-mqtt's clock (arrival - 0.75 s listener lag), never
+  the listener's.
 - The dongle keeps `--watch-all-on` and the HA automation on
   `insteon-rf/alert`; insteon-mqtt's `insteon/listeners/alert` (group 0 from
   any listener) runs alongside it.

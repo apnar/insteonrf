@@ -275,8 +275,8 @@ display:
 
           // Captures without accepts = noise or a framing problem; accepts
           // = real packets; lost = the receive path is being starved.
-          it.printf(0, 96, id(f_mid), "%u cap  %u ok  %u msg /min",
-                    (unsigned) node->captures_last_minute(),
+          // Captures are on the health page; this line leaves room for "lost".
+          it.printf(0, 96, id(f_mid), "%u ok  %u msg /min",
                     (unsigned) node->accepted_last_minute(),
                     (unsigned) node->decoded_last_minute());
           if (node->lost_last_minute())
@@ -377,21 +377,25 @@ display:
             it.print(0, 24, id(f_mid), id(c_dim), "offset: no packets");
           else
             it.printf(0, 24, id(f_mid), "offset %+.1f kHz", off);
-          it.printf(0, 52, id(f_mid), "lost %u  dec %u /min", (unsigned) node->lost_last_minute(),
+          it.printf(0, 52, id(f_mid), "cap %u  lost %u  dec %u /min",
+                    (unsigned) node->captures_last_minute(), (unsigned) node->lost_last_minute(),
                     (unsigned) node->decoded_last_minute());
 
           const float soc = id(battery_level).state;
           const float mv = id(battery_voltage).state;
           if (std::isnan(soc))
             it.print(0, 80, id(f_mid), id(c_dim), "battery: --");
+          else if (std::isnan(mv))
+            it.printf(0, 80, id(f_mid), "battery %.0f%%", soc);
           else
             it.printf(0, 80, id(f_mid), "battery %.0f%%  %.2f V", soc, mv / 1000.0f);
 
           const float wifi_db = id(wifi_rssi).state;
           if (!std::isnan(wifi_db))
             it.printf(0, 108, id(f_mid), "WiFi %.0f dBm", wifi_db);
-          it.printf(0, 136, id(f_small), id(c_dim), "up %.0f h",
-                    id(uptime_s).state / 3600.0f);
+          if (!std::isnan(id(uptime_s).state))
+            it.printf(0, 136, id(f_small), id(c_dim), "up %.0f h",
+                      id(uptime_s).state / 3600.0f);
           it.print(W, 136, id(f_small), id(c_dim), TextAlign::TOP_RIGHT, "turn knob: page");
 
 # ---------------------------------------------------------------- controls

@@ -159,6 +159,7 @@ class InsteonRF : public Component {
   /// Release (publish) messages whose fold window has closed. Radios call it
   /// from loop() on every pass, so messages go out on quiet air too.
   void service_decoded_();
+  void release_decoded_(const FoldedMessage &m, int64_t now_ms);
   void publish_decoded_(const FoldedMessage &m, int64_t now_ms);
   /// micros() extended to 64 bits (loop() context only; it must run at least
   /// once per 71 minutes, which loop() does).

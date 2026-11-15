@@ -201,7 +201,7 @@ void InsteonRF::decode_capture_(const uint8_t *buf, size_t len, float rssi, uint
     const int64_t t_ms = (first_us + (int64_t) copies[i].bit_pos * 1000000LL / DECODER_BITRATE) / 1000;
     FoldedMessage evicted;
     if (this->folder_.add(copies[i], t_ms, rssi, &evicted))
-      this->publish_decoded_(evicted, now_us / 1000);
+      this->release_decoded_(evicted, now_us / 1000);
   }
 }
 
@@ -210,15 +210,19 @@ void InsteonRF::service_decoded_() {
     return;
   const int64_t now_ms = this->now_us64_() / 1000;
   FoldedMessage m;
-  while (this->folder_.pop_ready(now_ms - RELEASE_LATENESS_MS, &m)) {
-    // For the display: recorded whether or not the clock is set yet.
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    const HeardMessage h = heard_from(m.msg, m.rssi, millis(), tv.tv_sec >= CLOCK_VALID_AFTER ? tv.tv_sec : 0);
-    this->heard_log_.add(h);
-    this->heard_devices_.add(h);
-    this->publish_decoded_(m, now_ms);
-  }
+  while (this->folder_.pop_ready(now_ms - RELEASE_LATENESS_MS, &m))
+    this->release_decoded_(m, now_ms);
+}
+
+void InsteonRF::release_decoded_(const FoldedMessage &m, int64_t now_ms) {
+  // For the display: recorded whether or not the clock is set yet, and for
+  // every release (window closed, a retry, or a full fold table).
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  const HeardMessage h = heard_from(m.msg, m.rssi, millis(), tv.tv_sec >= CLOCK_VALID_AFTER ? tv.tv_sec : 0);
+  this->heard_log_.add(h);
+  this->heard_devices_.add(h);
+  this->publish_decoded_(m, now_ms);
 }
 
 void InsteonRF::publish_decoded_(const FoldedMessage &m, int64_t now_ms) {

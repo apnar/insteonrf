@@ -1,4 +1,4 @@
-From c10a2041915a02b2bb8975e31e32cfff3a91e911 Mon Sep 17 00:00:00 2001
+From f0c41c7e5d7035c231abc1f5c21b5c9996725848 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 14:37:38 -0500
 Subject: [PATCH] Add optional RF listener support
@@ -29,15 +29,15 @@ How a message is decided (Listeners.py):
   transmission; further apart they are separate ones. Messages with a
   non-finite 't', or one more than 10 s from now, are dropped.
 - Each is held 2.5 s after it arrives for the modem's own copy, which
-  often comes later over the powerline. Decisions use insteon-mqtt's own
-  clock; a listener's clock only orders transmissions.
+  often comes later over the powerline. Decisions about the modem use
+  insteon-mqtt's own clock; a listener's clock only orders transmissions.
 - Nothing more happens if the modem read it (each modem read is credited
-  to one event; a read of the same bytes within 2 s on air also counts,
-  covering device retransmissions), if it read the other form of the same
-  event (broadcast vs cleanup, within 8 s), or if it has since read a
-  newer message about the same state from that device (leak sensors' dry
-  and wet groups count as one state). Messages to another device, and
-  group broadcasts the modem holds no link for, are not modem misses.
+  to one event; a read of the same bytes within 2 s also counts, covering
+  device retransmissions), if it read the other form of the same event
+  (broadcast vs cleanup, within 8 s), or if it has since read a newer
+  message about the same state from that device (leak sensors' dry and
+  wet groups count as one state). Messages to another device, and group
+  broadcasts the modem holds no link for, are not modem misses.
 - The rest are classified: 'battery' (broadcasts and cleanups from
   battery devices), 'group' (other group broadcasts and cleanups), 'state'
   (other messages to the modem). Never handled: ACK/NAK, cleanup status
@@ -45,26 +45,30 @@ How a message is decided (Listeners.py):
   a listener repaired, and group 0 broadcasts, which publish an alert.
 - Tiers listed in 'inject' go to the new Protocol.inject(); tiers in
   'shadow' are only logged ("Would inject ..."). Rate limits: 4 per device
-  and 12 overall per minute. Events are released oldest first; an error
-  deciding one does not affect the others.
+  and 12 overall per minute, with a separate budget for shadow. Events are
+  released oldest first; an error deciding one does not affect the others.
+- After an injection, the modem's own late copy of the message (within
+  1 s), or the other form of the same event (within 8 s), is dropped
+  before it is handled, once.
 - Counters per listener and per device are published retained to a stats
   topic; group 0 broadcasts go to an alert topic.
 
-Protocol gains signal_raw_read (every frame read from the modem) and
-inject(), which accepts only complete 0x50/0x51 frames of the exact length
-and passes them through the normal duplicate check and handlers.
+Protocol gains signal_raw_read (every frame read from the modem), an
+optional read_filter, and inject(), which accepts only complete 0x50/0x51
+frames of the exact length and passes them through the normal duplicate
+check and handlers.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
 ---
- config-example.yaml | 37 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 37 insertions(+)
+ config-example.yaml | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
 
 diff --git a/config-example.yaml b/config-example.yaml
-index daaf3aa..97965b8 100644
+index daaf3aa..3a83029 100644
 --- a/config-example.yaml
 +++ b/config-example.yaml
-@@ -213,4 +213,41 @@ mqtt:
+@@ -213,4 +213,42 @@ mqtt:
    # TO ENABLE THE DISCOVERY PLATFORM: Set the following to true
    enable_discovery: false
  
@@ -93,7 +97,8 @@ index daaf3aa..97965b8 100644
 +  # cleanup status reports, the modem's own messages, unknown senders,
 +  # repaired messages and group 0 broadcasts are never handled.  Tiers in
 +  # "shadow" are only logged ("would inject"), so a tier can be watched
-+  # before it is turned on.
++  # before it is turned on.  Injection is rate limited (4 per device, 12
++  # overall, per minute; shadow has its own budget).
 +  #
 +  # listeners:
 +  #   topic: 'insteon-rf/msg/+'

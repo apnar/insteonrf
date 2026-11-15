@@ -168,6 +168,8 @@ const char *DeviceNames::find(uint32_t addr) const {
 }
 
 void DeviceNames::label(uint32_t addr, char *buf, size_t len, size_t max_chars) const {
+  if (len == 0)
+    return;
   const char *name = this->find(addr);
   if (name == nullptr) {
     format_addr(addr, buf, len);
