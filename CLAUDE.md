@@ -34,7 +34,8 @@ python tools/gen_sync_word.py                            # SX1262 sync word, fro
 
 # The listener mesh (Doc/MESH-PLAN.md). Phases 1-3 need no new hardware: the
 # rfcat dongle is the first receiver.
-insteon-rf monitor --mqtt=host --mesh-capture=dongle     # dongle joins the mesh
+insteon-rf monitor --mqtt=host --mesh-capture=dongle     # dongle joins the mesh (legacy path)
+insteon-rf monitor --mqtt=host --publish-decoded=dongle  # contract v1 on insteon-rf/msg/dongle
 insteon-rf mesh --mqtt=host --report-every=900           # fuse + miss table, no injection
 
 # Tests that use insteon-mqtt as an oracle, and verify the patch series:
@@ -58,7 +59,8 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/context.py` | `CommandTracker`: correlates replies with their queries so an ACK's `cmd1` is read in the right table |
 | `insteonrf/recover.py` | soft-decision framing: Manchester pairs combined by difference, known frame-index counters as a checksum, bounded CRC-guided bit repair (`recover_packets`, `recover_from_burst`) |
 | `insteonrf/radio/` | `rfcat.py` (`RfcatRadio`, aliased `Radio`: 2FSK, 914.95 MHz, 9124 baud, 200 kHz BW, 75 kHz dev; `configure_rx()` syncs on the inverted start header `0x3155`, `sync_header=False` = carrier detect; `configure_tx()` sync word `0x6666`), `sdr.py` (`SdrReceiver`/`SdrTransmitter`), `file.py` (`FileRadio`), `__init__.py` (`RadioBackend` protocol, `open_backend()`) |
-| `insteonrf/monitor.py` | JSON-lines writer with rotation, mesh-repeat `Deduper`, `MqttPublisher` |
+| `insteonrf/monitor.py` | JSON-lines writer with rotation, mesh-repeat `Deduper`, `MqttPublisher`, `DecodedPublisher` (folds decoded packets into contract-v1 messages for `monitor --publish-decoded`) |
+| `insteonrf/listener.py` | listener contract v1 (`Doc/REARCHITECTURE.md`): `ListenerMessage`, `Folder` (hop copies → one message per transmission), the reference every listener and insteon-mqtt's parser are tested against |
 | `insteonrf/debug.py` | `dump_frames()` — frame-by-frame breakdown |
 | `insteonrf/cli.py` | `recv send print pkt dump monitor modulate demod clip reset`; `rf_reciv.py` etc. call these |
 | `Src/fsk2_demod.c` | FSK2 demod + squelch + framing for raw 8-bit I/Q (`-U` signed/HackRF) |
@@ -71,9 +73,9 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, publish, counters), radios `cc1101.cpp` (T-Embed, live) and `sx1262.cpp` (Heltec, retired 2026-10-08), chosen by `radio:` |
 | `esphome/insteon-rf-embed.yaml` | the LilyGO T-Embed CC1101 listener (`Doc/T-EMBED.md`); the Heltec's config is in `esphome/retired/` |
 | `tools/score_receivers.py` | score one receiver against a fixed reference set from the mesh event log, per time window (the A/B yardstick) |
-| `deploy/insteonrf-dongle.yaml` | receive-only k8s Pod publishing to MQTT `insteon-rf/` (see `/root/homelab/docs/k8s.md` conventions) |
+| `deploy/insteonrf-dongle.yaml` | receive-only k8s Pod: decoded messages (contract v1) on `insteon-rf/msg/dongle`, all-on alerts on `insteon-rf/alert` (see `/root/homelab/docs/k8s.md` conventions) |
 | `deploy/insteonrf-mesh.yaml` | the mesh service as a second pod, no USB |
-| `deploy/insteonrf-v3.yaml` | an RTL-SDR Blog V3 (serial `INST915`) as a third listener (`--mesh-capture=v3`), the only one producing soft decisions |
+| `deploy/insteonrf-v3.yaml` | an RTL-SDR Blog V3 (serial `INST915`) as a third listener (`--publish-decoded=v3`), the only one producing soft decisions |
 | `deploy/insteon-mqtt/` | patch series + Containerfile adding `insteon/raw/rx` and `insteon/raw/inject` to insteon-mqtt |
 
 Pipeline contract: one burst per line of `0`/`1` characters; blank lines ignored; `#` lines are
@@ -219,6 +221,19 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   identically at any queue size. `read_rssi()` used to ask the dongle **twice** per
   block (the `isinstance` test evaluated `getRSSI()` again), which is two USB
   round-trips per block on exactly the thread that must not be busy.
+- **What the host pods publish** (contract v1, `Doc/REARCHITECTURE.md`): both run
+  `monitor --publish-decoded=<rx>` (`dongle`, `v3`), not `--mesh-capture` any more
+  (it still works, for the retiring mesh). The worker folds every packet that survived
+  monitor's decode+repair into a `listener.Folder` and publishes each message to
+  `<topic>/msg/<rx>`, QoS 0, unretained; `--mqtt-alerts-only` does not affect it. Each
+  copy is dated at its own header (`packet_air_times`: burst stamp + position / baud),
+  since a dongle block spans four hop slots. Live radios release a message on the wall
+  clock at window (0.5 s) + `RELEASE_LATENESS_S` (0.2 s) after its first copy, checked
+  every 0.1 s even on silent air; a lossless replay releases on the recording's own
+  on-air clock, and `FileRadio` honours `# <time>` lines (`recv -t`), so replay is
+  deterministic. `rssi` is `null` for the dongle (post-block register snapshot, the
+  same reason `--mesh-capture` sends none) and there is no RSSI on the SDR; `snr` is
+  the SDR's symbol SNR; `repaired` is `Packet.corrected`.
 - **Two listeners cannot share an MQTT client id.** `MqttPublisher` defaults to a
   unique one now; with the fixed `insteon-rf` it had, the dongle pod and the V4 pod
   evicted each other from the broker in a reconnect loop that reads as a broker fault.

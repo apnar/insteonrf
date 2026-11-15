@@ -1,13 +1,18 @@
 # insteon-rf V3 — an RTL-SDR Blog V3 as a third listener, receive only.
 #
-# Why this exists: the mesh is only worth having if its receivers fail
-# independently, and this one fails differently from the other two. It is the
-# only receiver that produces **soft decisions** — one signed byte of
-# confidence per bit — so `fusion` can repair a damaged copy from this radio
-# alone, where the dongle's and the Heltec's hard bits need two copies to vote
-# with. It replaces the loaned RTL-SDR Blog V4 (2026-09-21 .. 09-29), which
-# ran from this same manifest as receiver `v4`; history for that one stays
-# under that name, this one publishes as `v3`.
+# Why this exists: extra receivers are only worth having if they fail
+# independently, and this one fails differently from the dongle and the
+# T-Embed. It is the only receiver that produces **soft decisions** — per-symbol
+# confidence — so it can repair a damaged copy on its own (Manchester pairs
+# combined by difference, least-confident bits tried first), where hard bits
+# need a second copy to vote with. It replaces the loaned RTL-SDR Blog V4
+# (2026-09-21 .. 09-29), which ran from this same manifest as receiver `v4`;
+# history for that one stays under that name, this one publishes as `v3`.
+#
+# What it publishes: every message it decodes, in listener contract v1 on
+# insteon-rf/msg/v3 (--publish-decoded; Doc/REARCHITECTURE.md), for
+# insteon-mqtt to correlate against the PLM. It no longer publishes raw
+# captures to insteon-rf/rx/v3 for the insteonrf-mesh pod.
 #
 # NEVER add a transmit path. There is exactly one transmitter on an Insteon
 # network and it is the PLM. This backend cannot transmit in any case:
@@ -78,11 +83,16 @@ spec:
         - --mqtt=192.168.88.5:1883
         - --topic=insteon-rf
         # Per-packet MQTT is off for the same reason as the dongle pod: the
-        # broker logs a line per publish. Captures still go to the mesh.
+        # broker logs a line per publish.
         - --mqtt-alerts-only
-        - --mesh-capture=v3
+        # Decoded messages, listener contract v1, on insteon-rf/msg/v3: one
+        # per transmission (hop copies folded over 0.5 s of air time), after
+        # soft framing and repair (repaired = bits changed), with the symbol
+        # SNR in snr. rssi is null: this backend measures none. Replaces
+        # --mesh-capture=v3 (raw captures for the retiring insteonrf-mesh pod).
+        - --publish-decoded=v3
         # The all-on watch lives in the dongle pod; this one is a receiver
-        # for the mesh and its own record, nothing more.
+        # and its own record, nothing more.
         - --out=/config/log/insteon-rf-v3.jsonl
         # No silence watchdog: re-arming means nothing to this backend
         # (SdrReceiver.configure_rx is a no-op) and if rtl_sdr dies the pod

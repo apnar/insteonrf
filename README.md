@@ -317,7 +317,7 @@ for the start header, so leading garbage and either bit polarity are fine.
 | `insteon-rf pkt` | `send_comm.py` | Build a packet as a bit string (`-n` to just describe it, `-j` for JSON) |
 | `insteon-rf send` | `rf_send.py` | Transmit bit strings (`-L MS` listens for replies, `-n` dry run) |
 | `insteon-rf allon` | | Hunt phantom "all on" events; see [below](#hunting-phantom-all-on-events) |
-| `insteon-rf monitor` | | Long-running logger: JSON lines to a rotating file and/or MQTT, mesh repeats deduped (`--mesh-capture NAME` makes this receiver a mesh member) |
+| `insteon-rf monitor` | | Long-running logger: JSON lines to a rotating file and/or MQTT, mesh repeats deduped (`--publish-decoded NAME` publishes listener contract v1 to `insteon-rf/msg/NAME`; `--mesh-capture NAME` makes this receiver a member of the retiring mesh) |
 | `insteon-rf mesh` | | Fuse listener captures, compare against the PLM, optionally inject; see [above](#more-ears-for-the-plm-the-listener-mesh) |
 | `insteon-rf modulate` | `mod_pkt.py` | Bit strings → raw I/Q for an SDR transmitter |
 | `insteon-rf demod` | | Raw I/Q → bit strings, or packets with `-D` (`--demod numpy|c`, `--method ml|discriminator`) |

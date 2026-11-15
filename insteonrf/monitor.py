@@ -3,19 +3,22 @@
 Every Insteon message is repeated by the mesh with a decremented hop count,
 so the air carries two to four copies of each packet. :class:`Deduper` folds
 those into one record with a ``hops_seen`` list, which is what makes a day of
-logs readable.
+logs readable. :class:`DecodedPublisher` does the same job for consumers:
+listener contract v1 (:mod:`insteonrf.listener`) on ``<prefix>/msg/<rx>``.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
+from .listener import FOLD_WINDOW_S, Folder, ListenerMessage
 from .packet import Packet
 
 log = logging.getLogger(__name__)
@@ -154,6 +157,7 @@ class MqttPublisher:
         self.published = 0
         self.alerts = 0
         self.captures = 0
+        self.messages = 0
         # A fixed client id means two listeners evict each other from the
         # broker in a loop, each reconnect re-subscribing, which reads as a
         # broker fault rather than as a name collision. There is more than one
@@ -280,6 +284,17 @@ class MqttPublisher:
                             json.dumps(payload, separators=(",", ":")), qos=0)
         self.captures += 1
 
+    def publish_message(self, topic: str, payload: str) -> None:
+        """Publish one contract-v1 listener message (:mod:`insteonrf.listener`).
+
+        QoS 0 and not retained, as the contract says: a message is about one
+        transmission, and a consumer that connects later has no use for the
+        last one. Not subject to ``alerts_only``, which is about the
+        per-packet log stream; this is the decoded stream consumers read.
+        """
+        self.client.publish(topic, payload, qos=0, retain=False)
+        self.messages += 1
+
     def publish_alert(self, alert: dict[str, Any]) -> None:
         """Publish a trigger to ``<topic>/alert``, at a higher QoS than packets."""
         self.client.publish(f"{self.topic}/alert", json.dumps(alert, separators=(",", ":")),
@@ -287,11 +302,135 @@ class MqttPublisher:
         self.alerts += 1
 
     def close(self) -> None:
-        self.client.loop_stop()
+        # Disconnect first: the DISCONNECT queues behind whatever was just
+        # published (the shutdown flush of deduped records and decoded
+        # messages), and the network thread writes all of it before it
+        # exits. Stopping the loop first threw those away.
         try:
             self.client.disconnect()
         except Exception as err:  # pragma: no cover - best effort
             log.debug("mqtt disconnect: %r", err)
+        self.client.loop_stop()
+
+
+#: How long past the fold window a decoded message is held before release, for
+#: copies that reach the decode worker after their on-air time: the dongle
+#: hands a block over 224 ms after its first bit, an SDR pass up to ~0.3 s
+#: after. Hop copies all start within 200 ms of the first, so the block
+#: holding the last of them has arrived well before window + this.
+RELEASE_LATENESS_S = 0.2
+#: How often the decode worker releases folded messages while the air is
+#: quiet, so a message never waits for the next packet to go out.
+RELEASE_TICK_S = 0.1
+
+
+def packet_air_times(bits: str, packets: Iterable[Packet], timestamp: float,
+                     baud: float) -> list[float]:
+    """The on-air time of each packet's start header within one burst.
+
+    Every backend stamps a burst with the on-air time of its first bit, and
+    the decoders give that one stamp to every packet in it. A dongle block
+    covers four 50 ms hop slots, so a reply decoded from the same block as
+    its command would otherwise be dated up to 150 ms early -- which matters
+    to a consumer that lines messages up against the PLM's. ``Packet.bits``
+    is a slice of the burst as :func:`~insteonrf.packet.find_headers`
+    normalised it (both :func:`~insteonrf.packet.parse_bits` and
+    :func:`~insteonrf.recover.recover_packets` slice it so, repaired or
+    not), so its position gives the offset. A packet that cannot be located
+    keeps the burst's stamp.
+    """
+    from .packet import find_headers
+
+    norm, _ = find_headers(bits.strip())
+    out = []
+    for p in packets:
+        pos = norm.find(p.bits) if p.bits else -1
+        out.append(timestamp + max(pos, 0) / baud)
+    return out
+
+
+class DecodedPublisher:
+    """Fold decoded packets into contract-v1 messages and publish them.
+
+    The listener side of ``Doc/REARCHITECTURE.md``: every packet ``monitor``
+    decodes (after its repair path) goes into a :class:`~insteonrf.listener.Folder`,
+    and each folded :class:`~insteonrf.listener.ListenerMessage` is handed to
+    ``publish(topic, payload)`` on ``<prefix>/msg/<rx>``.
+
+    Two clocks decide when a message's fold window has closed:
+
+    * live radios use the wall clock, held back by ``lateness_s`` for copies
+      that are still on their way to the worker, and :meth:`tick` runs on a
+      short timer so a message goes out about ``window + lateness`` after its
+      first copy even when nothing else arrives;
+    * ``data_clock`` (a lossless replay) uses the latest on-air time seen
+      instead, so a file decodes to the same messages however fast it is
+      read and whatever the timer does.
+
+    ``rssi=False`` publishes ``rssi: null`` -- for a radio whose RSSI is not a
+    per-packet measurement (the dongle's is a register snapshot taken after a
+    224 ms block, mostly the channel floor), leaving the packet itself alone
+    for the pod's own log.
+    """
+
+    def __init__(self, rx: str, publish: Callable[[str, str], None], *,
+                 prefix: str = "insteon-rf", window_s: float | None = None,
+                 lateness_s: float = RELEASE_LATENESS_S, data_clock: bool = False,
+                 rssi: bool = True, clock: Callable[[], float] = time.time):
+        self.rx = rx
+        self.prefix = f"{prefix.rstrip('/')}/msg"
+        self.folder = Folder(rx, FOLD_WINDOW_S if window_s is None else window_s)
+        self.lateness_s = lateness_s
+        self.data_clock = data_clock
+        self.rssi = rssi
+        self._publish = publish
+        self._clock = clock
+        self._latest = float("-inf")
+        #: Messages published.
+        self.published = 0
+        #: Decoded copies the contract's gate refused (bad CRC, impossible
+        #: counters or hop fields, too short).
+        self.rejected = 0
+
+    @property
+    def topic(self) -> str:
+        return f"{self.prefix}/{self.rx}"
+
+    def add(self, pkt: Packet, *, t: float | None = None) -> None:
+        """Fold one decoded copy in; ``t`` is its on-air time (default: its timestamp)."""
+        if not self.rssi and pkt.rssi_dbm is not None:
+            pkt = copy.copy(pkt)
+            pkt.rssi_dbm = None
+        if self.folder.add(pkt, t=t) is None:
+            self.rejected += 1
+            return
+        when = t if t is not None else pkt.timestamp
+        if when is not None:
+            self._latest = max(self._latest, when)
+
+    def tick(self, now: float | None = None) -> list[ListenerMessage]:
+        """Publish the messages whose fold window has closed; returns them."""
+        if self.data_clock:
+            ready = self.folder.pop_ready(self._latest)
+        else:
+            ready = self.folder.pop_ready((self._clock() if now is None else now)
+                                          - self.lateness_s)
+        self._send(ready)
+        return ready
+
+    def flush(self) -> list[ListenerMessage]:
+        """Publish everything still pending (use at shutdown)."""
+        out = self.folder.flush()
+        self._send(out)
+        return out
+
+    def _send(self, msgs: list[ListenerMessage]) -> None:
+        for m in msgs:
+            self._publish(m.topic(self.prefix), m.to_json())
+            self.published += 1
+
+    def __len__(self) -> int:
+        return len(self.folder)
 
 
 def records(packets: Iterable[Packet], *, dedupe: bool = True,

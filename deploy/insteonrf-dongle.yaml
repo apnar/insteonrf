@@ -13,6 +13,11 @@
 # insteon-rf/alert for an automation to notify on. Per-packet MQTT is off: the
 # rotating JSON-lines file at /nvme/k8s/insteonrf-config/log is the record.
 #
+# It is also a receiver for insteon-mqtt (Doc/REARCHITECTURE.md): every message
+# it decodes, hop copies folded into one per transmission, goes out in listener
+# contract v1 on insteon-rf/msg/dongle (--publish-decoded). It no longer
+# publishes raw captures to insteon-rf/rx/dongle for the insteonrf-mesh pod.
+#
 # NEVER add a transmit command here: the PLM owns the air. Topic prefix is
 # insteon-rf/ so it cannot collide with insteon-mqtt's insteon/ prefix.
 #
@@ -64,9 +69,15 @@ spec:
         # stream, and this broker runs log_type debug (a line per publish), so
         # MQTT carries only all-on triggers, on insteon-rf/alert.
         - --mqtt-alerts-only
-        # ...except raw captures, which make this dongle a member of the
-        # listener mesh that the insteonrf-mesh pod fuses.
-        - --mesh-capture=dongle
+        # ...and decoded messages, listener contract v1, on
+        # insteon-rf/msg/dongle: one per transmission (hop copies folded over
+        # 0.5 s of air time), in the PLM's frame layout, after hard-bit
+        # CRC-guided repair (repaired = bits changed; never injected when
+        # non-zero). rssi is null: the dongle's figure is a register snapshot
+        # taken after its 224 ms block, mostly the channel floor.
+        # Replaces --mesh-capture=dongle (raw captures to insteon-rf/rx/dongle
+        # for the insteonrf-mesh pod, which is being retired).
+        - --publish-decoded=dongle
         # The dongle goes deaf without erroring, mid-run, while still
         # answering register reads and still reporting MARC_STATE_RX with a
         # correct modem configuration and a normal noise floor. Re-arming

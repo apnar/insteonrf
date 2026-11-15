@@ -751,7 +751,15 @@ def clip_main(argv: list[str] | None = None) -> int:
 
 
 def monitor_main(argv: list[str] | None = None) -> int:
-    from .monitor import DEDUPE_WINDOW_S, Deduper, JsonlWriter, MqttPublisher
+    from .monitor import (
+        DEDUPE_WINDOW_S,
+        RELEASE_TICK_S,
+        DecodedPublisher,
+        Deduper,
+        JsonlWriter,
+        MqttPublisher,
+        packet_air_times,
+    )
 
     p = argparse.ArgumentParser(
         prog="insteon-rf monitor",
@@ -781,6 +789,12 @@ def monitor_main(argv: list[str] | None = None) -> int:
                         "capture format, so this receiver joins the mesh that 'insteon-rf mesh' "
                         "fuses — the dongle is a valid mesh member, and the only one that can "
                         "produce soft decisions")
+    p.add_argument("--publish-decoded", metavar="NAME",
+                   help="publish every decoded message to <topic>/msg/NAME in the listener "
+                        "contract v1 (insteonrf/listener.py): hop copies folded into one "
+                        "message per transmission, PLM frame layout, after this command's "
+                        "repair path ('repaired' counts the bits it changed). QoS 0, not "
+                        "retained, unaffected by --mqtt-alerts-only. Needs --mqtt")
     p.add_argument("--no-dedupe", action="store_true", help="log every mesh repeat separately")
     p.add_argument("-U", "--unknown-commands", action="store_true",
                    help="report commands the tables do not name — the first time each is seen "
@@ -829,6 +843,8 @@ def monitor_main(argv: list[str] | None = None) -> int:
                         "queue (default %(default)s)")
     _log_args(p)
     a = p.parse_args(argv)
+    if a.publish_decoded and not a.mqtt:
+        p.error("--publish-decoded needs --mqtt")
     _setup_logging(a.verbose or 1)
     _install_signal_handlers()
 
@@ -892,6 +908,15 @@ def monitor_main(argv: list[str] | None = None) -> int:
         if mqtt is None:
             p.error("--mesh-capture needs --mqtt")
         log.info("publishing raw captures as mesh receiver %r", a.mesh_capture)
+    decoded = None
+    if a.publish_decoded and mqtt is not None:
+        # The dongle's RSSI is a register snapshot taken after its 224 ms
+        # block has ended -- mostly the channel floor, not the packet (see
+        # the mesh capture below for the same decision). The contract wants
+        # null for a receiver with no per-packet figure.
+        decoded = DecodedPublisher(a.publish_decoded, mqtt.publish_message, prefix=a.topic,
+                                   rssi=a.backend != "rfcat")
+        log.info("publishing decoded messages to %s", decoded.topic)
 
     def process(item: tuple[Any, ...]) -> None:
         """Everything that happens to one block. Runs on the worker thread.
@@ -951,18 +976,40 @@ def monitor_main(argv: list[str] | None = None) -> int:
                 emit([pkt.to_dict()])
             else:
                 dd.add(pkt)
+        if decoded is not None and packets:
+            # Each copy at its own on-air time, not the block's: one dongle
+            # block holds four hop slots.
+            for pkt, t in zip(packets, packet_air_times(bits, packets, ts, a.baud), strict=True):
+                decoded.add(pkt, t=t)
 
     work: queue.Queue[tuple[Any, ...] | None] = queue.Queue(maxsize=max(1, a.queue))
+
+    def release() -> None:
+        """Hand over what has aged out. Runs on the worker thread only."""
+        if dd is not None:
+            # The records whose window has closed carry the final
+            # repeats/hops_seen.
+            emit(dd.pop_ready())
+        if decoded is not None:
+            try:
+                decoded.tick()
+            except Exception:
+                log.exception("publishing decoded messages failed")
+
+    # Decoded messages must go out about window + lateness after their first
+    # copy, not whenever the next block happens to arrive, so the idle tick
+    # is short when they are on.
+    idle_tick = RELEASE_TICK_S if decoded is not None else 0.5
 
     def worker() -> None:
         while True:
             try:
-                item = work.get(timeout=0.5)
+                item = work.get(timeout=idle_tick)
             except queue.Empty:
-                # Deduped records have to age out on time even while the air
-                # is silent, so the idle tick still has to happen.
-                if dd is not None:
-                    emit(dd.pop_ready())
+                # Deduped records and folded messages have to age out on time
+                # even while the air is silent, so the idle tick still has to
+                # happen.
+                release()
                 continue
             try:
                 if item is None:
@@ -973,10 +1020,7 @@ def monitor_main(argv: list[str] | None = None) -> int:
                 log.exception("decoding a block failed")
             finally:
                 work.task_done()
-            if dd is not None:
-                # Hand over the records whose window has closed — they carry
-                # the final repeats/hops_seen.
-                emit(dd.pop_ready())
+            release()
 
     decoder = threading.Thread(target=worker, name="insteon-rf-decode", daemon=True)
     decoder.start()
@@ -986,6 +1030,10 @@ def monitor_main(argv: list[str] | None = None) -> int:
             radio.configure_rx(sync_header=not a.carrier)
             log.info("monitoring on %s", getattr(radio, "name", a.backend))
             lossless = bool(getattr(radio, "lossless", False))
+            if decoded is not None:
+                # Replay is read as fast as it decodes, so fold windows close
+                # on the recording's own clock or not at all.
+                decoded.data_clock = lossless
 
             def diag(when: str) -> dict[str, Any]:
                 # What the radio itself says it is doing. Not logged on every
@@ -1104,11 +1152,20 @@ def monitor_main(argv: list[str] | None = None) -> int:
                         work.qsize())
         if dd is not None:
             emit(dd.flush())
+        if decoded is not None:
+            try:
+                decoded.flush()
+            except Exception:
+                log.exception("publishing decoded messages failed")
         if writer is not None:
             writer.close()
         if mqtt is not None:
             log.info("mqtt: %d packet(s), %d alert(s), %d capture(s) published",
                      mqtt.published, mqtt.alerts, mqtt.captures)
+            if decoded is not None:
+                log.info("mqtt: %d decoded message(s) published to %s, %d decoded "
+                         "packet(s) refused by the contract's gate",
+                         decoded.published, decoded.topic, decoded.rejected)
             mqtt.close()
         if idle_rearms or idle_skips:
             log.info("idle re-arm: %d strobe(s), %d skipped mid-packet",

@@ -6,11 +6,37 @@ exercised without a radio.
 
 from __future__ import annotations
 
+import datetime as _dt
 import time
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 from ..packet import iter_bit_lines
+
+
+def meta_time(line: str) -> float | None:
+    """The time in a ``# <time> ...`` metadata line, or ``None``.
+
+    ``<time>`` is what ``recv -t`` and ``demod -t`` write (ISO 8601, local
+    time unless it carries an offset) or epoch seconds. A replay that honours
+    it decodes to the same timestamps every time, which is what lets
+    time-windowed folding give the same answer at any replay speed.
+    """
+    parts = line.lstrip("#").split()
+    if not parts:
+        return None
+    tok = parts[0]
+    try:
+        epoch = float(tok)
+    except ValueError:
+        pass
+    else:
+        # A bare small number ("# 3 bursts") is not a time.
+        return epoch if 1e9 < epoch < 1e11 else None
+    try:
+        return _dt.datetime.fromisoformat(tok).timestamp()
+    except ValueError:
+        return None
 
 
 class FileRadio:
@@ -55,21 +81,31 @@ class FileRadio:
         """No radio to configure."""
 
     def _read_lines(self) -> list[str]:
+        return [line for _, line in self._read_entries()]
+
+    def _read_entries(self) -> list[tuple[float | None, str]]:
+        """Bit lines, each with the time its ``# <time> ...`` line gave, if any."""
         if self._lines is not None:
-            return self._lines
-        out: list[str] = []
+            return [(None, line) for line in self._lines]
+        out: list[tuple[float | None, str]] = []
         for path in self.paths:
+            when: float | None = None
             for kind, line in iter_bit_lines(path.read_text().splitlines()):
-                if kind == "bits":
-                    out.append(line)
+                if kind == "meta":
+                    when = meta_time(line)
+                elif kind == "bits":
+                    out.append((when, line))
+                    when = None
         return out
 
     def iter_bits(self, timeout_ms: int = 0) -> Iterator[tuple[float, str]]:
+        """Yield ``(timestamp, bits)``; the timestamp is the recorded one when
+        the file has ``# <time>`` lines (``recv -t``, ``demod -t``), else now."""
         while True:
-            for line in self._read_lines():
+            for when, line in self._read_entries():
                 if self.delay_s:
                     time.sleep(self.delay_s)
-                yield time.time(), line
+                yield (time.time() if when is None else when), line
             if not self.loop:
                 return
 
