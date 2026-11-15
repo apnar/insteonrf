@@ -1,47 +1,70 @@
-From 844ac922249089b87c0e88b613a97f5e4adc4d98 Mon Sep 17 00:00:00 2001
+From c10a2041915a02b2bb8975e31e32cfff3a91e911 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
-Date: Sun, 15 Nov 2026 12:15:07 -0500
-Subject: [PATCH 1/4] Add optional RF listener support
+Date: Sun, 15 Nov 2026 14:37:38 -0500
+Subject: [PATCH] Add optional RF listener support
 
 A PLM hears only what reaches its own antenna. Battery devices (leak,
 door, motion, remotes) are RF-only and can't be polled, so a message the
 modem misses from one of them is lost. Receive-only RF listeners placed
-elsewhere in the house (an ESPHome board with a CC1101, an RTL-SDR)
-decode what they hear and publish it to MQTT; this compares what they
-heard with what the modem heard and hands the modem's misses to the
-protocol stack. Nothing is transmitted.
+elsewhere in the house (an ESPHome board with a CC1101, an RTL-SDR, an
+rfcat dongle) decode what they hear and publish it to MQTT. This compares
+what they heard with what the modem heard and hands the modem's misses to
+the protocol stack. Nothing is transmitted; the modem stays the only
+transmitter.
 
 New optional `mqtt.listeners` config section. Without it nothing is
-created and nothing changes. With it, Listeners:
+created and nothing changes.
 
-- subscribes to decoded listener messages (default insteon-rf/msg/+):
-  JSON carrying the message as the modem would have reported it
-  (0x50/0x51 frame), its on-air time and receiver diagnostics;
-- holds each message 2.5 s for the modem's own (often later, powerline)
-  copy and does nothing if the modem heard it;
-- classifies the rest into tiers (battery, group, state), never
-  handling replies, the modem's own messages, unknown senders, repaired
-  messages or group 0 (which raises an alert instead);
-- injects listed tiers through the new Protocol.inject(), logs "shadow"
-  tiers only, with per-device and global rate limits;
-- publishes per-listener and per-device counters (retained) and group 0
-  alerts.
+Listener messages (default topic insteon-rf/msg/+), one per transmission:
+
+    {"v": 1, "rx": "t-embed", "t": <on-air epoch s>,
+     "frame": "0250...", "copies": 3, "hops_left": 2,
+     "rssi": -78.5, "snr": null, "repaired": 0}
+
+'frame' is the message exactly as the modem would report it (0x50/0x51).
+
+How a message is decided (Listeners.py):
+
+- Copies of the same bytes from any listeners within 0.5 s on air are one
+  transmission; further apart they are separate ones. Messages with a
+  non-finite 't', or one more than 10 s from now, are dropped.
+- Each is held 2.5 s after it arrives for the modem's own copy, which
+  often comes later over the powerline. Decisions use insteon-mqtt's own
+  clock; a listener's clock only orders transmissions.
+- Nothing more happens if the modem read it (each modem read is credited
+  to one event; a read of the same bytes within 2 s on air also counts,
+  covering device retransmissions), if it read the other form of the same
+  event (broadcast vs cleanup, within 8 s), or if it has since read a
+  newer message about the same state from that device (leak sensors' dry
+  and wet groups count as one state). Messages to another device, and
+  group broadcasts the modem holds no link for, are not modem misses.
+- The rest are classified: 'battery' (broadcasts and cleanups from
+  battery devices), 'group' (other group broadcasts and cleanups), 'state'
+  (other messages to the modem). Never handled: ACK/NAK, cleanup status
+  reports (0x06), the modem's own transmissions, unknown senders, messages
+  a listener repaired, and group 0 broadcasts, which publish an alert.
+- Tiers listed in 'inject' go to the new Protocol.inject(); tiers in
+  'shadow' are only logged ("Would inject ..."). Rate limits: 4 per device
+  and 12 overall per minute. Events are released oldest first; an error
+  deciding one does not affect the others.
+- Counters per listener and per device are published retained to a stats
+  topic; group 0 broadcasts go to an alert topic.
 
 Protocol gains signal_raw_read (every frame read from the modem) and
-inject(), which accepts only complete 0x50/0x51 frames and ignores the
-modem's own copy of an injected message for 3 s.
+inject(), which accepts only complete 0x50/0x51 frames of the exact length
+and passes them through the normal duplicate check and handlers.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
 ---
- config-example.yaml | 34 ++++++++++++++++++++++++++++++++++
- 1 file changed, 34 insertions(+)
+ config-example.yaml | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
 
 diff --git a/config-example.yaml b/config-example.yaml
-index daaf3aa..e3bd796 100644
+index daaf3aa..97965b8 100644
 --- a/config-example.yaml
 +++ b/config-example.yaml
-@@ -213,4 +213,38 @@ mqtt:
+@@ -213,4 +213,41 @@ mqtt:
    # TO ENABLE THE DISCOVERY PLATFORM: Set the following to true
    enable_discovery: false
  
@@ -62,9 +85,12 @@ index daaf3aa..e3bd796 100644
 +  #    "rssi": -78.5, "snr": null, "repaired": 0}
 +  # where "frame" is the message as the modem would have reported it.
 +  #
-+  # Tiers:  battery = broadcasts and cleanups from battery devices;
-+  # group = any group broadcast or cleanup; state = other messages to the
-+  # modem.  Replies (ACK/NAK), the modem's own messages, unknown senders,
++  # A message is only considered if the modem did not read it, has not
++  # since read a newer message for the same group from the same device, and
++  # (for a group broadcast) holds a link for that group.  Tiers:  battery = broadcasts
++  # and cleanups from battery devices; group = any group broadcast or
++  # cleanup; state = other messages to the modem.  Replies (ACK/NAK),
++  # cleanup status reports, the modem's own messages, unknown senders,
 +  # repaired messages and group 0 broadcasts are never handled.  Tiers in
 +  # "shadow" are only logged ("would inject"), so a tier can be watched
 +  # before it is turned on.
@@ -80,155 +106,6 @@ index daaf3aa..e3bd796 100644
 +  #   alert_topic: 'insteon/listeners/alert'
 +
  #----------------------------------------------------------------
--- 
-2.53.0
-
-
-From 9ed7291245e57d3af412e7a667455c0053c9a4ff Mon Sep 17 00:00:00 2001
-From: Josh Lukens <jlukens@botch.com>
-Date: Sun, 15 Nov 2026 13:08:47 -0500
-Subject: [PATCH 2/4] Listeners: fixes from review
-
-- Correlate on insteon-mqtt's own clock (arrival), never the listener's:
-  a listener clock that is off can no longer make a heard message look
-  missed. The modem-heard window runs to the actual release time, so a
-  release delayed by the main loop cannot miss a modem copy read
-  meanwhile.
-- Do not inject a message if the modem has since read a later message
-  from the same device (a close after an open, the cleanup after a
-  broadcast): that replayed old state.
-- Group broadcasts the modem has no responder link for are not counted
-  as missed and never injected (the modem would never pass them up).
-- Reject non-finite 't' (NaN poisoned the TimedCall queue and stalled
-  every timed call) and drop messages older than 10 s instead of
-  re-dating them as fresh. 't' is now required.
-- Rate limit per device per minute (4) instead of one per 30 s, so an
-  open/close pair both get through; release oldest first.
-- Protocol: drop the injected-copy guard. The modem's late copy of a
-  message it missed almost never arrives, so the guard swallowed the
-  next real identical press instead.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
----
- config-example.yaml | 11 +++++++----
- 1 file changed, 7 insertions(+), 4 deletions(-)
-
-diff --git a/config-example.yaml b/config-example.yaml
-index e3bd796..1478561 100644
---- a/config-example.yaml
-+++ b/config-example.yaml
-@@ -230,10 +230,13 @@ mqtt:
-   #    "rssi": -78.5, "snr": null, "repaired": 0}
-   # where "frame" is the message as the modem would have reported it.
-   #
--  # Tiers:  battery = broadcasts and cleanups from battery devices;
--  # group = any group broadcast or cleanup; state = other messages to the
--  # modem.  Replies (ACK/NAK), the modem's own messages, unknown senders,
--  # repaired messages and group 0 broadcasts are never handled.  Tiers in
-+  # A message is only considered if the modem did not read it, has not
-+  # since read a later message from the same device, and (for a group
-+  # broadcast) holds a link for that group.  Tiers:  battery = broadcasts
-+  # and cleanups from battery devices; group = any group broadcast or
-+  # cleanup; state = other messages to the modem.  Replies (ACK/NAK), the
-+  # modem's own messages, unknown senders, repaired messages and group 0
-+  # broadcasts are never handled.  Tiers in
-   # "shadow" are only logged ("would inject"), so a tier can be watched
-   # before it is turned on.
-   #
--- 
-2.53.0
-
-
-From ea2be693e0276fdd219af55f11b18a51de2c4017 Mon Sep 17 00:00:00 2001
-From: Josh Lukens <jlukens@botch.com>
-Date: Sun, 15 Nov 2026 13:13:24 -0500
-Subject: [PATCH 3/4] Listeners: late copies, a narrower superseded rule, 1.5 s
- early window
-
-From the second review of 9ed7291:
-
-- A copy of the same bytes from another listener within 4 s of the first
-  arrival is the same transmission, merged or (if already released)
-  absorbed as a late copy; it was injected twice. The same listener again
-  is a new transmission (listeners fold their own hop copies). A late copy
-  no longer releases a pending event early.
-- 'Superseded' only for a newer message for the same group from the same
-  device, ordered by when the listeners heard it (the modem's copy of an
-  older message can land after a listener's copy of a newer one), and
-  never for replies or 0x06 cleanup reports. The cleanup of a broadcast
-  (same group and command) counts as the modem having handled it.
-- EARLY_S 3.0 -> 1.5 s, so a missed repeat press 2 s after a heard one is
-  injected rather than taken as heard.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
----
- config-example.yaml | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/config-example.yaml b/config-example.yaml
-index 1478561..3dcec2b 100644
---- a/config-example.yaml
-+++ b/config-example.yaml
-@@ -231,8 +231,8 @@ mqtt:
-   # where "frame" is the message as the modem would have reported it.
-   #
-   # A message is only considered if the modem did not read it, has not
--  # since read a later message from the same device, and (for a group
--  # broadcast) holds a link for that group.  Tiers:  battery = broadcasts
-+  # since read a newer message for the same group from the same device, and
-+  # (for a group broadcast) holds a link for that group.  Tiers:  battery = broadcasts
-   # and cleanups from battery devices; group = any group broadcast or
-   # cleanup; state = other messages to the modem.  Replies (ACK/NAK), the
-   # modem's own messages, unknown senders, repaired messages and group 0
--- 
-2.53.0
-
-
-From febd5c68452d8660dab026dbe4e6c342ba76519c Mon Sep 17 00:00:00 2001
-From: Josh Lukens <jlukens@botch.com>
-Date: Sun, 15 Nov 2026 14:23:00 -0500
-Subject: [PATCH 4/4] Listeners: findings and timing from the Fable review
-
-- Cleanup status reports (0x06) are never injected and not counted as
-  misses ('reports'): they carry no state, were ~85% of what the modem
-  misses from battery devices, and each used a rate-limit slot.
-- A modem read of the same bytes within 2 s on air counts as heard even
-  if credited to another event (a device retransmits 0.5-1.4 s later);
-  duplicate modem reads are not recorded (one could be credited to a
-  later, missed, press).
-- Broadcast/cleanup pairing is matched on on-air time within PAIR_S
-  (8 s; measured gap p99 5.3 s) instead of the early window, which the
-  cleanup path never reached.
-- Leak sensors: groups 1 (dry) and 2 (wet) are one state for the
-  'newer' rule.
-- An exception deciding one event no longer strands the other due ones.
-- EARLY_S 1.5 -> 2.5 s, MATCH_S 1.5 -> 2.0 s (measured lags).
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
----
- config-example.yaml | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/config-example.yaml b/config-example.yaml
-index 3dcec2b..97965b8 100644
---- a/config-example.yaml
-+++ b/config-example.yaml
-@@ -234,9 +234,9 @@ mqtt:
-   # since read a newer message for the same group from the same device, and
-   # (for a group broadcast) holds a link for that group.  Tiers:  battery = broadcasts
-   # and cleanups from battery devices; group = any group broadcast or
--  # cleanup; state = other messages to the modem.  Replies (ACK/NAK), the
--  # modem's own messages, unknown senders, repaired messages and group 0
--  # broadcasts are never handled.  Tiers in
-+  # cleanup; state = other messages to the modem.  Replies (ACK/NAK),
-+  # cleanup status reports, the modem's own messages, unknown senders,
-+  # repaired messages and group 0 broadcasts are never handled.  Tiers in
-   # "shadow" are only logged ("would inject"), so a tier can be watched
-   # before it is turned on.
-   #
 -- 
 2.53.0
 
