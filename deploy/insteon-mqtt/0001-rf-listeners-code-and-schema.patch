@@ -1,7 +1,7 @@
 From 844ac922249089b87c0e88b613a97f5e4adc4d98 Mon Sep 17 00:00:00 2001
 From: Josh Lukens <jlukens@botch.com>
 Date: Sun, 15 Nov 2026 12:15:07 -0500
-Subject: [PATCH] Add optional RF listener support
+Subject: [PATCH 1/3] Add optional RF listener support
 
 A PLM hears only what reaches its own antenna. Battery devices (leak,
 door, motion, remotes) are RF-only and can't be polled, so a message the
@@ -797,6 +797,118 @@ index 9bfd1bc..b7e9ce8 100644
          for device in self.devices.values():
              device.unsubscribe(self.link)
  
+-- 
+2.53.0
+
+
+From 2e3ac24770be0d5bf8e99ab4c3894c92bae1b7f9 Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 12:24:45 -0500
+Subject: [PATCH 2/3] Listeners: drop the doubled 'Listeners:' log prefix
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ insteon_mqtt/Listeners.py | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/insteon_mqtt/Listeners.py b/insteon_mqtt/Listeners.py
+index af58dc1..41a1f8b 100644
+--- a/insteon_mqtt/Listeners.py
++++ b/insteon_mqtt/Listeners.py
+@@ -209,7 +209,7 @@ class Listeners:
+             return
+         self.mqtt.publish(self.stats_topic, json.dumps(self.stats()),
+                           retain=True)
+-        LOG.info("Listeners: %s", self.counts)
++        LOG.info("Counters: %s", self.counts)
+         if self.stats_interval:
+             self.modem.timed_call.add(self.clock() + self.stats_interval,
+                                       self.publish_stats)
+@@ -399,13 +399,13 @@ class Listeners:
+ 
+         heard_by = ", ".join(sorted(event['heard_by']))
+         if tier in self.shadow:
+-            LOG.info("Listeners: would inject %s message missed by the "
++            LOG.info("Would inject %s message missed by the "
+                      "modem, heard by %s: %s", tier, heard_by, msg)
+             self.counts['shadow'] += 1
+             dev['shadow'] += 1
+             return
+ 
+-        LOG.info("Listeners: injecting %s message missed by the modem, "
++        LOG.info("Injecting %s message missed by the modem, "
+                  "heard by %s: %s", tier, heard_by, msg)
+         self._last_injected[msg.from_addr.id] = now
+         self._recent_injections.append(now)
+@@ -478,7 +478,7 @@ class Listeners:
+           event (dict):  The pending event.
+         """
+         self.counts['alerts'] += 1
+-        LOG.warning("Listeners: group 0 broadcast from %s cmd %#04x, heard "
++        LOG.warning("Group 0 broadcast from %s cmd %#04x, heard "
+                     "by %s", msg.from_addr, msg.cmd1,
+                     ", ".join(sorted(event['heard_by'])))
+         if self.alert_topic:
+-- 
+2.53.0
+
+
+From 314fc46156ebbca96fe947240ff0f65b8dc087f2 Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 12:39:44 -0500
+Subject: [PATCH 3/3] Listeners: messages to other devices are not modem misses
+
+Direct and cleanup messages addressed to another device (e.g. a leak
+sensor's cleanups to its other responders) are never passed up by a PLM,
+so counting them as missed inflated the stats. They now count as
+not_for_modem and stop there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ insteon_mqtt/Listeners.py | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/insteon_mqtt/Listeners.py b/insteon_mqtt/Listeners.py
+index 41a1f8b..76bc1ec 100644
+--- a/insteon_mqtt/Listeners.py
++++ b/insteon_mqtt/Listeners.py
+@@ -132,7 +132,8 @@ class Listeners:
+         # Clock, replaceable in tests.
+         self.clock = time.time
+         self.started = self.clock()
+-        self.counts = {'messages': 0, 'plm_heard': 0, 'plm_missed': 0,
++        self.counts = {'messages': 0, 'not_for_modem': 0, 'plm_heard': 0,
++                       'plm_missed': 0,
+                        'injected': 0, 'shadow': 0, 'rejected': 0,
+                        'rate_limited': 0, 'malformed': 0, 'alerts': 0}
+         self.receivers = {}
+@@ -364,6 +365,15 @@ class Listeners:
+         if self.modem.addr is not None and msg.from_addr == self.modem.addr:
+             return
+ 
++        # Direct and cleanup messages to another device: the modem never
++        # passes those up, so they are neither heard nor missed by it.
++        flag_type = msg.flags.type
++        if flag_type not in (Msg.Flags.Type.ALL_LINK_BROADCAST,
++                             Msg.Flags.Type.BROADCAST) and \
++                msg.to_addr != self.modem.addr:
++            self.counts['not_for_modem'] += 1
++            return
++
+         dev = self.devices.setdefault(msg.from_addr.hex, {
+             'messages': 0, 'plm_missed': 0, 'injected': 0, 'shadow': 0})
+         dev['messages'] += 1
+@@ -439,8 +449,6 @@ class Listeners:
+ 
+         broadcast = flag_type in (Msg.Flags.Type.ALL_LINK_BROADCAST,
+                                   Msg.Flags.Type.BROADCAST)
+-        if not broadcast and msg.to_addr != self.modem.addr:
+-            return None, "not addressed to the modem"
+ 
+         if isinstance(device, BatterySensor) and (
+                 broadcast or flag_type in _GROUP_TYPES):
 -- 
 2.53.0
 
