@@ -17,6 +17,14 @@
 # tree it will be applied to, so a conflict fails there rather than on the
 # running house.
 #
+# The patches are generated from the upstream PR branch
+# (/root/src/insteon-mqtt, branch rf-listener-raw-topics, based on dev),
+# never edited by hand:
+#   git format-patch --stdout origin/dev..rf-listener-raw-topics -- insteon_mqtt \
+#       > 0001-raw-topics-code-and-schema.patch
+#   git format-patch --stdout origin/dev..rf-listener-raw-topics -- config-example.yaml \
+#       > 0002-raw-topics-config-example.patch
+#
 # TWO COPIES OF THE PACKAGE.  The image pip-installs insteon-mqtt into
 # site-packages and *also* keeps the source checkout at /opt/insteon-mqtt.
 # The running process imports from site-packages; /opt is what the hassio web
@@ -40,15 +48,13 @@
 # The manifest must use that localhost:32000 tag (imagePullPolicy IfNotPresent),
 # never the upstream image, which would silently drop the patches.
 
-FROM docker.io/td22057/amd64-insteon-mqtt@sha256:e98ceedc6b16c06b67bf66fed56dceccbddf0c1e5e476c48f3e0eb4bb5cf70e7
+# 1.4.0, published 2026-10-23.
+FROM docker.io/td22057/amd64-insteon-mqtt@sha256:e0ce53613172bd3d642e3d9049eb1c4fd547ecf070974cbd7a56b2f564b48fac
 
-# 0001-0004 are code and schema, applied to both trees.
-# 0005 documents the config and applies to the source checkout only.
-COPY 0001-protocol-raw-signal-and-inject.patch \
-     0002-mqtt-raw-topics.patch \
-     0003-wire-raw-topics.patch \
-     0004-config-schema-raw-section.patch \
-     0005-document-raw-in-config-example.patch \
+# 0001 is code and schema, applied to both trees.
+# 0002 documents the config and applies to the source checkout only.
+COPY 0001-raw-topics-code-and-schema.patch \
+     0002-raw-topics-config-example.patch \
      /tmp/patches/
 
 # The base is Alpine and ships no patch(1); install it for the build and drop
@@ -61,15 +67,26 @@ RUN set -eu; \
     echo "installed package lives in $SITE"; \
     for dir in /opt/insteon-mqtt "$SITE"; do \
         echo "== patching $dir"; \
-        for p in /tmp/patches/000[1-4]*.patch; do \
+        for p in /tmp/patches/0001-*.patch; do \
             echo "   $(basename "$p")"; \
             patch -d "$dir" -p1 --forward --no-backup-if-mismatch -i "$p"; \
         done; \
     done; \
     patch -d /opt/insteon-mqtt -p1 --forward --no-backup-if-mismatch \
-        -i /tmp/patches/0005-document-raw-in-config-example.patch; \
+        -i /tmp/patches/0002-raw-topics-config-example.patch; \
     rm -r /tmp/patches; \
     apk del patch
+
+# 1.4.0's entrypoint runs under s6-overlay ("#!/usr/bin/with-contenv sh", so
+# the add-on's TZ reaches the logs). Our pod overrides the command with
+# /bin/sh -c and never starts s6's /init, so with-contenv dies at once with
+# "unable to envdir /run/s6/container_environment" and the sidecar
+# crash-loops (2026-11-15). The pod mounts /etc/localtime, so plain sh keeps
+# local log times. grep fails the build if upstream changes the line.
+RUN set -eu; \
+    E=/opt/insteon-mqtt/hassio/entrypoint.sh; \
+    sed -i '1s|^#!/usr/bin/with-contenv sh$|#!/bin/sh|' "$E"; \
+    head -1 "$E" | grep -qx '#!/bin/sh'
 
 # Verify the copy that actually runs. No sys.path games: import insteon_mqtt
 # the way the service does, assert the patched surface is present, and hand
@@ -95,6 +112,8 @@ import insteon_mqtt, os;\
 from insteon_mqtt import config;\
 from insteon_mqtt.Protocol import Protocol;\
 from insteon_mqtt.mqtt import Raw;\
+from insteon_mqtt.const import __version__;\
+assert __version__ == '1.4.0', __version__;\
 pkg = os.path.dirname(insteon_mqtt.__file__);\
 print('checking', pkg);\
 assert hasattr(Protocol, 'inject'), 'Protocol.inject is missing';\

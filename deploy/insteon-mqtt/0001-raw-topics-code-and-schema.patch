@@ -1,0 +1,411 @@
+From 859f8b3de83c441186d9360868caf07f137dbbda Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 09:48:05 -0500
+Subject: [PATCH] Add optional raw message topics for external RF receivers
+
+A PLM hears only what reaches its own antenna, and passes up only the
+group broadcasts it holds a link for. Battery devices (leak, door,
+remotes) are RF-only and can't be polled, so a message the modem misses
+from one of them is simply lost. Additional receive-only RF listeners
+placed elsewhere in the house can hear those messages; this adds the
+seam to hand them over without adding a second transmitter.
+
+Two MQTT topics under a new optional `mqtt.raw` config section:
+
+- publish_topic (default insteon/raw/rx): every frame read from the
+  modem as JSON, before the duplicate check, with a "dup" flag. This
+  is what a listener needs to know what the modem already heard.
+- inject_topic (default insteon/raw/inject): complete 0x50/0x51
+  inbound frames, parsed by the new Protocol.inject() and handed to the
+  normal duplicate check and handler dispatch. Anything else (modem
+  commands, replies, malformed or wrong-length frames) is rejected.
+
+Both are off by default. Without a `raw` section no Raw object is
+created and no topic is subscribed, so nothing changes for existing
+installs. Protocol gains one signal, emitted per frame read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ insteon_mqtt/Protocol.py             |  75 ++++++++++-
+ insteon_mqtt/data/config-schema.yaml |  12 ++
+ insteon_mqtt/mqtt/Mqtt.py            |  18 +++
+ insteon_mqtt/mqtt/Raw.py             | 183 +++++++++++++++++++++++++++
+ 4 files changed, 287 insertions(+), 1 deletion(-)
+ create mode 100644 insteon_mqtt/mqtt/Raw.py
+
+diff --git a/insteon_mqtt/Protocol.py b/insteon_mqtt/Protocol.py
+index 01a9402..bab0ac4 100644
+--- a/insteon_mqtt/Protocol.py
++++ b/insteon_mqtt/Protocol.py
+@@ -94,6 +94,12 @@ class Protocol:
+         # been removed from the _write_queue
+         self.signal_msg_finished = Signal()  # (Message)
+ 
++        # Emitted for every inbound Insteon message read from the modem, with
++        # the raw frame bytes and whether it was judged a duplicate.  This is
++        # the ground truth for "what did the modem actually hear", which an
++        # external receiver needs in order to know what it should inject.
++        self.signal_raw_read = Signal()  # (bytes, bool)
++
+         # Inbound message buffer.
+         self._buf = bytearray()
+ 
+@@ -271,6 +277,70 @@ class Protocol:
+                     return True
+         return False
+ 
++    #-----------------------------------------------------------------------
++    def inject(self, raw):
++        """Process an inbound Insteon message that did not come from the modem.
++
++        A PLM hears only what reaches its single antenna, and passes up only
++        the group broadcasts it holds an ALDB link for.  Additional receivers
++        placed elsewhere can hear messages the modem missed; handing them over
++        here makes the modem effectively more sensitive without introducing a
++        second transmitter.
++
++        The bytes must be a complete inbound message frame exactly as the
++        modem would have produced it (0x02 0x50 for standard, 0x02 0x51 for
++        extended).  Nothing else is accepted: an injected frame is not allowed
++        to reconfigure the modem or fake a reply to an outbound command at the
++        link level.
++
++        This deliberately does **not** feed self._buf.  That buffer is filled
++        by the serial link and may hold a partially received frame; appending
++        to it would interleave the two streams and corrupt both.  Instead the
++        frame is parsed on its own and handed to the same duplicate check and
++        handler dispatch that _data_read() uses, so an injected copy of a
++        message the modem also heard is dropped exactly like a mesh repeat.
++
++        Args:
++          raw (bytes):  A complete 0x50 or 0x51 modem frame.
++
++        Returns:
++          bool:  True if the message was processed, False if it was rejected
++          as malformed or dropped as a duplicate.
++        """
++        buf = bytes(raw)
++        if len(buf) < 2 or buf[0] != 0x02:
++            LOG.warning("Injected frame does not start with 0x02: %s",
++                        buf.hex())
++            return False
++
++        msg_type = buf[1]
++        if msg_type not in (Msg.InpStandard.msg_code,
++                            Msg.InpExtended.msg_code):
++            LOG.warning("Injected message code %#04x is not an inbound "
++                        "Insteon message", msg_type)
++            return False
++
++        msg_class = Msg.types[msg_type]
++        if len(buf) != msg_class.msg_size(buf):
++            LOG.warning("Injected %#04x frame is %d bytes, needs %d", msg_type,
++                        len(buf), msg_class.msg_size(buf))
++            return False
++
++        try:
++            msg = msg_class.from_bytes(buf)
++        except Exception:
++            LOG.exception("Cannot parse injected message bytes %s", buf.hex())
++            return False
++
++        LOG.info("Injected %#04x: %s", msg_type, msg)
++
++        if self._is_duplicate(msg):
++            LOG.info("Ignored duplicate injected %s", msg)
++            return False
++
++        self._process_msg(msg)
++        return True
++
+     #-----------------------------------------------------------------------
+     def _poll(self, t):
+         """Periodic polling function.
+@@ -375,10 +445,13 @@ class Protocol:
+                 self._buf = self._buf[1:]
+                 continue
+ 
++            raw = bytes(self._buf[:msg_size])
+             self._buf = self._buf[msg_size:]
+             LOG.info("Read %#04x: %s", msg_type, msg)
+ 
+-            if self._is_duplicate(msg):
++            duplicate = self._is_duplicate(msg)
++            self.signal_raw_read.emit(raw, duplicate)
++            if duplicate:
+                 LOG.info("Ignored duplicate %s", msg)
+             else:
+                 # And try to process the message using the handlers.
+diff --git a/insteon_mqtt/data/config-schema.yaml b/insteon_mqtt/data/config-schema.yaml
+index 6d63a17..248de24 100644
+--- a/insteon_mqtt/data/config-schema.yaml
++++ b/insteon_mqtt/data/config-schema.yaml
+@@ -305,6 +305,18 @@ mqtt:
+     discovery_topic_base: *mqtt_topic
+     discovery_ha_status: *mqtt_topic
+     device_info_template: *discovery_device
++    # Raw inbound message topics.  Unknown keys under mqtt: are validated as
++    # user-defined discovery classes, so this has to be declared or the
++    # config is rejected outright.
++    raw:
++      type: dict
++      schema:
++        enable_publish:
++          type: boolean
++        enable_inject:
++          type: boolean
++        publish_topic: *mqtt_topic
++        inject_topic: *mqtt_topic
+     modem:
+       type: dict
+       allow_unknown: True
+diff --git a/insteon_mqtt/mqtt/Mqtt.py b/insteon_mqtt/mqtt/Mqtt.py
+index 9bfd1bc..f207223 100644
+--- a/insteon_mqtt/mqtt/Mqtt.py
++++ b/insteon_mqtt/mqtt/Mqtt.py
+@@ -9,6 +9,7 @@ import logging
+ from .. import log
+ from . import config
+ from .MsgTemplate import MsgTemplate
++from .Raw import Raw
+ from .Reply import Reply
+ 
+ LOG = log.get_logger()
+@@ -90,6 +91,11 @@ class Mqtt:
+         # Loaded config object.
+         self._config = None
+ 
++        # Raw inbound message topics (mqtt.Raw).  Only created when the
++        # config has a 'raw' section, so nothing changes for anyone who
++        # doesn't use them.
++        self.raw = None
++
+     #-----------------------------------------------------------------------
+     def load_config(self, data):
+         """Load a configuration dictionary.
+@@ -148,6 +154,12 @@ class Mqtt:
+         # Save the config for later passing to devices when they are created.
+         self._config = data
+ 
++        # Raw inbound message topics.
++        self.raw = None
++        if data.get('raw'):
++            self.raw = Raw(self, self.modem.protocol)
++            self.raw.load_config(data)
++
+         # Subscribe to the new topics.
+         if self.link.connected:
+             self._startup()
+@@ -427,6 +439,9 @@ class Mqtt:
+             self.link.subscribe(self._ha_status_topic, self.qos,
+                                 self.handle_ha_status)
+ 
++        if self.raw:
++            self.raw.subscribe(self.link, self.qos)
++
+         for device in self.devices.values():
+             device.subscribe(self.link, self.qos)
+             self._publish_device_discovery(device)
+@@ -440,6 +455,9 @@ class Mqtt:
+         if self._cmd_topic:
+             self.link.unsubscribe(self._cmd_topic + "/+")
+ 
++        if self.raw:
++            self.raw.unsubscribe(self.link)
++
+         for device in self.devices.values():
+             device.unsubscribe(self.link)
+ 
+diff --git a/insteon_mqtt/mqtt/Raw.py b/insteon_mqtt/mqtt/Raw.py
+new file mode 100644
+index 0000000..80b4ebc
+--- /dev/null
++++ b/insteon_mqtt/mqtt/Raw.py
+@@ -0,0 +1,183 @@
++#===========================================================================
++#
++# Raw inbound Insteon message topics
++#
++#===========================================================================
++"""Publish every inbound Insteon message, and accept injected ones.
++
++A PLM hears only what reaches its single antenna, and passes up only the
++group broadcasts it holds an ALDB link for -- an unlinked group broadcast
++never reaches the host at all.  Additional RF receivers placed around the
++house can hear messages the modem missed and hand them over, which makes the
++modem effectively more sensitive without introducing a second transmitter.
++
++Two topics, both disabled unless configured:
++
++  publish_topic  Every message read from the modem is published here as JSON,
++                 *before* the duplicate check, with a "dup" flag.  This is the
++                 ground truth an external receiver needs in order to know what
++                 the modem already heard and therefore what it should not
++                 inject.
++
++  inject_topic   JSON messages here are parsed and handed to
++                 Protocol.inject().  Injection is off by default because it
++                 lets another process feed the protocol stack.
++
++Config, under the mqtt section:
++
++    mqtt:
++      raw:
++        enable_publish: True
++        enable_inject: False
++        publish_topic: 'insteon/raw/rx'
++        inject_topic: 'insteon/raw/inject'
++
++Payloads.  Published:
++
++    {"ts": 1789412345.678, "code": 80, "raw": "0250...", "dup": false}
++
++Accepted for injection ("raw" is required, the rest is carried into the log
++so a message can be traced back to the receiver that heard it):
++
++    {"raw": "0250...", "src": "listener-1", "rssi": -87.5}
++
++An injected message goes through the same duplicate check as one read from
++the modem, but that check only remembers a message for hops_left * ~0.09 s
++(none at all once hops_left is 0).  A receiver should therefore suppress its
++own repeats, and should not inject anything the publish topic shows the
++modem already heard.
++"""
++#===========================================================================
++import json
++import time
++
++from .. import log
++
++LOG = log.get_logger()
++
++
++class Raw:
++    """Raw inbound message publishing and injection."""
++
++    def __init__(self, mqtt, protocol):
++        """Constructor
++
++        Args:
++          mqtt (mqtt.Mqtt):  The main MQTT handler, used to publish.
++          protocol (Protocol):  The Insteon protocol stack to inject into and
++                   to listen to for inbound messages.
++        """
++        self.mqtt = mqtt
++        self.protocol = protocol
++
++        self.enable_publish = False
++        self.enable_inject = False
++        self.publish_topic = None
++        self.inject_topic = None
++
++        # Counters, handy for answering "is this doing anything" from the log.
++        self.published = 0
++        self.injected = 0
++        self.rejected = 0
++
++        protocol.signal_raw_read.connect(self.handle_raw_read)
++
++    #-----------------------------------------------------------------------
++    def load_config(self, config):
++        """Load the 'raw' section of the mqtt config.
++
++        Args:
++          config (dict):  The mqtt configuration dictionary.
++        """
++        data = config.get('raw', None)
++        if not data:
++            return
++
++        self.publish_topic = data.get('publish_topic', 'insteon/raw/rx')
++        self.inject_topic = data.get('inject_topic', 'insteon/raw/inject')
++        self.enable_publish = bool(data.get('enable_publish', False))
++        self.enable_inject = bool(data.get('enable_inject', False))
++
++        LOG.info("Raw topics: publish=%s (%s), inject=%s (%s)",
++                 self.publish_topic,
++                 "on" if self.enable_publish else "off",
++                 self.inject_topic,
++                 "on" if self.enable_inject else "off")
++
++    #-----------------------------------------------------------------------
++    def subscribe(self, link, qos):
++        """Subscribe to the injection topic, if injection is enabled.
++
++        Args:
++          link (network.Mqtt):  The MQTT network client.
++          qos (int):  The quality of service to use.
++        """
++        if self.enable_inject and self.inject_topic:
++            link.subscribe(self.inject_topic, qos, self.handle_inject)
++
++    #-----------------------------------------------------------------------
++    def unsubscribe(self, link):
++        """Unsubscribe from the injection topic.
++
++        Args:
++          link (network.Mqtt):  The MQTT network client.
++        """
++        if self.enable_inject and self.inject_topic:
++            link.unsubscribe(self.inject_topic)
++
++    #-----------------------------------------------------------------------
++    def handle_raw_read(self, raw, duplicate):
++        """Protocol.signal_raw_read callback: publish an inbound message.
++
++        Args:
++          raw (bytes):  The complete modem frame that was read.
++          duplicate (bool):  Whether the protocol judged it a duplicate.
++        """
++        if not self.enable_publish or not self.publish_topic:
++            return
++
++        payload = json.dumps({
++            'ts': round(time.time(), 3),
++            'code': raw[1],
++            'raw': raw.hex().upper(),
++            'dup': bool(duplicate),
++            })
++
++        # retain must be False: these are events, and a retained frame would
++        # be redelivered to every new subscriber as though it had just
++        # arrived.  The class default for retain is True.
++        self.mqtt.publish(self.publish_topic, payload, retain=False)
++        self.published += 1
++
++    #-----------------------------------------------------------------------
++    def handle_inject(self, client, userdata, message):
++        """Inject topic callback.
++
++        Args:
++          client (paho.Client):  The paho mqtt client.
++          userdata:  Unused.
++          message:  The incoming MQTT message.
++        """
++        if not self.enable_inject:
++            return
++
++        try:
++            data = json.loads(message.payload.decode("utf-8"))
++            raw = bytes.fromhex(data['raw'])
++        except Exception:
++            LOG.exception("Bad injected payload on %s: %s", message.topic,
++                          message.payload)
++            self.rejected += 1
++            return
++
++        src = data.get('src', 'unknown')
++        if self.protocol.inject(raw):
++            self.injected += 1
++            LOG.info("Injected a message heard by %s (rssi %s)", src,
++                     data.get('rssi'))
++        else:
++            self.rejected += 1
++
++    #-----------------------------------------------------------------------
++
++#===========================================================================
+-- 
+2.53.0
+

@@ -24,18 +24,24 @@ it is applied to an insteon-mqtt install at image build time.
 
 ## The series
 
+Generated, never hand-edited, from the upstream PR branch
+`rf-listener-raw-topics` (local checkout `/root/src/insteon-mqtt`, based on
+upstream `dev` = 1.4.0). The commands are in the Containerfile header.
+
 | Patch | Applies to |
 |---|---|
-| `0001-protocol-raw-signal-and-inject.patch` | `Protocol.py`: a `signal_raw_read` signal and the `inject()` method |
-| `0002-mqtt-raw-topics.patch` | new `mqtt/Raw.py` |
-| `0003-wire-raw-topics.patch` | `mqtt/Mqtt.py`, `mqtt/__init__.py` |
-| `0004-config-schema-raw-section.patch` | `data/config-schema.yaml` |
-| `0005-document-raw-in-config-example.patch` | `config-example.yaml` (source checkout only) |
+| `0001-raw-topics-code-and-schema.patch` | `Protocol.py` (`signal_raw_read`, `inject()`), new `mqtt/Raw.py`, `mqtt/Mqtt.py`, `data/config-schema.yaml` |
+| `0002-raw-topics-config-example.patch` | `config-example.yaml` (source checkout only) |
 
-0001–0004 are applied to **both** trees; see the Containerfile for why that
-matters.
+0001 is applied to **both** trees; see the Containerfile for why that
+matters. The PR's tests are not in the series (the installed package has no
+`tests/`); they run in the branch checkout with upstream's `pytest`.
 
-## Two traps worth reading the Containerfile for
+Until 2026-11-15 this was a five-patch series against 1.3.2. The PR version
+differs in one way that matters: `mqtt.Raw` is created only when the config
+has a `raw:` section, so a config without it behaves exactly like stock.
+
+## Three traps worth reading the Containerfile for
 
 1. **The package is pip-installed into site-packages**, and
    `/opt/insteon-mqtt` is only the source checkout the hassio web CLI and docs
@@ -48,6 +54,16 @@ matters.
    startup, and the Insteon network is down until the config is reverted. The
    build now fails instead, by handing the real validator a config carrying
    the `raw:` section.
+
+3. **1.4.0's entrypoint needs s6-overlay** (`#!/usr/bin/with-contenv sh`).
+   The pod overrides the command with `/bin/sh -c` and never starts s6's
+   `/init`, so the sidecar crash-looped on `s6-envdir: fatal: unable to
+   envdir /run/s6/container_environment` until the build rewrote the shebang
+   to `#!/bin/sh` (2026-11-15).
+
+Also: **always use a new image tag**. The manifest's `imagePullPolicy:
+IfNotPresent` means a rebuilt image pushed under an existing tag is never
+pulled; the node keeps running the old one.
 
 The base image is pinned **by digest**, not by tag: upstream publishes
 `:latest`, and an unpinned pull would silently replace the patched image with a
@@ -67,5 +83,6 @@ INSTEONRF_IMQTT=/tmp/imqtt pytest tests/test_inject.py
 
 ## Upstreaming
 
-The raw topics are generally useful and a merged feature beats a carried
-patch. Worth offering to TD22057 rather than maintaining this indefinitely.
+In progress: branch `rf-listener-raw-topics` in `/root/src/insteon-mqtt`,
+targeting upstream `dev` (their CONTRIBUTING forbids PRs against `master`).
+Once merged and released, drop this directory and run the upstream image.

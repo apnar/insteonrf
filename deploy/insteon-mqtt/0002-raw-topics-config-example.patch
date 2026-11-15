@@ -1,0 +1,74 @@
+From 859f8b3de83c441186d9360868caf07f137dbbda Mon Sep 17 00:00:00 2001
+From: Josh Lukens <jlukens@botch.com>
+Date: Sun, 15 Nov 2026 09:48:05 -0500
+Subject: [PATCH] Add optional raw message topics for external RF receivers
+
+A PLM hears only what reaches its own antenna, and passes up only the
+group broadcasts it holds a link for. Battery devices (leak, door,
+remotes) are RF-only and can't be polled, so a message the modem misses
+from one of them is simply lost. Additional receive-only RF listeners
+placed elsewhere in the house can hear those messages; this adds the
+seam to hand them over without adding a second transmitter.
+
+Two MQTT topics under a new optional `mqtt.raw` config section:
+
+- publish_topic (default insteon/raw/rx): every frame read from the
+  modem as JSON, before the duplicate check, with a "dup" flag. This
+  is what a listener needs to know what the modem already heard.
+- inject_topic (default insteon/raw/inject): complete 0x50/0x51
+  inbound frames, parsed by the new Protocol.inject() and handed to the
+  normal duplicate check and handler dispatch. Anything else (modem
+  commands, replies, malformed or wrong-length frames) is rejected.
+
+Both are off by default. Without a `raw` section no Raw object is
+created and no topic is subscribed, so nothing changes for existing
+installs. Protocol gains one signal, emitted per frame read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0157MSwwBp84p98F4Aq9dGR3
+---
+ config-example.yaml | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/config-example.yaml b/config-example.yaml
+index daaf3aa..e7109a4 100644
+--- a/config-example.yaml
++++ b/config-example.yaml
+@@ -213,4 +213,34 @@ mqtt:
+   # TO ENABLE THE DISCOVERY PLATFORM: Set the following to true
+   enable_discovery: false
+ 
++  #==================================================================
++  # Raw inbound message topics
++  #==================================================================
++  # The modem hears only what reaches its single antenna, and passes up only
++  # the group broadcasts it holds an ALDB link for -- an unlinked group
++  # broadcast never reaches the host at all.  These two topics let additional
++  # receivers (for example RF listeners elsewhere in the house) see what the
++  # modem heard and hand over what it missed, which makes the modem
++  # effectively more sensitive without adding a second transmitter.
++  #
++  # Both halves are off by default.  Injection in particular lets another
++  # process feed the protocol stack, so turn it on deliberately.
++  #
++  # raw:
++  #   # Publish every inbound Insteon message as JSON, before the duplicate
++  #   # check:  {"ts": ..., "code": 80, "raw": "0250...", "dup": false}
++  #   enable_publish: True
++  #   publish_topic: 'insteon/raw/rx'
++  #
++  #   # Accept messages to feed into the protocol stack.  The payload needs a
++  #   # "raw" field holding a complete 0x50 or 0x51 modem frame in hex; "src"
++  #   # and "rssi" are optional and are logged so a message can be traced
++  #   # back to the receiver that heard it:
++  #   #   {"raw": "0250...", "src": "listener-1", "rssi": -87.5}
++  #   # The normal duplicate check drops an injected copy of a message the
++  #   # modem heard moments earlier, but its window is short, so a receiver
++  #   # should not inject anything it has seen on publish_topic.
++  #   enable_inject: False
++  #   inject_topic: 'insteon/raw/inject'
++
+ #----------------------------------------------------------------
+-- 
+2.53.0
+
