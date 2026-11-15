@@ -26,7 +26,8 @@
 #   - no captures at all while the dongle hears traffic -> check the log for
 #     "RF switch" pins, then try `sync_mode: 16/16` (carrier sense off)
 #   - captures arriving but "gate fail" on all of them -> send me the bytes
-#   - "gate PASS" -> it works; watch insteon-rf/rx/insteon-rf-embed
+#   - "gate PASS" -> it works; then "decoded n/10: 0250..." lines, and
+#     contract v1 messages on insteon-rf/msg/insteon-rf-embed
 #   - "RX FIFO overflow" warnings -> the radio task is being starved; raise
 #     the display's update_interval first
 #
@@ -45,7 +46,7 @@ esphome:
   # listener firmware in esphome/. See insteon-rf-main.yaml for why.
   project:
     name: insteonrf.listener
-    version: "2.10.0"
+    version: "3.0.0"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -75,9 +76,9 @@ ota:
   platform: esphome
   password: !secret ota_pass
 
-# The mesh service consumes MQTT directly, not the HA API, so this node needs
-# both. Topic prefix is insteon-rf/ so it cannot collide with insteon-mqtt's
-# insteon/ prefix.
+# insteon-mqtt consumes the decoded messages over MQTT directly, not the HA
+# API, so this node needs both. Topic prefix is insteon-rf/ so it cannot
+# collide with insteon-mqtt's insteon/ prefix.
 mqtt:
   broker: 192.168.88.5
   username: !secret mqtt_user
@@ -168,7 +169,11 @@ insteon_rf:
   capture_bytes: 162
   rssi_floor: -110
   manchester_gate: 4
-  mqtt_topic: insteon-rf/rx/${name}
+  # Decode on the board and publish listener contract v1, one message per
+  # transmission, to insteon-rf/msg/${name} (the default decoded_topic).
+  # `both` (plus `mqtt_topic: insteon-rf/rx/${name}`) also sends the raw
+  # captures the old mesh service reads.
+  publish: decoded
 
 # ---------------------------------------------------------------- display
 
@@ -294,7 +299,8 @@ display:
             it.print(0, 24, id(f_mid), id(c_dim), "offset: no packets");
           else
             it.printf(0, 24, id(f_mid), "offset %+.1f kHz", off);
-          it.printf(0, 52, id(f_mid), "lost %u/min", (unsigned) node->lost_last_minute());
+          it.printf(0, 52, id(f_mid), "lost %u  dec %u /min", (unsigned) node->lost_last_minute(),
+                    (unsigned) node->decoded_last_minute());
 
           const float soc = id(battery_level).state;
           const float mv = id(battery_voltage).state;
@@ -583,6 +589,8 @@ sensor:
       name: ${friendly_name} Accepted
     lost_per_minute:
       name: ${friendly_name} Lost
+    decoded_per_minute:
+      name: ${friendly_name} Decoded
     frequency_offset:
       name: ${friendly_name} Frequency Offset
   - platform: rotary_encoder

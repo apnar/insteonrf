@@ -225,6 +225,18 @@ def test_the_embed_keeps_uart0_free_for_the_nrf24():
     assert re.search(r"hardware_uart: USB_SERIAL_JTAG", _block("logger"))
 
 
-def test_the_embed_publishes_where_the_mesh_listens():
+def test_the_embed_publishes_contract_v1():
+    """3.0.0: the board decodes and publishes one message per transmission to
+    insteon-rf/msg/<node name> (listener.TOPIC_PREFIX); raw captures only
+    when `publish` asks for them, and then where the mesh listens."""
+    from insteonrf.listener import TOPIC_PREFIX
+
     rf = _block("insteon_rf")
-    assert re.search(r"mqtt_topic: insteon-rf/rx/\$\{name\}", rf)
+    mode = re.search(r"^\s+publish: (\w+)\s*$", rf, re.MULTILINE)
+    assert mode and mode.group(1) in ("decoded", "both")
+    topic = re.search(r"^\s+decoded_topic: (\S+)\s*$", rf, re.MULTILINE)
+    assert topic is None or topic.group(1) == f"{TOPIC_PREFIX}/${{name}}"
+    init = (COMPONENT / "__init__.py").read_text()
+    assert f'DECODED_TOPIC_PREFIX = "{TOPIC_PREFIX}/"' in init
+    if mode.group(1) == "both":
+        assert re.search(r"mqtt_topic: insteon-rf/rx/\$\{name\}", rf)

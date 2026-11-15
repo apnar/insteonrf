@@ -689,6 +689,10 @@ void InsteonRFCC1101::loop() {
     this->process_capture_(this->out_.data, this->out_.len, this->out_.rssi, this->out_.first_bit_us,
                            this->out_.freqest * FREQEST_KHZ);
   }
+  // After the queue is drained, so a copy handed over this pass is folded
+  // before its message's window is judged; on quiet air this is what
+  // releases the last message of an exchange.
+  this->service_decoded_();
 }
 
 void InsteonRFCC1101::dump_config() {

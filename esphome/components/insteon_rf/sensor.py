@@ -28,6 +28,7 @@ CONF_CAPTURES_PER_MINUTE = "captures_per_minute"
 CONF_ACCEPTED_PER_MINUTE = "accepted_per_minute"
 CONF_LOST_PER_MINUTE = "lost_per_minute"
 CONF_FREQUENCY_OFFSET = "frequency_offset"
+CONF_DECODED_PER_MINUTE = "decoded_per_minute"
 
 _COUNT_SCHEMA = sensor.sensor_schema(
     accuracy_decimals=0,
@@ -51,6 +52,9 @@ CONFIG_SCHEMA = cv.Schema(
         # overflows, stalled captures, a full hand-off queue). Nonzero means
         # the receive path is being starved, not that the air is quiet.
         cv.Optional(CONF_LOST_PER_MINUTE): _COUNT_SCHEMA,
+        # Contract-v1 messages published, i.e. transmissions decoded on the
+        # board after folding hop copies (0 with `publish: captures`).
+        cv.Optional(CONF_DECODED_PER_MINUTE): _COUNT_SCHEMA,
         # CC1101 only: the demodulator's carrier-offset estimate, averaged
         # over the minute's accepted packets. A steady value is this board's
         # crystal error; take it out of `frequency:` and it should read ~0.
@@ -72,6 +76,7 @@ async def to_code(config):
         (CONF_CAPTURES_PER_MINUTE, parent.set_captures_sensor),
         (CONF_ACCEPTED_PER_MINUTE, parent.set_accepted_sensor),
         (CONF_LOST_PER_MINUTE, parent.set_lost_sensor),
+        (CONF_DECODED_PER_MINUTE, parent.set_decoded_sensor),
         (CONF_FREQUENCY_OFFSET, parent.set_frequency_offset_sensor),
     ):
         if key in config:

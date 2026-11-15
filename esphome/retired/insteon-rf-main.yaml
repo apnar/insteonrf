@@ -110,6 +110,8 @@ insteon_rf:
   capture_bytes: 162
   rssi_floor: -110
   manchester_gate: 4
+  # Pre-3.0 behaviour (raw captures only); 3.0.0 defaults to `decoded`.
+  publish: captures
   mqtt_topic: insteon-rf/rx/${name}
 
 # ---------------------------------------------------------------- on-board OLED

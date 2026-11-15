@@ -18,6 +18,11 @@ static const char *const TAG = "insteon_rf";
 
 // How many captures to describe at INFO after boot.
 static const uint8_t BRINGUP_CAPTURES = 10;
+// ... and how many decoded messages.
+static const uint8_t BRINGUP_DECODED = 10;
+// Before SNTP has set the clock there is no epoch time to put in "t"; a
+// decoded message is dropped (and counted) rather than dated 1970.
+static const time_t CLOCK_VALID_AFTER = 1700000000;  // 2023-11
 
 // --------------------------------------------------------------------- the gate
 
@@ -85,6 +90,7 @@ void InsteonRF::tick_minute_() {
   this->captures_last_minute_ = this->captures_ - this->captures_at_mark_;
   this->accepted_last_minute_ = this->accepted_ - this->accepted_at_mark_;
   this->lost_last_minute_ = this->lost_ - this->lost_at_mark_;
+  this->decoded_last_minute_ = this->decoded_ - this->decoded_at_mark_;
   this->freq_offset_last_minute_ =
       this->freq_offset_n_ ? this->freq_offset_sum_ / (float) this->freq_offset_n_ : NAN;
 #ifdef USE_SENSOR
@@ -94,6 +100,8 @@ void InsteonRF::tick_minute_() {
     this->accepted_sensor_->publish_state(this->accepted_last_minute_);
   if (this->lost_sensor_ != nullptr)
     this->lost_sensor_->publish_state(this->lost_last_minute_);
+  if (this->decoded_sensor_ != nullptr)
+    this->decoded_sensor_->publish_state(this->decoded_last_minute_);
   // A minute with no packets says nothing about the offset; keep the last
   // value rather than publishing a gap.
   if (this->frequency_offset_sensor_ != nullptr && this->freq_offset_n_)
@@ -105,6 +113,11 @@ void InsteonRF::tick_minute_() {
   this->captures_at_mark_ = this->captures_;
   this->accepted_at_mark_ = this->accepted_;
   this->lost_at_mark_ = this->lost_;
+  this->decoded_at_mark_ = this->decoded_;
+  if (this->undated_) {
+    ESP_LOGW(TAG, "%u decoded message(s) dropped: the clock is not set yet (SNTP)", (unsigned) this->undated_);
+    this->undated_ = 0;
+  }
   this->freq_offset_sum_ = 0.0f;
   this->freq_offset_n_ = 0;
   this->last_minute_mark_ = now;
@@ -154,7 +167,95 @@ void InsteonRF::process_capture_(const uint8_t *buf, size_t len, float rssi, uin
     this->freq_offset_sum_ += offset_khz;
     this->freq_offset_n_++;
   }
-  this->publish_capture_(buf, len, rssi, first_bit_us);
+  if (this->publish_captures_())
+    this->publish_capture_(buf, len, rssi, first_bit_us);
+  if (this->publish_decoded_enabled_())
+    this->decode_capture_(buf, len, rssi, first_bit_us);
+}
+
+// --------------------------------------------------------------------- decoded
+
+int64_t InsteonRF::now_us64_() {
+  const uint32_t m = micros();
+  if (m < this->last_micros_)
+    this->micros_high_ += (int64_t) 1 << 32;
+  this->last_micros_ = m;
+  return this->micros_high_ + m;
+}
+
+void InsteonRF::decode_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us) {
+  // Every copy is dated at its own start header, on the board's monotonic
+  // clock: the capture's first FIFO bit plus the header's offset at 9124
+  // baud (the host pods' packet_air_times; a 162-byte capture spans three
+  // hop slots). It becomes epoch time only when published.
+  const int64_t now_us = this->now_us64_();
+  const int64_t first_us = now_us - (int64_t) (uint32_t) (this->last_micros_ - first_bit_us);
+  DecodedMessage copies[DECODER_MAX_COPIES];
+  const size_t n = this->decoder_.decode_copies(buf, len, this->sync_word_, copies, DECODER_MAX_COPIES);
+  ESP_LOGV(TAG, "decoded %u copies (%u headers, %u packets, %u rejected)", (unsigned) n,
+           (unsigned) this->decoder_.headers(), (unsigned) this->decoder_.packets(),
+           (unsigned) this->decoder_.rejected());
+  for (size_t i = 0; i < n; i++) {
+    // bit_pos counts the 16-bit start header put back in front, so the first
+    // copy lands on the capture's own stamp, as on the host.
+    const int64_t t_ms = (first_us + (int64_t) copies[i].bit_pos * 1000000LL / DECODER_BITRATE) / 1000;
+    FoldedMessage evicted;
+    if (this->folder_.add(copies[i], t_ms, rssi, &evicted))
+      this->publish_decoded_(evicted, now_us / 1000);
+  }
+}
+
+void InsteonRF::service_decoded_() {
+  if (!this->publish_decoded_enabled_())
+    return;
+  const int64_t now_ms = this->now_us64_() / 1000;
+  FoldedMessage m;
+  while (this->folder_.pop_ready(now_ms - RELEASE_LATENESS_MS, &m))
+    this->publish_decoded_(m, now_ms);
+}
+
+void InsteonRF::publish_decoded_(const FoldedMessage &m, int64_t now_ms) {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  if (tv.tv_sec < CLOCK_VALID_AFTER) {
+    this->undated_++;
+    return;
+  }
+  this->decoded_++;
+  // Epoch ms of the first copy's start header: the wall clock now, less how
+  // long ago that was on the monotonic clock.
+  const int64_t epoch_now_ms = (int64_t) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  const int64_t t_ms = epoch_now_ms - (now_ms - m.t_ms);
+  char hex[2 * PLM_EXT_FRAME_LEN + 1];
+  frame_hex(m.msg, hex);
+  char rssi[16];
+  if (std::isnan(m.rssi)) {
+    snprintf(rssi, sizeof(rssi), "null");
+  } else {
+    snprintf(rssi, sizeof(rssi), "%.1f", m.rssi);
+  }
+
+  if (this->decoded_logged_ < BRINGUP_DECODED) {
+    this->decoded_logged_++;
+    ESP_LOGI(TAG, "decoded %u/%u: %s, %u cop%s, hops left %u, %s dBm", (unsigned) this->decoded_logged_,
+             (unsigned) BRINGUP_DECODED, hex, (unsigned) m.msg.copies, m.msg.copies == 1 ? "y" : "ies",
+             (unsigned) m.msg.hops_left, rssi);
+  }
+#ifdef USE_MQTT
+  if (this->decoded_topic_.empty() || mqtt::global_mqtt_client == nullptr)
+    return;
+  // Contract v1 (insteonrf/listener.py, ListenerMessage.to_dict). No repair
+  // on the board, and a hardware demodulator has no SNR.
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+           "{\"v\":1,\"rx\":\"%s\",\"t\":%lld.%03d,\"frame\":\"%s\",\"copies\":%u,"
+           "\"hops_left\":%u,\"rssi\":%s,\"snr\":null,\"repaired\":0}",
+           App.get_name().c_str(), (long long) (t_ms / 1000), (int) (t_ms % 1000), hex,
+           (unsigned) m.msg.copies, (unsigned) m.msg.hops_left, rssi);
+  // QoS 0, not retained, like the captures: events, and the listeners are
+  // redundant by construction.
+  mqtt::global_mqtt_client->publish(this->decoded_topic_, std::string(payload), 0, false);
+#endif
 }
 
 void InsteonRF::publish_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us) {
@@ -223,7 +324,15 @@ void InsteonRF::dump_common_config_() {
   ESP_LOGCONFIG(TAG, "  Manchester gate: %u frames, up to %u bad pairs",
                 (unsigned) this->manchester_gate_, (unsigned) this->manchester_gate_errors_);
   ESP_LOGCONFIG(TAG, "  RSSI floor: %.1f dBm", this->rssi_floor_);
-  ESP_LOGCONFIG(TAG, "  MQTT topic: %s", this->mqtt_topic_.c_str());
+  static const char *const MODES[] = {"decoded", "captures", "both"};
+  ESP_LOGCONFIG(TAG, "  Publish: %s", MODES[this->publish_mode_ % 3]);
+  if (this->publish_decoded_enabled_()) {
+    ESP_LOGCONFIG(TAG, "  Decoded topic: %s (fold window %u ms, released %u ms later)",
+                  this->decoded_topic_.c_str(), (unsigned) FOLD_WINDOW_MS, (unsigned) RELEASE_LATENESS_MS);
+  }
+  if (this->publish_captures_()) {
+    ESP_LOGCONFIG(TAG, "  Capture topic: %s", this->mqtt_topic_.c_str());
+  }
   if (this->is_failed())
     ESP_LOGE(TAG, "  RADIO NOT RESPONDING");
 }

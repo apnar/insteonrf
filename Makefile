@@ -1,6 +1,6 @@
 # insteonrf — C helpers for the SDR receive path.
 #
-#   make           build fsk2_demod and rf_clip
+#   make           build fsk2_demod, rf_clip and the T-Embed decoder's host CLI
 #   make test      build, then run the Python test suite
 #   make lint      ruff + mypy (needs the dev extra installed)
 #   make clean     remove objects; make realclean also removes the binaries
@@ -11,6 +11,7 @@
 
 UNAME = $(shell uname)
 CC ?= gcc
+CXX ?= g++
 
 MKDIR_P = mkdir -p
 
@@ -18,17 +19,24 @@ OBJECTS_DIR = Obj
 SOURCE_DIR = Src
 CFLAGS += -ggdb -O2 -Wall -Wextra -Werror
 LDFLAGS += -ggdb
+CXXFLAGS += -std=c++17 -O2 -Wall -Wextra -Werror
 TESTDAT = Dat/41802513110D2711018C00.dat
 
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
-all: directories fsk2_demod rf_clip
+# The ESPHome listener's on-board decoder, compiled for the host so pytest
+# can hold it to the Python reference (tests/test_esphome_decoder.py builds
+# its own copy; this target keeps -Werror honest in `make check`).
+DECODER_DIR = esphome/components/insteon_rf
+DECODER_CLI = $(OBJECTS_DIR)/insteon_rf_decode
+
+all: directories fsk2_demod rf_clip $(DECODER_CLI)
 
 .PHONY: all directories test lint check clean realclean p
 
 directories: $(OBJECTS_DIR)
 
-test: fsk2_demod
+test: fsk2_demod $(DECODER_CLI)
 	$(PYTHON) -m pytest -q
 
 lint:
@@ -47,6 +55,9 @@ fsk2_demod: $(OBJECTS_DIR)/fsk2_demod.o $(OBJECTS_DIR)/fxpt_atan2.o
 rf_clip: $(OBJECTS_DIR)/rf_clip.o
 	$(CC) $(LDFLAGS) -O2 -pipe $< -o $@
 
+$(DECODER_CLI): tools/insteon_rf_decode.cpp $(DECODER_DIR)/decoder.cpp $(DECODER_DIR)/decoder.h | $(OBJECTS_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ tools/insteon_rf_decode.cpp $(DECODER_DIR)/decoder.cpp
+
 $(OBJECTS_DIR)/%.o: $(SOURCE_DIR)/%.c
 	$(CC) -c $(CFLAGS) -o $@ $<
 
@@ -56,6 +67,7 @@ $(OBJECTS_DIR):
 p:
 	@echo UNAME $(UNAME)
 	@echo CC $(CC)
+	@echo CXX $(CXX)
 	@echo PYTHON $(PYTHON)
 
 clean:

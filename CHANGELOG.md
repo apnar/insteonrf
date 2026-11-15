@@ -4,6 +4,45 @@ All notable changes to this project. Versions follow
 [semantic versioning](https://semver.org/) loosely: the bit-string pipeline
 contract and the legacy script names are treated as public API.
 
+## 3.0.0 — 2026-11-15
+
+Listeners decode on their own and publish messages instead of raw captures
+(`Doc/REARCHITECTURE.md`). Major version, because what goes on MQTT changed.
+
+- **Listener contract v1** (`insteonrf/listener.py`): one message per
+  transmission on `insteon-rf/msg/<rx>`, QoS 0, not retained --
+  `{"v":1,"rx","t","frame","copies","hops_left","rssi","snr","repaired"}`,
+  `frame` being the PLM inbound frame (`0250…`/`0251…`). Published only when
+  the packet CRC matches, the frame-index counters run as the protocol
+  requires and hops-left <= max-hops (`plm.to_plm_bytes(validate=True)`); hop
+  copies are folded by the hop-insensitive key within 0.5 s of on-air time
+  (`Folder`). `capture_messages()` is the reference decode of one capture,
+  and `tests/data/contract-v1/` holds vectors made with it (290 real T-Embed
+  captures, 31 synthetic edge cases) that every listener is tested against.
+- **`monitor --publish-decoded NAME`**: the host pods (dongle, V3) fold every
+  packet that survived decode + repair into contract-v1 messages on
+  `insteon-rf/msg/NAME`, released 0.5 s + 0.2 s after the first copy on the
+  wall clock (even on quiet air) or on the recording's clock for a lossless
+  replay; each copy dated at its own header (`packet_air_times`).
+- **T-Embed: decoding on the device.** New `decoder.cpp/.h` in the
+  `insteon_rf` component, with no ESPHome dependency: start header put back,
+  headers in either polarity, 28-bit Manchester frames, counters, hops,
+  packet CRC, PLM layout, fold -- a port of the reference, no repair
+  (`repaired` 0, `snr` null). A 0.5 s fold window across captures
+  (`MessageFolder`, fixed storage) publishes a transmission whose copies
+  straddle two captures once; `loop()` releases messages 0.2 s after their
+  window closes, quiet air included, and dates them at the first copy's
+  start header. New options `publish: decoded | captures | both` (default
+  `decoded`) and `decoded_topic` (default `insteon-rf/msg/<node name>`);
+  `mqtt_topic` is needed only when captures are published. New
+  `decoded_per_minute` sensor. Messages decoded before SNTP has set the clock
+  are dropped and counted, not dated 1970.
+- **Host harness**: `tools/insteon_rf_decode.cpp` wraps the decoder in a CLI
+  (built by `make`, `-Wall -Wextra -Werror`); `tests/test_esphome_decoder.py`
+  builds it and requires output identical to the Python reference on every
+  vector, on 3,000 generated captures (errors, either polarity, noise), and
+  for the cross-capture fold over the real capture sequence.
+
 ## 2.10.0 — 2026-10-11
 
 - **rfcat dongle: strobe IDLE -> RX after 1 s with no block**

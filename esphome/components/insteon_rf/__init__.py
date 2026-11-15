@@ -11,13 +11,17 @@ Two radios, chosen with ``radio:``:
 * ``cc1101`` -- LilyGO T-Embed CC1101 / CC1101 Plus. The CC1111 dongle's own
   modem, configured the way the dongle is.
 
-Both publish identical capture messages to MQTT, so the mesh cannot tell them
-apart except by name.
+Both decode on the board (``decoder.cpp``, a port of the Python reference
+held to it by ``tests/test_esphome_decoder.py``) and publish listener
+contract v1 -- one message per transmission -- to ``decoded_topic``
+(``insteon-rf/msg/<node name>``). ``publish: captures`` or ``both`` also
+sends the raw FIFO captures to ``mqtt_topic`` for the old mesh service.
 """
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_FREQUENCY, CONF_ID, CONF_RESET_PIN
+from esphome.core import CORE
 
 from esphome import pins
 from esphome.components import spi
@@ -56,6 +60,19 @@ CONF_MANCHESTER_GATE_ERRORS = "manchester_gate_errors"
 CONF_TCXO_VOLTAGE = "tcxo_voltage"
 CONF_TCXO_DELAY = "tcxo_delay"
 CONF_MQTT_TOPIC = "mqtt_topic"
+CONF_PUBLISH = "publish"
+CONF_DECODED_TOPIC = "decoded_topic"
+
+# What goes to MQTT (insteon_rf.h PublishMode). `decoded` is contract v1 on
+# `decoded_topic`; `captures` is the pre-3.0 raw FIFO dump on `mqtt_topic`;
+# `both` is for the migration and for A/B work.
+PUBLISH_MODES = {
+    "decoded": 0,
+    "captures": 1,
+    "both": 2,
+}
+# listener.TOPIC_PREFIX; the node name is appended.
+DECODED_TOPIC_PREFIX = "insteon-rf/msg/"
 
 # From tools/gen_sync_word.py, pinned by tests/test_sync_word.py. The
 # complement (0xCCCCCEAA) is the one to try if the radio's bit sense turns
@@ -140,7 +157,11 @@ _COMMON_SCHEMA = cv.Schema(
         # threw away exactly the marginal packets it could have saved;
         # noise breaks ~25 of the ~50 pairs, so 2 is still airtight.
         cv.Optional(CONF_MANCHESTER_GATE_ERRORS, default=2): cv.int_range(min=0, max=8),
-        cv.Required(CONF_MQTT_TOPIC): cv.publish_topic,
+        cv.Optional(CONF_PUBLISH, default="decoded"): cv.enum(PUBLISH_MODES, lower=True),
+        # Contract v1 messages; default insteon-rf/msg/<node name>.
+        cv.Optional(CONF_DECODED_TOPIC): cv.publish_topic,
+        # Raw captures; needed only when `publish` includes them.
+        cv.Optional(CONF_MQTT_TOPIC): cv.publish_topic,
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -229,11 +250,23 @@ CC1101_SCHEMA = (
     .extend(spi.spi_device_schema(cs_pin_required=True))
 )
 
-CONFIG_SCHEMA = cv.typed_schema(
-    {"sx1262": SX1262_SCHEMA, "cc1101": CC1101_SCHEMA},
-    key=CONF_RADIO,
-    default_type="sx1262",
-    lower=True,
+def _validate_publish(config):
+    if config[CONF_PUBLISH] != "decoded" and CONF_MQTT_TOPIC not in config:
+        raise cv.Invalid(
+            f"publish: {config[CONF_PUBLISH]} sends captures, which need mqtt_topic",
+            path=[CONF_MQTT_TOPIC],
+        )
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.typed_schema(
+        {"sx1262": SX1262_SCHEMA, "cc1101": CC1101_SCHEMA},
+        key=CONF_RADIO,
+        default_type="sx1262",
+        lower=True,
+    ),
+    _validate_publish,
 )
 
 
@@ -245,7 +278,10 @@ async def _common_to_code(var, config):
     cg.add(var.set_rssi_floor(config[CONF_RSSI_FLOOR]))
     cg.add(var.set_manchester_gate(config[CONF_MANCHESTER_GATE]))
     cg.add(var.set_manchester_gate_errors(config[CONF_MANCHESTER_GATE_ERRORS]))
-    cg.add(var.set_mqtt_topic(config[CONF_MQTT_TOPIC]))
+    cg.add(var.set_publish_mode(config[CONF_PUBLISH]))
+    cg.add(var.set_decoded_topic(config.get(CONF_DECODED_TOPIC, DECODED_TOPIC_PREFIX + CORE.name)))
+    if CONF_MQTT_TOPIC in config:
+        cg.add(var.set_mqtt_topic(config[CONF_MQTT_TOPIC]))
     cg.add(var.set_frequency(int(config[CONF_FREQUENCY])))
 
 

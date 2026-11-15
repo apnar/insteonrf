@@ -579,6 +579,15 @@ bits are Manchester pairs, and a valid pair is only `01` or `10`, so noise
 fails within a handful of bits. That is what makes syncing on a short word
 viable in a crowded 915 MHz band.
 
+Since 3.0.0 the board also **decodes** what passes the gate
+(`decoder.cpp`, a dependency-free port of `listener.capture_messages`, no
+repair), folds hop copies across captures for 0.5 s, and publishes listener
+contract v1 -- one message per transmission -- to `insteon-rf/msg/<node name>`
+(`publish: decoded`, the default). `publish: both` with `mqtt_topic:` keeps the
+raw captures flowing to the mesh as well. `make` builds the decoder for the
+host and `tests/test_esphome_decoder.py` holds it to the Python output on every
+contract-v1 vector.
+
 #### The Heltec, for the record
 
 First flashed 2026-09-19 a few feet from the PLM, it received Insteon on the

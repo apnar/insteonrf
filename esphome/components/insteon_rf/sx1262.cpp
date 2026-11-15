@@ -253,6 +253,8 @@ void InsteonRFSX1262::loop() {
     return;
 
   this->tick_minute_();
+  // Release decoded messages whose fold window closed, quiet air or not.
+  this->service_decoded_();
 
   // DIO1 is mapped to RxDone|Timeout, so its level answers "anything to do?"
   // for free. Without this, polling the IRQ register is a 4-byte SPI

@@ -6,10 +6,12 @@ other board: there is exactly one transmitter on an Insteon network, and it
 is the PLM.
 
 Firmware: `esphome/insteon-rf-embed.yaml` + the `insteon_rf` component with
-`radio: cc1101`. It publishes to `insteon-rf/rx/insteon-rf-embed` in the same
-format as the Heltec, so `insteon-rf mesh` picks it up with no change: it
-subscribes to `insteon-rf/rx/+`, and the receiver name comes from the
-payload.
+`radio: cc1101`. Since 3.0.0 it decodes on the board and publishes listener
+contract v1 (`insteonrf/listener.py`) to `insteon-rf/msg/insteon-rf-embed`,
+one message per transmission (`publish: decoded`). Until then it published
+raw captures to `insteon-rf/rx/insteon-rf-embed` in the same format as the
+Heltec, which `insteon-rf mesh` reads (it subscribes to `insteon-rf/rx/+`);
+`publish: both` plus `mqtt_topic: insteon-rf/rx/${name}` brings those back.
 
 ## Why this radio is a good bet
 

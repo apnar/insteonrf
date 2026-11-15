@@ -70,7 +70,7 @@ Recreate the venv with `uv venv .venv && uv pip install -e ".[dev,mqtt]" pyusb p
 | `insteonrf/inject.py` | what may be handed to insteon-mqtt: tiers, shadow mode, PLM-heard suppression, rate limits |
 | `insteonrf/mesh.py` | the mesh service and the miss table (`insteon-rf mesh`) |
 | `insteonrf/radio/mqtt.py` | listener-board captures over MQTT, also a `RadioBackend` |
-| `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, publish, counters), radios `cc1101.cpp` (T-Embed, live) and `sx1262.cpp` (Heltec, retired 2026-10-08), chosen by `radio:` |
+| `esphome/components/insteon_rf/` | ESPHome listener firmware, receive only: shared base `insteon_rf.cpp` (gate, decode + fold + publish, counters), `decoder.cpp` (dependency-free port of `listener.capture_messages` + `MessageFolder`; host CLI `tools/insteon_rf_decode.cpp`, held to the Python by `tests/test_esphome_decoder.py`), radios `cc1101.cpp` (T-Embed, live) and `sx1262.cpp` (Heltec, retired 2026-10-08), chosen by `radio:`; `publish: decoded|captures|both` |
 | `esphome/insteon-rf-embed.yaml` | the LilyGO T-Embed CC1101 listener (`Doc/T-EMBED.md`); the Heltec's config is in `esphome/retired/` |
 | `tools/score_receivers.py` | score one receiver against a fixed reference set from the mesh event log, per time window (the A/B yardstick) |
 | `deploy/insteonrf-dongle.yaml` | receive-only k8s Pod: decoded messages (contract v1) on `insteon-rf/msg/dongle`, all-on alerts on `insteon-rf/alert` (see `/root/homelab/docs/k8s.md` conventions) |
@@ -208,7 +208,7 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   logged at start, on the `--diag-after` timer and on `SIGUSR1` —
   `kill -USR1 $(pgrep -f 'insteon-rf monitor')` from the host. To tell quiet air from a
   deaf dongle, compare against the T-Embed's per-minute `Captures` sensor or
-  `insteon-rf/rx/insteon-rf-embed` on MQTT (the Heltec did this job until 2026-10-08). **Never let a test or tool reset the dongle
+  `insteon-rf/msg/insteon-rf-embed` on MQTT (3.0.0+; raw captures on `insteon-rf/rx/…` only with `publish: both`; the Heltec did this job until 2026-10-08). **Never let a test or tool reset the dongle
   while the pod holds it**: `tests/test_radio.py`'s `fake_radio` stubs both `usb_reset`
   and `external_usb_reset` because, for one afternoon, every `make check` knocked the
   pod's receiver over and looked like a flaky dongle. `bpftrace -e
@@ -234,6 +234,15 @@ The SDR stages (`modulate`, `demod`, `clip`) speak raw interleaved 8-bit I/Q ins
   deterministic. `rssi` is `null` for the dongle (post-block register snapshot, the
   same reason `--mesh-capture` sends none) and there is no RSSI on the SDR; `snr` is
   the SDR's symbol SNR; `repaired` is `Packet.corrected`.
+- **The T-Embed decodes on the board** (3.0.0, `publish: decoded`): each gated capture
+  goes through `decoder.cpp` in `loop()` (never the radio task), every valid copy is
+  dated at its own header (capture's first FIFO bit + position / 9124, the 16-bit header
+  put back counts) and folded in a fixed 16-slot `MessageFolder` (0.5 s window, so copies
+  straddling two captures publish once); `loop()` releases at window + 0.2 s, quiet air
+  included. No repair: `repaired` 0, `snr` null, `rssi` the strongest copy's capture
+  RSSI. Before SNTP sets the clock messages are dropped and counted (logged per minute).
+  The decoder is a port, not a reimplementation: change `listener.py`/`packet.py`/`plm.py`
+  semantics and `tests/test_esphome_decoder.py` will fail until `decoder.cpp` follows.
 - **Two listeners cannot share an MQTT client id.** `MqttPublisher` defaults to a
   unique one now; with the fixed `insteon-rf` it had, the dongle pod and the V4 pod
   evicted each other from the broker in a reconnect loop that reads as a broker fault.

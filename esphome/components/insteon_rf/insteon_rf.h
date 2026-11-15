@@ -6,11 +6,19 @@
 //
 // A radio driver's whole job is to hand process_capture_() the bytes that
 // followed the Insteon start header, plus the RSSI and the moment the first
-// of those bits was on the air. Everything after that -- the Manchester gate,
-// the RSSI floor, the MQTT payload and its timestamp, the counters, the
-// sensors and the read-outs for an on-board display -- lives here, so two
-// boards with different radios publish captures the host cannot tell apart
-// except by name.
+// of those bits was on the air, and to call service_decoded_() from loop().
+// Everything after that -- the Manchester gate, the RSSI floor, decoding
+// (decoder.h) and the cross-capture fold window, the MQTT payloads and their
+// timestamps, the counters, the sensors and the read-outs for an on-board
+// display -- lives here, so two boards with different radios publish
+// messages the host cannot tell apart except by name.
+//
+// What goes out (YAML `publish:`):
+//   decoded   contract v1 (insteonrf/listener.py, Doc/REARCHITECTURE.md): one
+//             message per transmission on `decoded_topic`
+//             (insteon-rf/msg/<node name>), decoded and folded on the board
+//   captures  the raw FIFO dumps on `mqtt_topic`, for the old mesh service
+//   both      for the migration and for A/B work
 //
 // Drivers:
 //   sx1262.h  Heltec LoRa 32 V3 (SX1262), GFSK packet mode as a bit recorder
@@ -21,6 +29,8 @@
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/helpers.h"
+
+#include "decoder.h"
 
 #include <cmath>
 #include <cstdint>
@@ -55,6 +65,20 @@ static const uint8_t INSTEON_SYNC_BITS = 32;
 static const uint32_t INSTEON_BITRATE = 9124;
 static const uint32_t INSTEON_DEVIATION_HZ = 75000;
 
+enum PublishMode : uint8_t {
+  PUBLISH_DECODED = 0,
+  PUBLISH_CAPTURES = 1,
+  PUBLISH_BOTH = 2,
+};
+
+/// Fold window for hop copies, from the first copy (listener.FOLD_WINDOW_S).
+static const uint32_t FOLD_WINDOW_MS = 500;
+/// How long past the window a message is held for copies still on their way:
+/// a capture reaches loop() only after it ends (up to ~220 ms of air for 255
+/// bytes) and may wait in the hand-off queue. Same as the host pods'
+/// RELEASE_LATENESS_S.
+static const uint32_t RELEASE_LATENESS_MS = 200;
+
 /// Microseconds of air for n bytes at the Insteon bit rate.
 inline uint32_t air_us(uint32_t nbytes) {
   return (uint32_t) (((uint64_t) nbytes * 8ULL * 1000000ULL) / INSTEON_BITRATE);
@@ -70,6 +94,8 @@ class InsteonRF : public Component {
   void set_manchester_gate(uint8_t frames) { this->manchester_gate_ = frames; }
   void set_manchester_gate_errors(uint8_t n) { this->manchester_gate_errors_ = n; }
   void set_mqtt_topic(const std::string &topic) { this->mqtt_topic_ = topic; }
+  void set_decoded_topic(const std::string &topic) { this->decoded_topic_ = topic; }
+  void set_publish_mode(uint8_t mode) { this->publish_mode_ = mode; }
 
 #ifdef USE_SENSOR
   void set_last_rssi_sensor(sensor::Sensor *s) { this->last_rssi_sensor_ = s; }
@@ -78,6 +104,7 @@ class InsteonRF : public Component {
   // Only radios that measure these publish them (the CC1101 does).
   void set_frequency_offset_sensor(sensor::Sensor *s) { this->frequency_offset_sensor_ = s; }
   void set_lost_sensor(sensor::Sensor *s) { this->lost_sensor_ = s; }
+  void set_decoded_sensor(sensor::Sensor *s) { this->decoded_sensor_ = s; }
 #endif
 
   // -- read-outs for an on-board display (placement survey)
@@ -91,6 +118,10 @@ class InsteonRF : public Component {
   /// Counts over the previous whole minute, refreshed once a minute.
   uint32_t captures_last_minute() const { return this->captures_last_minute_; }
   uint32_t accepted_last_minute() const { return this->accepted_last_minute_; }
+  /// Contract-v1 messages published (one per transmission), previous minute
+  /// and in total; 0 when `publish: captures`.
+  uint32_t decoded_last_minute() const { return this->decoded_last_minute_; }
+  uint32_t total_decoded() const { return this->decoded_; }
   /// Captures the radio lost before the gate saw them, previous minute.
   uint32_t lost_last_minute() const { return this->lost_last_minute_; }
   /// Mean carrier offset of the previous minute's accepted packets, kHz;
@@ -115,6 +146,17 @@ class InsteonRF : public Component {
 
   bool manchester_gate_ok_(const uint8_t *buf, size_t len) const;
   void publish_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us);
+  /// Decode one gated capture and fold its copies into the window.
+  void decode_capture_(const uint8_t *buf, size_t len, float rssi, uint32_t first_bit_us);
+  /// Release (publish) messages whose fold window has closed. Radios call it
+  /// from loop() on every pass, so messages go out on quiet air too.
+  void service_decoded_();
+  void publish_decoded_(const FoldedMessage &m, int64_t now_ms);
+  /// micros() extended to 64 bits (loop() context only; it must run at least
+  /// once per 71 minutes, which loop() does).
+  int64_t now_us64_();
+  bool publish_captures_() const { return this->publish_mode_ != PUBLISH_DECODED; }
+  bool publish_decoded_enabled_() const { return this->publish_mode_ != PUBLISH_CAPTURES; }
 
   uint32_t sync_word_{INSTEON_SYNC_WORD};
   uint8_t capture_bytes_{162};
@@ -122,6 +164,18 @@ class InsteonRF : public Component {
   uint8_t manchester_gate_{4};
   uint8_t manchester_gate_errors_{2};
   std::string mqtt_topic_{};
+  std::string decoded_topic_{};
+  uint8_t publish_mode_{PUBLISH_DECODED};
+
+  CaptureDecoder decoder_{};
+  MessageFolder folder_{FOLD_WINDOW_MS};
+  uint32_t last_micros_{0};
+  int64_t micros_high_{0};
+  uint32_t decoded_{0};
+  uint32_t decoded_at_mark_{0};
+  uint32_t decoded_last_minute_{0};
+  uint32_t undated_{0};
+  uint8_t decoded_logged_{0};
 
   bool radio_ok_{false};
   uint32_t seq_{0};
@@ -152,6 +206,7 @@ class InsteonRF : public Component {
   sensor::Sensor *accepted_sensor_{nullptr};
   sensor::Sensor *frequency_offset_sensor_{nullptr};
   sensor::Sensor *lost_sensor_{nullptr};
+  sensor::Sensor *decoded_sensor_{nullptr};
 #endif
 };
 
