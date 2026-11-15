@@ -18,6 +18,8 @@ contract v1 -- one message per transmission -- to ``decoded_topic``
 sends the raw FIFO captures to ``mqtt_topic`` for the old mesh service.
 """
 
+import re
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_FREQUENCY, CONF_ID, CONF_RESET_PIN
@@ -62,6 +64,24 @@ CONF_TCXO_DELAY = "tcxo_delay"
 CONF_MQTT_TOPIC = "mqtt_topic"
 CONF_PUBLISH = "publish"
 CONF_DECODED_TOPIC = "decoded_topic"
+CONF_DEVICE_NAMES = "device_names"
+
+_ADDRESS = re.compile(r"([0-9A-Fa-f]{2})[.:]?([0-9A-Fa-f]{2})[.:]?([0-9A-Fa-f]{2})")
+
+
+def _device_names(value):
+    """`"29.4E.52": Master Bed` pairs, for the board's own display."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise cv.Invalid("device_names must map Insteon addresses to names")
+    out = {}
+    for addr, name in value.items():
+        m = _ADDRESS.fullmatch(str(addr).strip())
+        if m is None:
+            raise cv.Invalid(f"{addr!r} is not an Insteon address like 29.4E.52")
+        out[".".join(g.upper() for g in m.groups())] = cv.string(name)
+    return out
 
 # What goes to MQTT (insteon_rf.h PublishMode). `decoded` is contract v1 on
 # `decoded_topic`; `captures` is the pre-3.0 raw FIFO dump on `mqtt_topic`;
@@ -160,6 +180,8 @@ _COMMON_SCHEMA = cv.Schema(
         cv.Optional(CONF_PUBLISH, default="decoded"): cv.enum(PUBLISH_MODES, lower=True),
         # Contract v1 messages; default insteon-rf/msg/<node name>.
         cv.Optional(CONF_DECODED_TOPIC): cv.publish_topic,
+        # Labels for the display only; nothing is published with them.
+        cv.Optional(CONF_DEVICE_NAMES, default={}): _device_names,
         # Raw captures; needed only when `publish` includes them.
         cv.Optional(CONF_MQTT_TOPIC): cv.publish_topic,
     }
@@ -282,6 +304,8 @@ async def _common_to_code(var, config):
     cg.add(var.set_decoded_topic(config.get(CONF_DECODED_TOPIC, DECODED_TOPIC_PREFIX + CORE.name)))
     if CONF_MQTT_TOPIC in config:
         cg.add(var.set_mqtt_topic(config[CONF_MQTT_TOPIC]))
+    for addr, name in config[CONF_DEVICE_NAMES].items():
+        cg.add(var.add_device_name(int(addr.replace(".", ""), 16), name))
     cg.add(var.set_frequency(int(config[CONF_FREQUENCY])))
 
 

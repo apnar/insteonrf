@@ -210,8 +210,15 @@ void InsteonRF::service_decoded_() {
     return;
   const int64_t now_ms = this->now_us64_() / 1000;
   FoldedMessage m;
-  while (this->folder_.pop_ready(now_ms - RELEASE_LATENESS_MS, &m))
+  while (this->folder_.pop_ready(now_ms - RELEASE_LATENESS_MS, &m)) {
+    // For the display: recorded whether or not the clock is set yet.
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    const HeardMessage h = heard_from(m.msg, m.rssi, millis(), tv.tv_sec >= CLOCK_VALID_AFTER ? tv.tv_sec : 0);
+    this->heard_log_.add(h);
+    this->heard_devices_.add(h);
     this->publish_decoded_(m, now_ms);
+  }
 }
 
 void InsteonRF::publish_decoded_(const FoldedMessage &m, int64_t now_ms) {

@@ -175,6 +175,9 @@ insteon_rf:
   # `both` (plus `mqtt_topic: insteon-rf/rx/${name}`) also sends the raw
   # captures the old mesh service reads.
   publish: decoded
+  # Names for the display's Recent and Heard pages, generated from
+  # insteon-mqtt's device files (insteonrf tools/insteon_names.py).
+  device_names: !include common/insteon-names.yaml
 
 # ---------------------------------------------------------------- display
 
@@ -212,6 +215,8 @@ color:
     hex: "FF453A"
   - id: c_bar
     hex: "0A84FF"
+  - id: c_text
+    hex: "FFFFFF"
 
 display:
   - platform: mipi_spi
@@ -270,23 +275,95 @@ display:
 
           // Captures without accepts = noise or a framing problem; accepts
           // = real packets; lost = the receive path is being starved.
-          it.printf(0, 96, id(f_mid), "%u cap  %u ok  /min",
+          it.printf(0, 96, id(f_mid), "%u cap  %u ok  %u msg /min",
                     (unsigned) node->captures_last_minute(),
-                    (unsigned) node->accepted_last_minute());
+                    (unsigned) node->accepted_last_minute(),
+                    (unsigned) node->decoded_last_minute());
           if (node->lost_last_minute())
             it.printf(W, 96, id(f_mid), id(c_bad), TextAlign::TOP_RIGHT, "%u lost",
                       (unsigned) node->lost_last_minute());
 
-          const uint32_t age = node->ms_since_accepted();
-          if (age == UINT32_MAX) {
-            it.print(0, 128, id(f_mid), id(c_dim), "no packet yet");
-          } else if (age < 60000) {
-            it.printf(0, 128, id(f_mid), "last %us ago", (unsigned) (age / 1000));
+          // The last message decoded here: who, what, how long ago.
+          const auto &log = node->heard_log();
+          if (log.size() == 0) {
+            it.print(0, 128, id(f_mid), id(c_dim), "no message yet");
           } else {
-            it.printf(0, 128, id(f_mid), "last %um ago", (unsigned) (age / 60000));
+            const auto &h = log.at(0);
+            char name[24], cbuf[12];
+            node->device_names().label(h.from, name, sizeof(name), 14);
+            it.printf(0, 128, id(f_mid), "%s %s", name, insteon_rf::command_label(h, cbuf, sizeof(cbuf)));
+            const uint32_t s = (millis() - h.at_ms) / 1000;
+            if (s < 60)
+              it.printf(W, 128, id(f_mid), id(c_dim), TextAlign::TOP_RIGHT, "%us", (unsigned) s);
+            else
+              it.printf(W, 128, id(f_mid), id(c_dim), TextAlign::TOP_RIGHT, "%um", (unsigned) (s / 60));
           }
-          it.printf(W, 128, id(f_mid), TextAlign::TOP_RIGHT, "n=%u",
-                    (unsigned) node->total_accepted());
+
+      # Recent messages, newest first: age, device, command (group), RSSI.
+      - id: page_recent
+        lambda: |-
+          auto *node = id(rf);
+          const int W = it.get_width();
+          const auto &log = node->heard_log();
+          it.print(0, 0, id(f_small), "Recent messages");
+          it.printf(W, 0, id(f_small), id(c_dim), TextAlign::TOP_RIGHT, "%u /min",
+                    (unsigned) node->decoded_last_minute());
+          if (log.size() == 0) {
+            it.print(W / 2, 80, id(f_mid), id(c_dim), TextAlign::CENTER, "nothing decoded yet");
+            return;
+          }
+          const uint32_t now = millis();
+          char name[24], cbuf[12], age[8];
+          for (size_t i = 0; i < log.size() && i < 7; i++) {
+            const auto &h = log.at(i);
+            const int y = 22 + 20 * (int) i;
+            const uint32_t s = (now - h.at_ms) / 1000;
+            if (s < 100) snprintf(age, sizeof(age), "%us", (unsigned) s);
+            else if (s < 6000) snprintf(age, sizeof(age), "%um", (unsigned) (s / 60));
+            else snprintf(age, sizeof(age), "%uh", (unsigned) (s / 3600));
+            node->device_names().label(h.from, name, sizeof(name), 17);
+            const char *cmd = insteon_rf::command_label(h, cbuf, sizeof(cbuf));
+            it.print(0, y, id(f_small), id(c_dim), age);
+            it.print(36, y, id(f_small), id(c_text), name);
+            const int g = h.group();
+            if (g >= 0)
+              it.printf(186, y, id(f_small), id(c_text), "%s g%d", cmd, g);
+            else
+              it.print(186, y, id(f_small), id(c_text), cmd);
+            if (!std::isnan(h.rssi))
+              it.printf(W, y, id(f_small), h.rssi < -100 ? id(c_bad) : id(c_dim), TextAlign::TOP_RIGHT,
+                        "%.0f", h.rssi);
+          }
+
+      # Placement: every device heard here in the last 15 minutes, weakest
+      # first -- the ones this spot is about to lose. Red below -100 dBm.
+      - id: page_heard
+        lambda: |-
+          auto *node = id(rf);
+          const int W = it.get_width();
+          const auto &dev = node->heard_devices();
+          const uint32_t now = millis(), window = 15 * 60 * 1000;
+          it.printf(0, 0, id(f_small), "Heard %u devices, 15 min", (unsigned) dev.active(now, window));
+          it.print(W, 0, id(f_small), id(c_dim), TextAlign::TOP_RIGHT, "weakest");
+          size_t idx[7];
+          const size_t n = dev.weakest(now, window, idx, 7);
+          if (n == 0) {
+            it.print(W / 2, 80, id(f_mid), id(c_dim), TextAlign::CENTER, "nothing heard yet");
+            return;
+          }
+          char name[24];
+          for (size_t i = 0; i < n; i++) {
+            const auto &e = dev.at(idx[i]);
+            const int y = 22 + 20 * (int) i;
+            node->device_names().label(e.addr, name, sizeof(name), 22);
+            it.print(0, y, id(f_small), id(c_text), name);
+            it.printf(236, y, id(f_small), id(c_dim), TextAlign::TOP_RIGHT, "x%u", (unsigned) e.count);
+            if (std::isnan(e.best_rssi))
+              it.print(W, y, id(f_small), id(c_dim), TextAlign::TOP_RIGHT, "--");
+            else
+              it.printf(W, y, id(f_small), e.best_rssi < -100 ? id(c_bad) : (e.best_rssi > -90 ? id(c_ok) : id(c_text)),
+                        TextAlign::TOP_RIGHT, "%.0f", e.best_rssi);
+          }
 
       # Board health: tuning, battery, network.
       - id: page_health

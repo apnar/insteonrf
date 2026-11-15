@@ -31,6 +31,7 @@
 #include "esphome/core/helpers.h"
 
 #include "decoder.h"
+#include "heard.h"
 
 #include <cmath>
 #include <cstdint>
@@ -95,6 +96,7 @@ class InsteonRF : public Component {
   void set_manchester_gate_errors(uint8_t n) { this->manchester_gate_errors_ = n; }
   void set_mqtt_topic(const std::string &topic) { this->mqtt_topic_ = topic; }
   void set_decoded_topic(const std::string &topic) { this->decoded_topic_ = topic; }
+  void add_device_name(uint32_t addr, const std::string &name) { this->device_names_.add(addr, name); }
   void set_publish_mode(uint8_t mode) { this->publish_mode_ = mode; }
 
 #ifdef USE_SENSOR
@@ -122,6 +124,12 @@ class InsteonRF : public Component {
   /// and in total; 0 when `publish: captures`.
   uint32_t decoded_last_minute() const { return this->decoded_last_minute_; }
   uint32_t total_decoded() const { return this->decoded_; }
+
+  // What this board heard, for display lambdas (main loop only). Times are
+  // millis(); devices(): heard_devices().active(millis(), window).
+  const HeardLog &heard_log() const { return this->heard_log_; }
+  const HeardDevices &heard_devices() const { return this->heard_devices_; }
+  const DeviceNames &device_names() const { return this->device_names_; }
   /// Captures the radio lost before the gate saw them, previous minute.
   uint32_t lost_last_minute() const { return this->lost_last_minute_; }
   /// Mean carrier offset of the previous minute's accepted packets, kHz;
@@ -169,6 +177,9 @@ class InsteonRF : public Component {
 
   CaptureDecoder decoder_{};
   MessageFolder folder_{FOLD_WINDOW_MS};
+  HeardLog heard_log_;
+  HeardDevices heard_devices_;
+  DeviceNames device_names_;
   uint32_t last_micros_{0};
   int64_t micros_high_{0};
   uint32_t decoded_{0};
