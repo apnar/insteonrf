@@ -96,3 +96,23 @@ def test_json_round_trip() -> None:
     assert ListenerMessage.from_dict(d).frame == m.frame
     with pytest.raises(ValueError):
         ListenerMessage.from_dict(dict(d, v=99))
+
+
+@pytest.mark.parametrize("name", ["embed-vectors.jsonl", "synthetic-vectors.jsonl"])
+def test_contract_vectors_match_reference(name: str) -> None:
+    """The vector files the ESPHome decoder is tested against still agree
+    with this reference (regenerate them if the contract changes)."""
+    import pathlib
+
+    from insteonrf.radio.mqtt import Capture
+
+    path = pathlib.Path(__file__).parent / "data" / "contract-v1" / name
+    lines = path.read_text().splitlines()
+    assert lines
+    for line in lines:
+        case = json.loads(line)
+        cap = Capture.from_payload("insteon-rf/rx/x", json.dumps(case["capture"]).encode())
+        assert cap is not None
+        got = capture_messages(cap.bits, "x", cap.timestamp, sync_word=cap.sync_word)
+        assert [{"frame": m.frame.hex().upper(), "copies": m.copies, "hops_left": m.hops_left}
+                for m in got] == case["expected"], case.get("name", case["capture"].get("seq"))
